@@ -1,0 +1,22 @@
+# Секреты
+.env
+passSB.txt
+
+# Дампы воркфлоу (содержат хардкод токенов Bitrix)
+workflows/
+
+# Зависимости
+node_modules/
+
+# Временные файлы
+tmp/
+*.tmp
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/

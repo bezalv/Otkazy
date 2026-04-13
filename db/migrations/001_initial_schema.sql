@@ -1,0 +1,6 @@
+-- 001_initial_schema.sql
+-- Таблицы: lost_deals, lost_deal_communications, lost_deal_analyses, batch_lock
+-- Применено через Supabase MCP DD.MM.YYYY
+--
+-- Полная схема применена напрямую в Supabase.
+-- Этот файл — документация, исходник миграции.
