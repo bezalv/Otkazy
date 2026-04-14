@@ -96,6 +96,7 @@
 - Фикс в WF4 (14.04.2026): синхронизирована логика сбора данных в "Обработать 1 сделку" — добавлен HTTP-вызов `crm.deal.userfield.list` для справочника причин, извлечение `lose_reason_id/lead_id` из карточки, поиск `loseDate` в истории стадий, вычисление `days_in_lost`
 - Бонус: починено corrupted connection (тип "0" вместо "main") в WF1 между "Объединить коммуникации" и "Вызов Блока 3"
 - Миграция БД: `ALTER TABLE lost_deals ADD COLUMN lead_id INTEGER` + индекс (применена Саней вручную)
+- Фикс в WF4 (14.04.2026): починен счётчик `trans_calls_transcribed`/`trans_calls_failed` — считается из communications по наличию transcript (было захардкожено 0, 0)
 
 ### TODO для Фазы 3
 - [x] Перезапустить batch с теми же 3 сделками после миграции 002
