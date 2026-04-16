@@ -150,6 +150,14 @@
 - "Возврат без AI" с disabled:true всё равно выполнялась (pass-through), конкурируя с final-output за responseMode:lastNode. Фикс: удаление ноды и связи.
 - "Обработать 1 сделку" не прокидывала multi_agent_analysis в return — новые колонки БД оставались NULL. Фикс: добавлена строка `multi_agent_analysis: block345Result.multi_agent_analysis || null`.
 
+### AI-комментарий в Битрикс (16.04.2026)
+- Добавлены 2 ноды в WF4 BhPWB9S6W5dlMUvV после "Записать в Supabase": "Собрать AI-комментарий" (Code) → "B24: Добавить AI-комментарий в карточку" (HTTP Request, continueOnFail).
+- Метод crm.timeline.comment.add — пишет форматированный AI-анализ прямо в таймлайн карточки сделки.
+- Комментарий содержит: вердикт, класс причины, уровень возврата, полный текст Writer (для неправомерных), футер с моделью и токенами.
+- Баг: deal_id приходил строкой → Битрикс возвращал OWNER_NOT_FOUND. Фикс: Number(r.deal_id) + валидация.
+- Баг: "Записать в Supabase" (Postgres) возвращает только {success:true}, затирая данные сделки. Фикс: чтение из $('Обработать 1 сделку') вместо $input.
+- Валидация на 108213: комментарий успешно записан в карточку.
+
 ### Валидация на сделке 108213
 - verdict=неправомерен, closure_correctness=premature, closure_reason_class=manager_dropped, recoverable_now=yes_medium, probability=50, misplaced=true, correct_stage=Приостановленные
 - 24 факта, 4 manager_mistakes, 4 key_signals, 4 risk_factors
