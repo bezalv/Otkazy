@@ -9,6 +9,7 @@
 - SplitInBatches v3: сбор результатов только через `$input.all()`
 - Webhook ноды: webhookId должен совпадать с path, иначе молчаливый 404
 - `n8n_autofix_workflow` ломает typeVersions — не использовать
+- Set-ноды (typeVersion 3.4+) по умолчанию не пробрасывают поля входа. Если Set стоит в основном потоке перед Code-нодой которая ждёт body вебхука — обязательно включать `includeOtherFields=true` (Include Other Fields в UI), иначе входные данные теряются.
 
 ## Запуск воркфлоу
 - Только через `n8n_test_workflow` MCP, **НЕ** через curl/bash (песочница → 403)

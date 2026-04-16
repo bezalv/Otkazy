@@ -7,6 +7,7 @@
 | 1 | БД | ✅ завершена (DD.MM.YYYY) |
 | 2 | Адаптация клонов воркфлоу | ✅ завершена (13.04.2026) |
 | 3 | Тестовый прогон | 🔄 в процессе (13.04.2026) |
+| 3.5 | Миграция мульти-агента в n8n | ✅ завершена (16.04.2026) |
 | 4 | Промпт под Отказы | ожидает |
 | 5 | Лайв-триггер | ожидает |
 
@@ -135,6 +136,28 @@
 — Writer на Opus 4.6 иногда вставляет мягкие "если-то" в Цель звонка (113759), но не явные скрипты ответов. Граница допустимого.
 — PowerShell на Windows иногда рендерит UTF-8 с битыми байтами, в самом файле output/*.txt всё чисто.
 
+## Миграция мульти-агента в n8n — лог (16.04.2026)
+
+### Выполнено
+- Добавлены 2 Set-ноды ("Set: Judge System Prompt", "Set: Writer System Prompt") с промптами из prototype/prompts/. Обе с includeOtherFields=true для проброса body вебхука.
+- Добавлены 7 новых нод в GLQ2iuzRaCQZM7QU: agent-facts-assembler, agent-judge-call, agent-judge-parse, verdict-router (IF), agent-writer-call, agent-writer-parse, final-output. Пайплайн: b4.5 Comm Analytics → facts-assembler → judge-call → judge-parse → verdict-router → (если неправомерен) writer-call + writer-parse, затем → final-output.
+- Нода "Возврат без AI" удалена (была disabled:true, связь b4.5 → Возврат без AI удалена, т.к. нода работала pass-through и конкурировала с final-output за responseMode:lastNode).
+- Нода "Подготовить SQL" в WF4 BhPWB9S6W5dlMUvV обновлена: читает r.multi_agent_analysis и мапит 16 новых колонок в lost_deal_analyses (ai_verdict, ai_verdict_reason_short, ai_closure_correctness, ai_closure_reason_class, ai_recoverable_now, ai_recovery_probability, ai_recovery_route, ai_manager_mistakes jsonb, ai_final_comment, ai_recovery_script, ai_facts_json jsonb, ai_judge_json jsonb, ai_proof_warnings jsonb, ai_facts_count, judge_model, judge_prompt_tokens, judge_completion_tokens, writer_model, writer_prompt_tokens, writer_completion_tokens) и 5 новых в lost_deals (last_ai_closure_correctness, last_ai_closure_reason_class, last_ai_recoverable_now, last_ai_recovery_probability, last_ai_recovery_route). prompt_version обновлён с v1.1 на v2.0.
+- Нода "Обработать 1 сделку" в WF4 — добавлен проброс multi_agent_analysis из ответа WF2.
+
+### Баги найденные и починенные
+- Set-ноды (typeVersion 3.4) по дефолту includeOtherFields=false — затирали body вебхука, Config + Фильтр звонков получал {content:"..."} вместо данных. Фикс: includeOtherFields=true.
+- "Возврат без AI" с disabled:true всё равно выполнялась (pass-through), конкурируя с final-output за responseMode:lastNode. Фикс: удаление ноды и связи.
+- "Обработать 1 сделку" не прокидывала multi_agent_analysis в return — новые колонки БД оставались NULL. Фикс: добавлена строка `multi_agent_analysis: block345Result.multi_agent_analysis || null`.
+
+### Валидация на сделке 108213
+- verdict=неправомерен, closure_correctness=premature, closure_reason_class=manager_dropped, recoverable_now=yes_medium, probability=50, misplaced=true, correct_stage=Приостановленные
+- 24 факта, 4 manager_mistakes, 4 key_signals, 4 risk_factors
+- final_comment присутствует (Вывод → Рекомендация РОПу → Сообщение менеджеру → План), без запрещённых скриптов "если-то"
+- Judge 10722+1693 токенов, Writer 12242+1296 токенов (~26k total), processing_time ~200 сек
+- 2/12 proof_warnings по типизации proof_type — known issue, не блокер
+
 ## Открытые вопросы
 
-- (пусто)
+- Минорно: Judge (Opus 4.6) путает proof_type на кейсах с посредниками (не прямой клиент). Пример 108213: 2/12 пруфов с некорректной типизацией. Вердикт при этом корректен. Фикс — уточнить промпт Judge с примерами правильной типизации.
+- Минорно: recovery_probability маппинг low=0 в "Подготовить SQL" теряет разницу между "низкий шанс" и "нет шанса". Исправить на 25 согласно прототипу.
