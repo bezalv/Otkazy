@@ -50,6 +50,9 @@
 - Префикс `lost-*` обязателен (lost-trigger, lost-batch, lost-transcription, lost-analysis)
 - НЕ `reactivation-*` — это проект Приостановленных
 
+## Bitrix24
+- Для методов `im.*` (уведомления, сообщения — например `im.notify.system.add`) входящему вебхуку нужен scope «Чат и уведомления (im)». Без него вызов падает с `insufficient_scope`.
+
 ## Git
 - Коммиты на русском
 - После каждой фазы: `git commit` + `git push`
