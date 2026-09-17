@@ -5,7 +5,7 @@
 ## n8n 2.12.3 — ограничения
 - `process.env.X` и `$env.X` в Code-нодах **НЕ работают** (N8N_BLOCK_ENV_ACCESS_IN_NODE=true)
 - `$env.X` работает только в expression-полях (URL, headers, body HTTP Request, Set, IF)
-- Code-ноды не ходят в сеть — HTTP только через HTTP Request ноды
+- В Code-нодах нет `fetch`/`axios`, но `await this.helpers.httpRequest({...})` работает и вовсю используется в проде («Обработать 1 сделку», `screenshots-fetch`). Запросы, которым нужен credential n8n (Polza, Supabase Postgres), всё равно делаем HTTP Request нодой — в Code-ноду креды не подставить.
 - SplitInBatches v3: сбор результатов только через `$input.all()`
 - Webhook ноды: webhookId должен совпадать с path, иначе молчаливый 404
 - `n8n_autofix_workflow` ломает typeVersions — не использовать
@@ -59,6 +59,17 @@
 ## Модели LLM для мульти-агентного анализа
 - Judge и Writer работают на Claude Opus 4.6 (anthropic/claude-opus-4.6 через Polza). Sonnet 3.7 давал заметно хуже: путал пол менеджера, вставлял запрещённые "если-то" скрипты, менее глубокий анализ.
 - Константы моделей в prototype/lib/models.js.
+- **Рабочие промпты — `prototype/prompts/judge_v2.4.md` и `writer_v2.4.md`**, это выгрузка из нод «Set: Judge System Prompt» и «Set: Writer System Prompt». `judge_v1.md` и `writer_v1.md` — история, в проде не используются, править их бессмысленно.
+- Источник истины всё равно нода в n8n: правишь промпт — обнови и файл v2.4, иначе разъедутся, как когда-то разъехались v1.
+- Распознавание скриншотов переписки — anthropic/claude-sonnet-4.6 (нода `screenshots-extract`). Gemini 2.5 Flash Lite в 50 раз дешевле, но искажает слова в русском тексте.
+
+## Скриншоты переписки в комментариях
+- `lost-batch` принимает `"screenshots": true`, по умолчанию false. Флаг идёт той же цепочкой, что `silent`.
+- Сборщик кладёт в событие комментария `screenshots[]` (только `FILES` с `type=image`), порядок — по дате, затем по имени с натуральной сортировкой.
+- Ветка в «Анализе сделки»: `screenshots-fetch` → `screenshots-router` → `screenshots-extract` → `screenshots-parse`, между «b4.5 Comm Analytics» и `agent-facts-assembler`.
+- Реплики становятся фактами `source=screenshot_chat`; Proof Validator (внутри `agent-judge-parse`) принимает их наравне с `chat`.
+- Даты реплик считаются от даты загрузки файла в MSK, переведённой в Asia/Novosibirsk: на скринах время местное.
+- `DOWNLOAD_URL` и base64 дальше ветки не уходят — ни в communications, ни в базу.
 
 ## Секреты
 - `service_role_key` и `db_password` — **никогда в чат**, только в `.env` или credentials n8n
