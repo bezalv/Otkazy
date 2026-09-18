@@ -64,7 +64,7 @@
 - Распознавание скриншотов переписки — anthropic/claude-sonnet-4.6 (нода `screenshots-extract`). Gemini 2.5 Flash Lite в 50 раз дешевле, но искажает слова в русском тексте.
 
 ## Скриншоты переписки в комментариях
-- `lost-batch` принимает `"screenshots": true`, по умолчанию false. Флаг идёт той же цепочкой, что `silent`.
+- **Распознавание включено для живых отказов (18.09.2026).** `lost-batch` считает `screenshots` включённым по умолчанию, точечно выключается `{"screenshots": false}` в теле запуска. Флаг идёт той же цепочкой, что `silent`.
 - Сборщик кладёт в событие комментария `screenshots[]` (только `FILES` с `type=image`), порядок — по дате, затем по имени с натуральной сортировкой.
 - Ветка в «Анализе сделки»: `screenshots-fetch` → `screenshots-router` → `screenshots-extract` → `screenshots-parse`, между «b4.5 Comm Analytics» и `agent-facts-assembler`.
 - Реплики становятся фактами `source=screenshot_chat`; Proof Validator (внутри `agent-judge-parse`) принимает их наравне с `chat`.
