@@ -12,8 +12,12 @@ const dir = path.join(ROOT, 'prototype', 'prompts', 'models', model);
 const base = fs.readFileSync(path.join(ROOT, 'prototype', 'prompts', 'judge_v2.5.md'), 'utf8');
 const skip = new Set((arg('skip', '') || '').split(',').filter(Boolean));
 const outName = arg('out', 'judge.md');
-const patches = JSON.parse(fs.readFileSync(path.join(dir, 'patches.json'), 'utf8'))
-  .filter(p => !skip.has(p.id));
+// enabled: false — патч остаётся в файле как история, но в сборку не идёт.
+const all = JSON.parse(fs.readFileSync(path.join(dir, 'patches.json'), 'utf8'));
+const withDisabled = process.argv.includes('--with-disabled');
+const patches = all.filter(p => (withDisabled || p.enabled !== false) && !skip.has(p.id));
+const offCount = all.length - all.filter(p => p.enabled !== false).length;
+if (offCount && !withDisabled) console.log(`Выключенных патчей пропущено: ${offCount} (включить: --with-disabled)`);
 if (skip.size) console.log(`Пропущены патчи: ${[...skip].join(', ')}`);
 
 let out = base;
