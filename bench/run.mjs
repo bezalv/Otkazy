@@ -70,6 +70,12 @@ if (!MODEL) { console.error(`Неизвестная модель: ${modelKey}. �
 const judgeOnly = flag('judge-only');
 const dealsArg = arg('deals');
 const limit = arg('limit') ? Number(arg('limit')) : null;
+// Проверка проброса lose_reason до судьи, пока воркфлоу не правили.
+const withLoseReason = flag('with-lose-reason');
+// Промпт судьи: рабочий (Opus) или копия под модель.
+const promptDir = arg('prompt-dir');
+// Метка прогона: под ней ложатся сырые ответы и результаты, чтобы круги не затирали друг друга.
+const TAG = arg('tag', modelKey);
 
 // ── окружение ────────────────────────────────────────────────────────────────
 function env() {
@@ -85,8 +91,24 @@ const KEY = env().POLZA_API_KEY;
 if (!KEY) { console.error('Нет POLZA_API_KEY в .env'); process.exit(1); }
 
 const PRICES = JSON.parse(fs.readFileSync(path.join(BENCH, 'prices.json'), 'utf8'));
-const JUDGE_PROMPT = fs.readFileSync(path.join(ROOT, 'prototype', 'prompts', 'judge_v2.5.md'), 'utf8');
-const WRITER_PROMPT = fs.readFileSync(path.join(ROOT, 'prototype', 'prompts', 'writer_v2.5.md'), 'utf8');
+const PROMPTS = promptDir
+  ? path.resolve(ROOT, promptDir)
+  : path.join(ROOT, 'prototype', 'prompts');
+const judgeFile = fs.existsSync(path.join(PROMPTS, 'judge.md'))
+  ? path.join(PROMPTS, 'judge.md')
+  : path.join(ROOT, 'prototype', 'prompts', 'judge_v2.5.md');
+const writerFile = fs.existsSync(path.join(PROMPTS, 'writer.md'))
+  ? path.join(PROMPTS, 'writer.md')
+  : path.join(ROOT, 'prototype', 'prompts', 'writer_v2.5.md');
+const JUDGE_PROMPT = fs.readFileSync(judgeFile, 'utf8');
+const WRITER_PROMPT = fs.readFileSync(writerFile, 'utf8');
+console.log(`Промпт судьи:   ${path.relative(ROOT, judgeFile)} (${JUDGE_PROMPT.length} символов)`);
+console.log(`Промпт писателя: ${path.relative(ROOT, writerFile)} (${WRITER_PROMPT.length} символов)`);
+
+const EXTRA_PATH = path.join(DATA, 'deal_extra.json');
+const DEAL_EXTRA = (withLoseReason && fs.existsSync(EXTRA_PATH))
+  ? JSON.parse(fs.readFileSync(EXTRA_PATH, 'utf8')) : null;
+if (withLoseReason && !DEAL_EXTRA) { console.error('Нет bench/data/deal_extra.json — сначала node bench/fetch.mjs'); process.exit(1); }
 
 // ── настоящий код ноды agent-judge-parse ─────────────────────────────────────
 // Берём резервную копию и накладываем те же патчи, что ушли в n8n (patches.json).
@@ -182,14 +204,19 @@ let deals = index.map(d => d.deal_id);
 if (dealsArg) deals = dealsArg.split(',').map(s => Number(s.trim()));
 if (limit) deals = deals.slice(0, limit);
 
-const outDir = path.join(DATA, 'raw', modelKey);
+const outDir = path.join(DATA, 'raw', TAG);
 fs.mkdirSync(outDir, { recursive: true });
 
-console.log(`Модель: ${MODEL.id} | сделок: ${deals.length} | потрачено на стенде: ${spent().toFixed(2)} / ${CEILING_RUB} ₽\n`);
+console.log(`Модель: ${MODEL.id} | метка: ${TAG} | сделок: ${deals.length} | lose_reason в карточке: ${DEAL_EXTRA ? 'да' : 'нет'} | потрачено: ${spent().toFixed(2)} / ${CEILING_RUB} ₽\n`);
 
 const results = [];
 for (const dealId of deals) {
   const packet = JSON.parse(fs.readFileSync(path.join(DATA, 'inputs', `${dealId}.json`), 'utf8'));
+  // Проброс причины отказа в карточку — так, как это сделает правка b4.5, когда её согласуют.
+  if (DEAL_EXTRA && DEAL_EXTRA[dealId]) {
+    const e = DEAL_EXTRA[dealId];
+    packet.deal_card = { ...packet.deal_card, lose_reason: e.lose_reason, lose_date: e.lose_date, days_in_lost: e.days_in_lost };
+  }
   const row = { deal_id: dealId };
   try {
     // Запрос судьи собираем как agent-facts-assembler: system + facts_packet целиком в user.
@@ -255,7 +282,7 @@ for (const dealId of deals) {
   results.push(row);
 }
 
-fs.writeFileSync(path.join(DATA, `results.${modelKey}.json`), JSON.stringify(results, null, 2), 'utf8');
+fs.writeFileSync(path.join(DATA, `results.${TAG}.json`), JSON.stringify(results, null, 2), 'utf8');
 const sum = results.reduce((s, r) => s + (r.total_cost || 0), 0);
 const ok = results.filter(r => !r.error);
 console.log(`\nГотово: ${ok.length}/${results.length} без сбоев | ${sum.toFixed(2)} ₽ | средняя ${ok.length ? (sum / ok.length).toFixed(2) : '—'} ₽/сделка`);

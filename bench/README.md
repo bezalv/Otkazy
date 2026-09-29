@@ -20,8 +20,9 @@
 
 | Путь | Что там |
 |---|---|
-| `fetch.mjs` | выгрузка входов и эталонов Opus из Supabase |
+| `fetch.mjs` | выгрузка входов, эталонов Opus и причин отказа из Supabase |
 | `run.mjs` | прогон модели: судья → разбор кодом ноды → писатель |
+| `build-prompt.mjs` | сборка промпта под модель из рабочего промпта и патчей |
 | `compare.mjs` | таблица «Opus против модели» и критерии приёмки |
 | `mismatch-brief.mjs` | выжимка по сделкам с разошедшимся вердиктом |
 | `schema.judge.json` | strict-схема ответа судьи для `response_format` |
@@ -32,13 +33,31 @@
 ## Запуск
 
 ```bash
-node bench/fetch.mjs                          # обновить входы и эталоны из базы
-node bench/run.mjs --model sol --limit 1      # одна сделка
-node bench/run.mjs --model sol                # весь набор
-node bench/run.mjs --model sol --judge-only   # без писателя
+node bench/fetch.mjs                                  # обновить входы и эталоны из базы
+node bench/build-prompt.mjs --model gpt-6-sol         # собрать промпт под модель
+node bench/run.mjs --model sol --limit 1              # одна сделка
+node bench/run.mjs --model sol                        # весь набор на рабочем промпте
 node bench/compare.mjs --model sol
 node bench/mismatch-brief.mjs --model sol
+
+# круг на промпте под модель, с пробросом причины отказа, под своей меткой
+node bench/run.mjs --model sol --tag sol-k2 \
+  --prompt-dir prototype/prompts/models/gpt-6-sol --with-lose-reason
+node bench/compare.mjs --model sol --tag sol-k2
 ```
+
+Флаги `run.mjs`: `--tag` — метка прогона, под ней ложатся сырые ответы и результаты, круги
+не затирают друг друга. `--prompt-dir` — папка с `judge.md` и `writer.md`; чего нет, берётся
+из рабочих `judge_v2.5.md` / `writer_v2.5.md`. `--with-lose-reason` — подставляет в `deal_card`
+причину отказа из `lost_deals`, чтобы проверить проброс до правки воркфлоу. `--judge-only` —
+без писателя. `--deals 124101,123427` — конкретные сделки.
+
+## Промпт под модель
+
+Правится не копией, а патчами: `prototype/prompts/models/<модель>/patches.json`, у каждого
+патча `id`, `why` и пара `find`/`replace`. `build-prompt.mjs` собирает из них `judge.md` и
+падает, если `find` встречается не ровно один раз. Рабочий промпт Opus остаётся источником
+и не меняется — пересобрать промпт под модель после его правки можно одной командой.
 
 ## Деньги
 

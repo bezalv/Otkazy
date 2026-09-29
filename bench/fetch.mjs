@@ -89,6 +89,16 @@ for (const r of rows) {
 index.sort((a, b) => a.deal_id - b.deal_id);
 fs.writeFileSync(path.join(DATA, 'index.json'), JSON.stringify(index, null, 2), 'utf8');
 
+// Поля отказа из карточки сделки. В deal_card они сейчас не попадают: b4.5 передаёт дальше
+// фиксированный список полей. Держим их отдельно, чтобы стенд мог проверить проброс
+// до того, как править воркфлоу.
+const ids = index.map(d => d.deal_id).join(',');
+const extraRows = await rest(`lost_deals?deal_id=in.(${ids})&select=deal_id,lose_reason,lose_reason_id,lose_date,days_in_lost`);
+const extra = {};
+for (const r of extraRows) extra[r.deal_id] = { lose_reason: r.lose_reason, lose_reason_id: r.lose_reason_id, lose_date: r.lose_date, days_in_lost: r.days_in_lost };
+fs.writeFileSync(path.join(DATA, 'deal_extra.json'), JSON.stringify(extra, null, 2), 'utf8');
+console.log(`Причины отказа выгружены: ${Object.keys(extra).length} сделок`);
+
 console.log(`Сделок выгружено: ${index.length}`);
 const byV = {}, byC = {};
 for (const d of index) {

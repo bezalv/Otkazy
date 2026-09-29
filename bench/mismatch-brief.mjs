@@ -6,9 +6,11 @@ import path from 'node:path';
 
 const ROOT = path.resolve(import.meta.dirname, '..');
 const DATA = path.join(ROOT, 'bench', 'data');
-const modelKey = (() => { const i = process.argv.indexOf('--model'); return i === -1 ? 'sol' : process.argv[i + 1]; })();
+const arg = (n, d) => { const i = process.argv.indexOf('--' + n); return i === -1 ? d : process.argv[i + 1]; };
+const modelKey = arg('model', 'sol');
+const TAG = arg('tag', modelKey);
 
-const mism = JSON.parse(fs.readFileSync(path.join(DATA, `mismatch.${modelKey}.json`), 'utf8'));
+const mism = JSON.parse(fs.readFileSync(path.join(DATA, `mismatch.${TAG}.json`), 'utf8'));
 const mask = (s) => String(s || '').replace(/(\+?7|8)[\s(-]*\d{3}[\s)-]*\d{3}[\s-]*\d{2}[\s-]*\d{2}/g, '[телефон]');
 const cut = (s, n) => { s = mask(s).replace(/\s+/g, ' ').trim(); return s.length > n ? s.slice(0, n) + '…' : s; };
 const day = (ts) => (ts ? new Date(ts).toISOString().slice(0, 10) : '?');

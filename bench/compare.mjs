@@ -5,9 +5,11 @@ import path from 'node:path';
 
 const ROOT = path.resolve(import.meta.dirname, '..');
 const DATA = path.join(ROOT, 'bench', 'data');
-const modelKey = (() => { const i = process.argv.indexOf('--model'); return i === -1 ? 'sol' : process.argv[i + 1]; })();
+const arg = (n, d) => { const i = process.argv.indexOf('--' + n); return i === -1 ? d : process.argv[i + 1]; };
+const modelKey = arg('model', 'sol');
+const TAG = arg('tag', modelKey);
 
-const results = JSON.parse(fs.readFileSync(path.join(DATA, `results.${modelKey}.json`), 'utf8'));
+const results = JSON.parse(fs.readFileSync(path.join(DATA, `results.${TAG}.json`), 'utf8'));
 const golden = (id) => JSON.parse(fs.readFileSync(path.join(DATA, 'golden', `${id}.json`), 'utf8'));
 const labelsPath = path.join(ROOT, 'bench', 'labels.json');
 const labels = fs.existsSync(labelsPath) ? JSON.parse(fs.readFileSync(labelsPath, 'utf8')) : {};
@@ -42,7 +44,7 @@ for (const r of results) {
       deal_id: r.deal_id,
       opus: { verdict: gj.verdict, class: gj.closure_reason_class, reason_short: gj.verdict_reason_short, exact: gj.exact_reason, mistakes: (gj.manager_mistakes || []).map(m => m.mistake) },
       sol: (() => {
-        const raw = JSON.parse(fs.readFileSync(path.join(DATA, 'raw', modelKey, `${r.deal_id}.judge.json`), 'utf8'));
+        const raw = JSON.parse(fs.readFileSync(path.join(DATA, 'raw', TAG, `${r.deal_id}.judge.json`), 'utf8'));
         const j = raw.parsed.judge;
         return { verdict: j.verdict, class: j.closure_reason_class, reason_short: j.verdict_reason_short, exact: j.exact_reason, mistakes: (j.manager_mistakes || []).map(m => m.mistake) };
       })()
@@ -67,5 +69,5 @@ console.log(`— цена не выше 8 ₽ за сделку: превыше�
 const fb = results.filter(r => r.fallback);
 console.log(`— ответил запасной провайдер: ${fb.length} вызовов ${fb.length ? '✗ ' + fb.map(r => r.deal_id).join(', ') : '✓'}`);
 
-fs.writeFileSync(path.join(DATA, `mismatch.${modelKey}.json`), JSON.stringify(mismatch, null, 2), 'utf8');
-console.log(`\nРасхождений вердикта: ${mismatch.length} → bench/data/mismatch.${modelKey}.json`);
+fs.writeFileSync(path.join(DATA, `mismatch.${TAG}.json`), JSON.stringify(mismatch, null, 2), 'utf8');
+console.log(`\nРасхождений вердикта: ${mismatch.length} → bench/data/mismatch.${TAG}.json`);
