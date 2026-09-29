@@ -1,0 +1,88 @@
+{
+  "name": "otkaz_judge_verdict",
+  "strict": true,
+  "schema": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+      "verdict",
+      "verdict_reason_short",
+      "recoverable_level",
+      "closure_reason_class",
+      "misplaced",
+      "correct_stage",
+      "exact_reason",
+      "manager_mistakes",
+      "key_signals",
+      "risk_factors",
+      "questions_for_manager"
+    ],
+    "properties": {
+      "verdict": {
+        "type": "string",
+        "enum": ["правомерен", "неправомерен", "недостаточно_данных"]
+      },
+      "verdict_reason_short": { "type": "string" },
+      "recoverable_level": {
+        "type": ["string", "null"],
+        "enum": ["высокий", "средний", "низкий", null]
+      },
+      "closure_reason_class": {
+        "type": "string",
+        "enum": ["price", "competitor", "no_need", "no_money", "timing", "manager_dropped", "customer_unreachable", "regulatory", "other"]
+      },
+      "misplaced": { "type": "boolean" },
+      "correct_stage": { "type": ["string", "null"] },
+      "exact_reason": { "type": "string" },
+      "manager_mistakes": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["mistake", "proof_fact_ids", "proof_type"],
+          "properties": {
+            "mistake": { "type": "string" },
+            "proof_fact_ids": { "type": "array", "items": { "type": "string" } },
+            "proof_type": {
+              "type": "string",
+              "enum": ["client_statement", "manager_statement", "crm_comment", "metric", "absence"]
+            }
+          }
+        }
+      },
+      "key_signals": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["signal", "proof_fact_ids", "proof_type"],
+          "properties": {
+            "signal": { "type": "string" },
+            "proof_fact_ids": { "type": "array", "items": { "type": "string" } },
+            "proof_type": {
+              "type": "string",
+              "enum": ["client_statement", "manager_statement", "crm_comment", "metric", "absence"]
+            }
+          }
+        }
+      },
+      "risk_factors": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["factor", "proof_fact_ids", "proof_type"],
+          "properties": {
+            "factor": { "type": "string" },
+            "proof_fact_ids": { "type": "array", "items": { "type": "string" } },
+            "proof_type": {
+              "type": "string",
+              "enum": ["client_statement", "manager_statement", "crm_comment", "metric", "absence"]
+            }
+          }
+        }
+      },
+      "questions_for_manager": { "type": "array", "items": { "type": "string" } }
+    }
+  }
+}
