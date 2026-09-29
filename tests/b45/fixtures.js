@@ -56,7 +56,7 @@ var deal122693 = {
   opportunity: 48000,
   pause_reason: 'Не указана',
   full_prompt_text: '=== КАРТОЧКА СДЕЛКИ ===\n\n=== ХРОНОЛОГИЧЕСКИЙ ЖУРНАЛ СОБЫТИЙ ===\n\n...',
-  comm_stats: { total_events: 16, calls: 0, calls_with_audio: 0, comments: 2, chat_messages: 10, tasks: 3 },
+  comm_stats: { total_events: 17, calls: 0, calls_with_audio: 0, comments: 3, chat_messages: 10, tasks: 3 },
   communications: [
     comment('2026-08-19T06:11:22Z', '1 окно 1000*1400'),
     task('2026-08-19T06:45:21Z', 'CRM: сделать расчет'),
@@ -71,7 +71,8 @@ var deal122693 = {
     chat('2026-08-24T02:25:08Z', 'incoming', '[USER=30213 REPLACE]Юлия Тимкина[/USER] начал работу с диалогом'),
     chat('2026-08-24T02:25:58Z', 'outgoing', 'Марина, доброго дня! Ознакомились с расчетом?'),
     chat('2026-08-24T02:26:15Z', 'incoming', '[USER=30213 REPLACE]Юлия Тимкина[/USER] завершил диалог'),
-    task('2026-08-24T02:26:34Z', 'CRM: записать на замер')
+    task('2026-08-24T02:26:34Z', 'CRM: записать на замер'),
+    comment('2026-08-26T07:20:11Z', '[B]:f09f948d: AI-анализ отказа[/B] (26.08.2026 14:20)')
   ]
 };
 

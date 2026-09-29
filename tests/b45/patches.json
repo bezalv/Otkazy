@@ -82,5 +82,11 @@
     "node": "agent-judge-parse",
     "find": "var writer_input = {\n  deal_card: factsPacket.deal_card,\n  facts: facts,\n  metrics: metrics,\n  judge: judge\n};",
     "replace": "// Writer, в отличие от Judge, планирует возврат на сегодня — ему нужны числа «от сейчас».\n// В metrics их класть нельзя: Judge не должен видеть ничего, что растёт со временем.\nvar cutoffTsW = metrics && metrics.cutoff_at ? new Date(metrics.cutoff_at).getTime() : null;\nvar daysSinceLoseW = (cutoffTsW !== null && !isNaN(cutoffTsW)) ? Math.max(0, Math.round((Date.now() - cutoffTsW) / 86400000)) : null;\nvar lastBeforeLoseW = (metrics && typeof metrics.last_contact_days_before_lose === 'number') ? metrics.last_contact_days_before_lose : null;\nvar daysSinceLastContactW = (daysSinceLoseW !== null && lastBeforeLoseW !== null) ? daysSinceLoseW + lastBeforeLoseW : daysSinceLoseW;\n\nvar writer_input = {\n  deal_card: factsPacket.deal_card,\n  facts: facts,\n  metrics: metrics,\n  judge: judge,\n  now: { days_since_lose: daysSinceLoseW, days_since_last_contact: daysSinceLastContactW }\n};"
+  },
+  {
+    "id": "P13-skip-ai-comments",
+    "node": "b4.5 Comm Analytics",
+    "find": "var comms = commsRaw.filter(function(c) { return !isSystemChat(c); });",
+    "replace": "// Наши собственные AI-разборы, записанные в карточку, — не контакт с клиентом и не событие сделки.\n// Живой прогон их ещё не видит, перепрогон уже видит — без фильтра метрики расходятся.\n// Маркер тот же, что в agent-facts-assembler: одно правило на оба места.\nfunction isAiComment(c) {\n  if (!c || c.type !== 'comment') return false;\n  var t = (c.text || '').trim();\n  return t.indexOf('AI-анализ отказа') !== -1 || t.indexOf('[B]:f09f948d:') !== -1;\n}\nvar comms = commsRaw.filter(function(c) { return !isSystemChat(c) && !isAiComment(c); });"
   }
 ]

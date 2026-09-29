@@ -118,9 +118,9 @@ Object.keys(fixtures.real).forEach(function (key) {
 console.log('\n=== 2. Ожидания из задания ===');
 var m124 = runNode(b45after, fixtures.real.deal124101, DAY_OF_LOSE.deal124101).comm_analytics;
 check('124101: cutoff_source = lose_date', m124.cutoff_source, 'lose_date');
-check('124101: cutoff_at = последнее событие 13.09 04:31:10', m124.cutoff_at, '2026-09-13T04:31:10.000Z');
+check('124101: cutoff_at = lose_date, без сдвига на AI-комментарий', m124.cutoff_at, '2026-09-13T04:25:03.000Z');
 check('124101: days_in_funnel_until_lose = 5', m124.days_in_funnel_until_lose, 5);
-check('124101: last_contact_days_before_lose = 0', m124.last_contact_days_before_lose, 0);
+check('124101: last_contact_days_before_lose = 3', m124.last_contact_days_before_lose, 3);
 check('124101: старых имён нет', [m124.days_in_funnel, m124.last_contact_days_ago], [undefined, undefined]);
 
 var m122 = runNode(b45after, fixtures.real.deal122693, DAY_OF_LOSE.deal122693).comm_analytics;
@@ -171,7 +171,24 @@ console.log('\n=== 4. Регресс на одном «сегодня» ===');
   });
   check(key + ': убраны ровно старые имена', removed.sort(), ['calls_last_successful_days_ago', 'chats_last_client_days_ago', 'chats_last_manager_days_ago', 'days_in_funnel', 'last_contact_days_ago'].sort());
   check(key + ': добавлены ровно новые', added.sort(), ['calls_last_successful_days_before_lose', 'chats_last_client_days_before_lose', 'chats_last_manager_days_before_lose', 'cutoff_at', 'cutoff_source', 'days_in_funnel_until_lose', 'last_contact_days_before_lose'].sort());
-  check(key + ': прочие поля не тронуты', changed, []);
+  // Меняется только то, на что влияет исключение нашего AI-разбора из событий сделки.
+  // У 124101 он был последним событием после трёхдневной паузы — поэтому уехали ещё разрыв и тренд.
+  var allowed = { deal124101: ['comments_count', 'last_contact', 'max_gap_days', 'max_gap_period', 'trend'], deal122693: ['comments_count', 'last_contact'] };
+  check(key + ': прочие поля меняются только из-за фильтра AI-комментариев', changed.sort(), allowed[key].sort());
+});
+
+// ── 4b. AI-комментарии исключены из расчётов ─────────────────
+console.log('');
+console.log('=== 4b. Наши AI-комментарии не считаются событиями сделки ===');
+var noP13 = applyPatches(b45before, patches.filter(function (p) { return p.id !== 'P13-skip-ai-comments'; }), 'b4.5 Comm Analytics').code;
+[['deal124101', 3], ['deal122693', 2]].forEach(function (pair) {
+  var key = pair[0], want = pair[1];
+  var withAi = runNode(noP13, fixtures.real[key], DAY_OF_LOSE[key]).comm_analytics;
+  var without = runNode(b45after, fixtures.real[key], DAY_OF_LOSE[key]).comm_analytics;
+  check(key + ': с AI-комментарием отсечка сдвигалась, последний контакт был 0', withAi.last_contact_days_before_lose, 0);
+  check(key + ': после фильтра last_contact_days_before_lose = ' + want, without.last_contact_days_before_lose, want);
+  check(key + ': отсечка вернулась на lose_date', without.cutoff_at < withAi.cutoff_at, true);
+  check(key + ': AI-комментарий не попал в счётчик комментариев', without.comments_count, withAi.comments_count - 1);
 });
 
 // ── 5. Блок now для Writer ───────────────────────────────────
