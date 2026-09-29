@@ -126,5 +126,21 @@
     "field": "parameters.jsCode",
     "find": " | Промпт v2.4'",
     "replace": " | Промпт v2.5'"
+  },
+  {
+    "id": "V3-sql-version-26",
+    "workflow": "BhPWB9S6W5dlMUvV",
+    "node": "Подготовить SQL",
+    "field": "parameters.jsCode",
+    "find": "+ (r.processing_time_sec || 0) + \", 'v2.5', \"",
+    "replace": "+ (r.processing_time_sec || 0) + \", 'v2.6', \""
+  },
+  {
+    "id": "V4-comment-version-26",
+    "workflow": "BhPWB9S6W5dlMUvV",
+    "node": "Собрать AI-комментарий",
+    "field": "parameters.jsCode",
+    "find": " | Промпт v2.5'",
+    "replace": " | Промпт v2.6'"
   }
 ]
