@@ -10,7 +10,11 @@ const model = arg('model', 'gpt-6-sol');
 const dir = path.join(ROOT, 'prototype', 'prompts', 'models', model);
 
 const base = fs.readFileSync(path.join(ROOT, 'prototype', 'prompts', 'judge_v2.5.md'), 'utf8');
-const patches = JSON.parse(fs.readFileSync(path.join(dir, 'patches.json'), 'utf8'));
+const skip = new Set((arg('skip', '') || '').split(',').filter(Boolean));
+const outName = arg('out', 'judge.md');
+const patches = JSON.parse(fs.readFileSync(path.join(dir, 'patches.json'), 'utf8'))
+  .filter(p => !skip.has(p.id));
+if (skip.size) console.log(`Пропущены патчи: ${[...skip].join(', ')}`);
 
 let out = base;
 const applied = [];
@@ -25,8 +29,8 @@ for (const p of patches) {
   applied.push({ id: p.id, delta: p.replace.length - p.find.length });
 }
 
-fs.writeFileSync(path.join(dir, 'judge.md'), out, 'utf8');
-console.log(`Промпт судьи под ${model}: ${path.relative(ROOT, path.join(dir, 'judge.md'))}`);
+fs.writeFileSync(path.join(dir, outName), out, 'utf8');
+console.log(`Промпт судьи под ${model}: ${path.relative(ROOT, path.join(dir, outName))}`);
 console.log(`Было ${base.length} символов, стало ${out.length} (+${out.length - base.length})`);
 console.table(applied);
 

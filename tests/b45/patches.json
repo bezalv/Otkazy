@@ -88,5 +88,11 @@
     "node": "b4.5 Comm Analytics",
     "find": "var comms = commsRaw.filter(function(c) { return !isSystemChat(c); });",
     "replace": "// Наши собственные AI-разборы, записанные в карточку, — не контакт с клиентом и не событие сделки.\n// Живой прогон их ещё не видит, перепрогон уже видит — без фильтра метрики расходятся.\n// Маркер тот же, что в agent-facts-assembler: одно правило на оба места.\nfunction isAiComment(c) {\n  if (!c || c.type !== 'comment') return false;\n  var t = (c.text || '').trim();\n  return t.indexOf('AI-анализ отказа') !== -1 || t.indexOf('[B]:f09f948d:') !== -1;\n}\nvar comms = commsRaw.filter(function(c) { return !isSystemChat(c) && !isAiComment(c); });"
+  },
+  {
+    "id": "P14-pass-lose-reason",
+    "node": "b4.5 Comm Analytics",
+    "find": "'days_from_pause_to_deferred', 'stage_history_count', 'comm_stats', 'communications',",
+    "replace": "'days_from_pause_to_deferred', 'stage_history_count', 'comm_stats', 'communications', 'lose_reason_id', 'lose_reason', 'lose_date', 'days_in_lost', 'lead_id',"
   }
 ]
