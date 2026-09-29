@@ -1,0 +1,130 @@
+[
+  {
+    "id": "J1-input-block",
+    "workflow": "GLQ2iuzRaCQZM7QU",
+    "node": "Set: Judge System Prompt",
+    "field": "parameters.assignments.assignments[0].value",
+    "find": "- facts — массив атомарных фактов, каждый с полями source, actor, ts, content",
+    "replace": "- facts — массив атомарных фактов, каждый с полями source, actor, ts, content\n\nВСЕ МЕТРИКИ В metrics ПОСЧИТАНЫ НА МОМЕНТ ЗАКРЫТИЯ СДЕЛКИ (поле cutoff_at). Поля вида *_days_before_lose — сколько дней прошло от события до закрытия. Сегодняшняя дата в оценке не участвует: ты оцениваешь, правомерно ли закрыли сделку в тот момент, а не как сделка выглядит сегодня."
+  },
+  {
+    "id": "J2-test-available",
+    "workflow": "GLQ2iuzRaCQZM7QU",
+    "node": "Set: Judge System Prompt",
+    "field": "parameters.assignments.assignments[0].value",
+    "find": "Тест: «Клиент сейчас реально доступен и в диалоге?». Если он не отвечает 30+ дней до момента закрытия",
+    "replace": "Тест: «Был ли клиент доступен и в диалоге на момент закрытия?». Если он не отвечал 30+ дней до закрытия"
+  },
+  {
+    "id": "J3-key-check",
+    "workflow": "GLQ2iuzRaCQZM7QU",
+    "node": "Set: Judge System Prompt",
+    "field": "parameters.assignments.assignments[0].value",
+    "find": "Ключевая проверка перед verdict=«неправомерен»: «Клиент сейчас реально доступен для возврата?». Если ответ «нет» (ушёл к конкуренту, молчит 30+ дней, физически выбыл)",
+    "replace": "Ключевая проверка перед verdict=«неправомерен»: «Был ли клиент доступен для возврата на момент закрытия?». Если ответ «нет» (ушёл к конкуренту, молчал 30+ дней до закрытия, физически выбыл)"
+  },
+  {
+    "id": "J4-30days-list",
+    "workflow": "GLQ2iuzRaCQZM7QU",
+    "node": "Set: Judge System Prompt",
+    "field": "parameters.assignments.assignments[0].value",
+    "find": "— Клиент 30+ дней не отвечает ни в одном канале.",
+    "replace": "— Клиент не отвечал ни в одном канале 30+ дней до закрытия."
+  },
+  {
+    "id": "J5-nedozvon",
+    "workflow": "GLQ2iuzRaCQZM7QU",
+    "node": "Set: Judge System Prompt",
+    "field": "parameters.assignments.assignments[0].value",
+    "find": "Если клиент молчит 30+ дней на всех каналах — «правомерен» с customer_unreachable.",
+    "replace": "Если клиент молчал 30+ дней на всех каналах до закрытия — «правомерен» с customer_unreachable."
+  },
+  {
+    "id": "J6-null-level",
+    "workflow": "GLQ2iuzRaCQZM7QU",
+    "node": "Set: Judge System Prompt",
+    "field": "parameters.assignments.assignments[0].value",
+    "find": "NULL — клиент полностью потерян: физически выбыл, молчит 30+ дней на всех каналах, заказал у конкурента без намёков на возврат, регуляторный запрет.",
+    "replace": "NULL — клиент полностью потерян: физически выбыл, молчал 30+ дней на всех каналах до закрытия, заказал у конкурента без намёков на возврат, регуляторный запрет."
+  },
+  {
+    "id": "J7-nepravomeren-intro",
+    "workflow": "GLQ2iuzRaCQZM7QU",
+    "node": "Set: Judge System Prompt",
+    "field": "parameters.assignments.assignments[0].value",
+    "find": "Отказ НЕПРАВОМЕРЕН, если клиент ещё НА СВЯЗИ или недавно был на связи, и выполнено хотя бы одно:",
+    "replace": "Отказ НЕПРАВОМЕРЕН, если на момент закрытия клиент был на связи или незадолго до закрытия выходил на связь, и выполнено хотя бы одно:"
+  },
+  {
+    "id": "J8-level-high",
+    "workflow": "GLQ2iuzRaCQZM7QU",
+    "node": "Set: Judge System Prompt",
+    "field": "parameters.assignments.assignments[0].value",
+    "find": "ВЫСОКИЙ — клиент активно общается сейчас или недавно, отказных слов не было",
+    "replace": "ВЫСОКИЙ — клиент активно общался незадолго до закрытия, отказных слов не было"
+  },
+  {
+    "id": "J9-level-medium",
+    "workflow": "GLQ2iuzRaCQZM7QU",
+    "node": "Set: Judge System Prompt",
+    "field": "parameters.assignments.assignments[0].value",
+    "find": "СРЕДНИЙ — клиент остывает, прошло 1–2 недели тишины, есть риск конкурентов, но прямого «нет» не было.",
+    "replace": "СРЕДНИЙ — клиент остывал: к закрытию 1–2 недели тишины, есть риск конкурентов, но прямого «нет» не было."
+  },
+  {
+    "id": "J10-unreachable-class",
+    "workflow": "GLQ2iuzRaCQZM7QU",
+    "node": "Set: Judge System Prompt",
+    "field": "parameters.assignments.assignments[0].value",
+    "find": "- customer_unreachable — реально не выходит на связь (подтверждено отсутствием ответов 2+ недели)",
+    "replace": "- customer_unreachable — реально не выходил на связь (подтверждено отсутствием ответов 2+ недели до закрытия)"
+  },
+  {
+    "id": "W1-input-block",
+    "workflow": "GLQ2iuzRaCQZM7QU",
+    "node": "Set: Writer System Prompt",
+    "field": "parameters.assignments.assignments[0].value",
+    "find": "- judge — вывод Judge: verdict, verdict_reason_short, recoverable_level, closure_reason_class, exact_reason, manager_mistakes, key_signals, risk_factors, questions_for_manager, misplaced, correct_stage",
+    "replace": "- judge — вывод Judge: verdict, verdict_reason_short, recoverable_level, closure_reason_class, exact_reason, manager_mistakes, key_signals, risk_factors, questions_for_manager, misplaced, correct_stage\n- now — что изменилось со дня закрытия: days_since_lose (сколько дней сделка лежит в отказе) и days_since_last_contact (сколько дней клиент молчит на сегодня)\n\nmetrics посчитаны НА МОМЕНТ ЗАКРЫТИЯ сделки, now — сколько прошло с тех пор. Когда пишешь «сколько дней тишины» или оцениваешь срочность звонка, бери числа из now, а не из metrics."
+  },
+  {
+    "id": "W2-mode-a",
+    "workflow": "GLQ2iuzRaCQZM7QU",
+    "node": "Set: Writer System Prompt",
+    "field": "parameters.assignments.assignments[0].value",
+    "find": "РЕЖИМ A — judge.verdict == «неправомерен». Клиент ещё на связи, сделку можно вернуть.",
+    "replace": "РЕЖИМ A — judge.verdict == «неправомерен». На момент закрытия клиент был на связи, сделку можно вернуть. С отказа прошло now.days_since_lose дней — учитывай это в плане: чем больше прошло, тем осторожнее заход."
+  },
+  {
+    "id": "W3-context-silence",
+    "workflow": "GLQ2iuzRaCQZM7QU",
+    "node": "Set: Writer System Prompt",
+    "field": "parameters.assignments.assignments[0].value",
+    "find": "Выжимка из журнала в 3–5 строк. Включает: кому звоним (клиент или ЛПР), что уже отправлено, последний значимый факт и сколько дней тишины",
+    "replace": "Выжимка из журнала в 3–5 строк. Включает: кому звоним (клиент или ЛПР), что уже отправлено, последний значимый факт и сколько дней тишины (берётся из now.days_since_last_contact)"
+  },
+  {
+    "id": "W4-verdict-b",
+    "workflow": "GLQ2iuzRaCQZM7QU",
+    "node": "Set: Writer System Prompt",
+    "field": "parameters.assignments.assignments[0].value",
+    "find": "Отказ правомерен, клиент [причина недоступности в 2-4 словах — «ушёл к конкуренту» / «переехал» / «молчит 5 недель»]. Вернуть нельзя. [Одно предложение — главный урок для менеджера.]",
+    "replace": "Отказ правомерен, клиент [причина недоступности в 2-4 словах — «ушёл к конкуренту» / «переехал» / «молчит 5 недель»]. Вернуть нельзя. [Одно предложение — главный урок для менеджера.]\n\nСрок молчания («молчит 5 недель») считай по now.days_since_last_contact, а не по метрикам на момент закрытия."
+  },
+  {
+    "id": "V1-sql-version",
+    "workflow": "BhPWB9S6W5dlMUvV",
+    "node": "Подготовить SQL",
+    "field": "parameters.jsCode",
+    "find": "+ (r.processing_time_sec || 0) + \", 'v2.4', \"",
+    "replace": "+ (r.processing_time_sec || 0) + \", 'v2.5', \""
+  },
+  {
+    "id": "V2-comment-version",
+    "workflow": "BhPWB9S6W5dlMUvV",
+    "node": "Собрать AI-комментарий",
+    "field": "parameters.jsCode",
+    "find": " | Промпт v2.4'",
+    "replace": " | Промпт v2.5'"
+  }
+]

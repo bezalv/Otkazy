@@ -1,0 +1,86 @@
+[
+  {
+    "id": "P1-cutoff",
+    "node": "b4.5 Comm Analytics",
+    "find": "function daysBetween(ts1, ts2) { return Math.round(Math.abs(ts2 - ts1) / 86400000); }\nfunction daysAgo(ts) { return daysBetween(ts, now.getTime()); }",
+    "replace": "function daysBetween(ts1, ts2) { return Math.round(Math.abs(ts2 - ts1) / 86400000); }\n// === ТОЧКА ОТСЕЧКИ ===\n// Метрики хода продажи считаем на момент закрытия сделки, а не от даты прогона:\n// иначе те же факты назавтра дают другой вердикт.\nvar lastEventTs = null;\nfor (var lei = 0; lei < comms.length; lei++) { var evTs = parseDate(comms[lei].date); if (evTs !== null && (lastEventTs === null || evTs > lastEventTs)) lastEventTs = evTs; }\nvar cutoffSource = 'lose_date';\nvar cutoffTs = parseDate(input.lose_date);\nif (cutoffTs === null) { cutoffTs = lastEventTs; cutoffSource = 'last_event'; }\nif (cutoffTs === null) { cutoffTs = parseDate(input.date_modify); cutoffSource = 'date_modify'; }\nif (cutoffTs === null) { cutoffTs = now.getTime(); cutoffSource = 'now'; }\nvar cutoffShiftedDays = 0;\nif (lastEventTs !== null && cutoffTs < lastEventTs) { cutoffShiftedDays = daysBetween(cutoffTs, lastEventTs); cutoffTs = lastEventTs; }\nvar daysSinceLose = Math.max(0, Math.round((now.getTime() - cutoffTs) / 86400000));\n// daysAgo теперь означает «за сколько дней до закрытия», а не «сколько дней назад от сегодня»\nfunction daysAgo(ts) { return daysBetween(ts, cutoffTs); }"
+  },
+  {
+    "id": "P2-warning",
+    "node": "b4.5 Comm Analytics",
+    "find": "var dataWarnings = [];",
+    "replace": "var dataWarnings = [];\nif (cutoffSource !== 'lose_date') dataWarnings.push('Cutoff by ' + cutoffSource + ' (lose_date missing)');"
+  },
+  {
+    "id": "P3-analytics-head",
+    "node": "b4.5 Comm Analytics",
+    "find": "var analytics = { days_in_funnel: daysInFunnel,",
+    "replace": "var analytics = { cutoff_at: new Date(cutoffTs).toISOString(), cutoff_source: cutoffSource, days_in_funnel_until_lose: daysInFunnel,"
+  },
+  {
+    "id": "P4-calls-last",
+    "node": "b4.5 Comm Analytics",
+    "find": "calls_last_successful_days_ago: lastSuccessfulCall ? daysAgo(lastSuccessfulCall.ts) : null,",
+    "replace": "calls_last_successful_days_before_lose: lastSuccessfulCall ? daysAgo(lastSuccessfulCall.ts) : null,"
+  },
+  {
+    "id": "P5-chats-client",
+    "node": "b4.5 Comm Analytics",
+    "find": "chats_last_client_days_ago: lastClientChat ? daysAgo(lastClientChat.ts) : null,",
+    "replace": "chats_last_client_days_before_lose: lastClientChat ? daysAgo(lastClientChat.ts) : null,"
+  },
+  {
+    "id": "P6-chats-manager",
+    "node": "b4.5 Comm Analytics",
+    "find": "chats_last_manager_days_ago: lastManagerChat ? daysAgo(lastManagerChat.ts) : null,",
+    "replace": "chats_last_manager_days_before_lose: lastManagerChat ? daysAgo(lastManagerChat.ts) : null,"
+  },
+  {
+    "id": "P7-last-contact",
+    "node": "b4.5 Comm Analytics",
+    "find": "last_contact_days_ago: lastContact ? daysAgo(lastContact) : null,",
+    "replace": "last_contact_days_before_lose: lastContact ? daysAgo(lastContact) : null,"
+  },
+  {
+    "id": "P8-text-period",
+    "node": "b4.5 Comm Analytics",
+    "find": "L.push('Period: ' + pS + ' - ' + pE + ' (' + daysInFunnel + ' days in funnel)');",
+    "replace": "L.push('Period: ' + pS + ' - ' + pE + ' (' + daysInFunnel + ' days in funnel, until lose)');\nL.push('Cutoff (deal closed): ' + formatDateRu(cutoffTs) + ' [source: ' + cutoffSource + (cutoffShiftedDays > 0 ? ', shifted +' + cutoffShiftedDays + 'd to last event' : '') + ']');\nL.push('Days since lose (as of today): ' + daysSinceLose);"
+  },
+  {
+    "id": "P9-text-last-successful",
+    "node": "b4.5 Comm Analytics",
+    "find": "if (lastSuccessfulCall) L.push('  Last successful: ' + formatDateRu(lastSuccessfulCall.ts) + ' (' + daysAgo(lastSuccessfulCall.ts) + ' days ago)');",
+    "replace": "if (lastSuccessfulCall) L.push('  Last successful: ' + formatDateRu(lastSuccessfulCall.ts) + ' (' + daysAgo(lastSuccessfulCall.ts) + ' days before lose)');"
+  },
+  {
+    "id": "P10-text-chat-client",
+    "node": "b4.5 Comm Analytics",
+    "find": "if (lastClientChat) L.push('  Last client msg: ' + formatDateRu(lastClientChat.ts) + ' (' + daysAgo(lastClientChat.ts) + ' days ago)');",
+    "replace": "if (lastClientChat) L.push('  Last client msg: ' + formatDateRu(lastClientChat.ts) + ' (' + daysAgo(lastClientChat.ts) + ' days before lose)');"
+  },
+  {
+    "id": "P11-text-chat-manager",
+    "node": "b4.5 Comm Analytics",
+    "find": "if (lastManagerChat) L.push('  Last manager msg: ' + formatDateRu(lastManagerChat.ts) + ' (' + daysAgo(lastManagerChat.ts) + ' days ago)');",
+    "replace": "if (lastManagerChat) L.push('  Last manager msg: ' + formatDateRu(lastManagerChat.ts) + ' (' + daysAgo(lastManagerChat.ts) + ' days before lose)');"
+  },
+  {
+    "id": "P12-text-last-contact",
+    "node": "b4.5 Comm Analytics",
+    "find": "if (lastContact) L.push('  Last contact: ' + formatDateRu(lastContact) + ' (' + daysAgo(lastContact) + ' days ago)');",
+    "replace": "if (lastContact) L.push('  Last contact: ' + formatDateRu(lastContact) + ' (' + daysAgo(lastContact) + ' days before lose)');"
+  },
+  {
+    "id": "S1-skip-passfields",
+    "node": "Пропуск (нет аудио)",
+    "find": "  'days_from_pause_to_deferred','stage_history_count','comm_stats'];",
+    "replace": "  'days_from_pause_to_deferred','stage_history_count','comm_stats',\n  'lose_reason_id','lose_reason','lose_date','days_in_lost','lead_id'];"
+  },
+  {
+    "id": "W1-writer-now",
+    "node": "agent-judge-parse",
+    "find": "var writer_input = {\n  deal_card: factsPacket.deal_card,\n  facts: facts,\n  metrics: metrics,\n  judge: judge\n};",
+    "replace": "// Writer, в отличие от Judge, планирует возврат на сегодня — ему нужны числа «от сейчас».\n// В metrics их класть нельзя: Judge не должен видеть ничего, что растёт со временем.\nvar cutoffTsW = metrics && metrics.cutoff_at ? new Date(metrics.cutoff_at).getTime() : null;\nvar daysSinceLoseW = (cutoffTsW !== null && !isNaN(cutoffTsW)) ? Math.max(0, Math.round((Date.now() - cutoffTsW) / 86400000)) : null;\nvar lastBeforeLoseW = (metrics && typeof metrics.last_contact_days_before_lose === 'number') ? metrics.last_contact_days_before_lose : null;\nvar daysSinceLastContactW = (daysSinceLoseW !== null && lastBeforeLoseW !== null) ? daysSinceLoseW + lastBeforeLoseW : daysSinceLoseW;\n\nvar writer_input = {\n  deal_card: factsPacket.deal_card,\n  facts: facts,\n  metrics: metrics,\n  judge: judge,\n  now: { days_since_lose: daysSinceLoseW, days_since_last_contact: daysSinceLastContactW }\n};"
+  }
+]
