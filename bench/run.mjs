@@ -22,7 +22,7 @@ const DATA = path.join(BENCH, 'data');
 const BACKUP = path.join(ROOT, 'tmp', 'backup', 'GLQ2iuzRaCQZM7QU');
 const LEDGER = path.join(DATA, 'ledger.json');
 
-const CEILING_RUB = 300;          // потолок расходов на весь стенд
+const CEILING_RUB = 360;          // потолок расходов на весь стенд (поднят 30.09 с 300)
 const POLZA_URL = 'https://api.polza.ai/api/v1/chat/completions';
 
 // ── модели ───────────────────────────────────────────────────────────────────
