@@ -22,7 +22,7 @@ const E = env();
 const H = { apikey: E.SUPABASE_PUBLISHABLE_KEY, Authorization: `Bearer ${E.SUPABASE_PUBLISHABLE_KEY}` };
 
 const COLS = ['id', 'deal_id', 'event_id', 'event_date', 'direction', 'call_duration_seconds',
-  'transcript_status', 'transcript_manager_text', 'transcript_client_text', 'transcript_replicas',
+  'transcript_status', 'transcript_manager_text', 'transcript_client_text', 'transcript_replicas', 'transcript_formatted',
   'call_subject'].join(',');
 
 // Берём и transcribed, и voicemail: второе нужно, чтобы сверить детектор с тем,

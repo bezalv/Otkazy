@@ -34,6 +34,17 @@ var NOTALK_ZERO_SEC_CHARS = 200;
 // значит клиент сказал что-то своё.
 var NOTALK_MEANINGFUL_CHARS = 12;
 
+// Остаток реплики МЕНЕДЖЕРА для ветки «клиент сказал только приветствие». Если менеджер
+// говорил содержательно, разговор был, даже когда в NOTALK_PURPOSE нет подходящих слов.
+// Записи двухканальные: в канал менеджера попадают и сообщения оператора связи до ответа
+// абонента, поэтому их нужно вырезать перед оценкой.
+//
+// Правило применяется ТОЛЬКО когда клиент сказал что-то помимо приветствия — пусть и коротко,
+// как «это мой номер» в сделке 96701. Если клиент ограничился «Алло», разговора не было, даже
+// когда менеджер говорил содержательно: так выглядит обрыв связи (сделка 109997, менеджер
+// «связь прерывается… вас не слышно?»).
+var NOTALK_MANAGER_REST_CHARS = 15;
+
 // ── списки ──────────────────────────────────────────────────────────────────
 
 // Фразы систем дозвона. Звучат ДО того, как трубку сняли, поэтому сами по себе ничего не
@@ -93,9 +104,10 @@ var NOTALK_BOT_SMALLTALK = [
   'одновременно положим трубки', 'не молчите лучшее'
 ];
 
-// Длинные фразы целиком — только их ищем в реплике менеджера. Диаризация иногда приписывает
-// сообщение автоответчика менеджеру, но искать там отдельные слова нельзя: у менеджера
-// «я прослушала ваш голосовой» — живой разговор (сделка 118715).
+// Длинные фразы целиком — только их ищем в реплике менеджера. Записи двухканальные, стороны
+// не путаются: сообщения оператора связи звучат до ответа абонента и слышны на канале
+// менеджера. Искать там отдельные слова нельзя: у менеджера «я прослушала ваш голосовой» —
+// живой разговор (сделка 118715).
 var NOTALK_MACHINE_IN_MANAGER = [
   'абонент сейчас не может ответить', 'абонент не может ответить',
   'абонент пока не может', 'абонент не берет трубку', 'абонент недоступен',
@@ -103,6 +115,20 @@ var NOTALK_MACHINE_IN_MANAGER = [
   'вне зоны действия сети', 'телефон выключен или находится',
   'вызываемый абонент не может', 'я виртуальный помощник', 'я виртуальный ассистент',
   'я голосовой помощник', 'я голосовой ассистент'
+];
+
+// Системные фразы, которые попадают в канал менеджера от телефонии, а не от человека.
+var NOTALK_MANAGER_SYSTEM = [
+  'пожалуйста подождите завершение обработки', 'подождите завершение обработки',
+  'завершение обработки', 'пожалуйста подождите', 'идет соединение', 'соединяю'
+];
+
+// Менеджер сам говорит, что связь не установилась. Если при этом клиент успел сказать только
+// «алло», предложение до него не дошло, сколько бы менеджер ни говорил: разговора не было.
+// Это отличает обрыв связи (сделка 109997) от обычного «менеджер назвал цель, клиент услышал».
+var NOTALK_BAD_LINE = [
+  'связь прерывается', 'связь прервалась', 'связь барахлит', 'вас не слышно',
+  'не слышно', 'плохо слышно', 'вы меня слышите', 'ничего не слышно', 'вы тут'
 ];
 
 // Трубку снял не клиент: секретарь, родственник, не тот номер.
@@ -193,8 +219,32 @@ function notalkHit(norm, list) {
   return null;
 }
 
+// Моно-режим: стерео не распозналось, и весь звонок расшифрован одним потоком «Говорящий:».
+// В базе таких 296 из 4226. Стороны в них не разделены (весь текст падает в канал менеджера),
+// поэтому судить, кто что сказал, нельзя. Метим только если ВЕСЬ текст — фразы робота,
+// оператора и приветствия. Остался живой текст — отдаём судье, пусть читает.
+function detectNoConversationMono(wholeText, durationSec) {
+  var wn = notalkStripList(notalkNormalize(wholeText), NOTALK_DIALING);
+  wn = notalkStripList(wn, NOTALK_MANAGER_SYSTEM);
+
+  var machine = notalkHit(wn, NOTALK_MACHINE) || notalkHit(wn, NOTALK_BOT_SMALLTALK);
+  var notClient = notalkHit(wn, NOTALK_NOT_CLIENT);
+
+  var rest = notalkStripList(wn, NOTALK_MACHINE);
+  rest = notalkStripList(rest, NOTALK_BOT_SMALLTALK);
+  rest = notalkStripList(rest, NOTALK_NOT_CLIENT);
+  rest = notalkStripWords(rest, NOTALK_GREETING);
+  rest = notalkStripWords(rest, NOTALK_DEBRIS);
+
+  if (rest.length > NOTALK_MEANINGFUL_CHARS) return null;
+  if (machine) return { reason: 'machine', matched: machine, rest: rest, mono: true, duration_sec: durationSec };
+  if (notClient) return { reason: 'not_client', matched: notClient, rest: rest, mono: true, duration_sec: durationSec };
+  return { reason: 'greeting_only', matched: null, rest: rest, mono: true, duration_sec: durationSec };
+}
+
 // Возвращает null, если разговор состоялся, либо объект с причиной.
-function detectNoConversation(clientText, managerText, durationSec) {
+// isMono — признак моно-записи: в проде это наличие «Говорящий:» в отформатированном транскрипте.
+function detectNoConversation(clientText, managerText, durationSec, isMono) {
   var cnRaw = notalkNormalize(clientText);
   var mn = notalkNormalize(managerText);
 
@@ -206,6 +256,9 @@ function detectNoConversation(clientText, managerText, durationSec) {
     isShort = durationSec <= NOTALK_MAX_SEC;
   }
   if (!isShort) return null;
+
+  // Моно-запись разбираем отдельно: делить текст по сторонам нельзя.
+  if (isMono) return detectNoConversationMono((clientText || '') + ' ' + (managerText || ''), durationSec);
 
   // Шум систем дозвона убираем сразу: он звучит до ответа.
   var cn = notalkStripList(cnRaw, NOTALK_DIALING);
@@ -231,11 +284,25 @@ function detectNoConversation(clientText, managerText, durationSec) {
   if (machine) return { reason: 'machine', matched: machine, rest: rest, duration_sec: durationSec };
   if (notClient) return { reason: 'not_client', matched: notClient, rest: rest, duration_sec: durationSec };
 
-  // Клиент ограничился приветствием. Если менеджер назвал цель — клиент снял трубку и услышал
-  // предложение, это контакт. Если менеджер молчал — звонок сорвался на нашей стороне.
+  // Клиент ограничился приветствием. Сначала смотрим, не жалуется ли менеджер на связь:
+  // тогда предложение до клиента не дошло, даже если цель звонка была названа.
+  var badLine = notalkHit(mn, NOTALK_BAD_LINE);
+  if (badLine) return { reason: 'bad_line', matched: badLine, rest: rest, duration_sec: durationSec };
+
+  // Если менеджер назвал цель — клиент снял трубку и услышал предложение, это контакт.
+  // Если менеджер молчал — звонок сорвался на нашей стороне.
   if (notalkManagerNamedPurpose(mn)) return null;
 
-  return { reason: 'greeting_only', matched: null, rest: rest, duration_sec: durationSec };
+  // Слов из NOTALK_PURPOSE может не быть, а разговор всё равно состоялся. Смотрим, что
+  // осталось от реплики менеджера, если убрать системные фразы телефонии и приветствия.
+  var mgrRest = notalkStripList(mn, NOTALK_DIALING);
+  mgrRest = notalkStripList(mgrRest, NOTALK_MANAGER_SYSTEM);
+  mgrRest = notalkStripList(mgrRest, NOTALK_MACHINE_IN_MANAGER);
+  mgrRest = notalkStripWords(mgrRest, NOTALK_GREETING);
+  mgrRest = notalkStripWords(mgrRest, NOTALK_DEBRIS);
+  if (rest.length > 0 && mgrRest.length > NOTALK_MANAGER_REST_CHARS) return null;
+
+  return { reason: 'greeting_only', matched: null, rest: rest, manager_rest: mgrRest, duration_sec: durationSec };
 }
 
 function notalkManagerNamedPurpose(mn) {

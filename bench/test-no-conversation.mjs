@@ -33,10 +33,12 @@ const VM_HIGH = ['абонент недоступен', 'абонент не д�
 const vmHit = (norm) => VM_HIGH.some(p => norm.indexOf(p) !== -1);
 
 const calls = JSON.parse(fs.readFileSync(path.join(DATA, 'short-calls.json'), 'utf8'));
+// Моно-запись: стерео не распозналось, весь звонок расшифрован одним потоком «Говорящий:».
+const isMono = (c) => ((c.transcript_formatted || '').indexOf('Говорящий') !== -1);
 
 const flagged = [], notFlagged = [];
 for (const c of calls) {
-  const res = D.detectNoConversation(c.transcript_client_text, c.transcript_manager_text, c.call_duration_seconds);
+  const res = D.detectNoConversation(c.transcript_client_text, c.transcript_manager_text, c.call_duration_seconds, isMono(c));
   const norm = D.notalkNormalize(c.transcript_client_text);
   const row = { ...c, verdict: res, norm_client: norm, norm_manager: D.notalkNormalize(c.transcript_manager_text), already_vm: c.transcript_status === 'voicemail' || vmHit(norm) };
   (res ? flagged : notFlagged).push(row);
@@ -116,7 +118,7 @@ for (const t of CONTROL) {
     return hay.indexOf(D.notalkNormalize(t.frag)) !== -1;
   });
   if (!rows.length) { console.log(`  ?    ${t.deal}: звонок с «${t.frag}» не найден`); fails++; continue; }
-  const res = rows.map(c => D.detectNoConversation(c.transcript_client_text, c.transcript_manager_text, c.call_duration_seconds));
+  const res = rows.map(c => D.detectNoConversation(c.transcript_client_text, c.transcript_manager_text, c.call_duration_seconds, isMono(c)));
   const anyFlag = res.some(Boolean);
   const ok = t.flag ? anyFlag : !anyFlag;
   if (!ok) fails++;
@@ -136,7 +138,7 @@ const edges = calls.filter(c => {
   if (D.notalkHit(n, D.NOTALK_MACHINE) || D.notalkHit(n, D.NOTALK_BOT_SMALLTALK)) return false;
   return EDGE_WORDS.some(w => n.indexOf(w) !== -1);
 });
-const edgesFlagged = edges.filter(c => D.detectNoConversation(c.transcript_client_text, c.transcript_manager_text, c.call_duration_seconds));
+const edgesFlagged = edges.filter(c => D.detectNoConversation(c.transcript_client_text, c.transcript_manager_text, c.call_duration_seconds, isMono(c)));
 console.log('\n' + '='.repeat(78));
 console.log(`ПОГРАНИЧНЫЕ (живые короткие отказы без признаков машины): ${edges.length}`);
 console.log(`Ошибочно помечено: ${edgesFlagged.length} ${edgesFlagged.length ? '✗' : '✓ ни одного'}`);
