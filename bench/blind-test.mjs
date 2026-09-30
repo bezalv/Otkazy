@@ -12,6 +12,9 @@ const ROOT = path.resolve(import.meta.dirname, '..');
 const DATA = path.join(ROOT, 'bench', 'data');
 const arg = (n, d) => { const i = process.argv.indexOf('--' + n); return i === -1 ? d : process.argv[i + 1]; };
 const TAG = arg('tag', 'sol-k2');
+// --from-db: тексты Sol берутся не из сырых ответов стенда, а из базы — то есть ровно те,
+// что выдал прод после переключения. Источник: bench/data/prod-texts.json (готовит fetch-prod.mjs).
+const fromDb = process.argv.includes('--from-db');
 const WANT = Number(arg('pairs', 10));
 
 // Порядок внутри пары фиксируем от seed, чтобы перезапуск давал тот же расклад.
@@ -60,6 +63,25 @@ const bbToMd = (s) => s.replace(/\[B\]/g, '**').replace(/\[\/B\]/g, '**').replac
 // ── подбор сделок, где есть оба текста ──────────────────────────────────────
 const rawDir = path.join(DATA, 'raw', TAG);
 const candidates = [];
+
+if (fromDb) {
+  const prod = JSON.parse(fs.readFileSync(path.join(DATA, 'prod-texts.json'), 'utf8'));
+  for (const row of prod) {
+    const goldenPath = path.join(DATA, 'golden', `${row.deal_id}.json`);
+    if (!fs.existsSync(goldenPath)) { console.log(`  ! ${row.deal_id}: нет эталона Opus, пропуск`); continue; }
+    const golden = JSON.parse(fs.readFileSync(goldenPath, 'utf8'));
+    const opusText = (golden.final_comment || '').trim();
+    const solText = (row.final_comment || '').trim();
+    if (!opusText || opusText === 'Отказ правомерен' || opusText.length < 200) { console.log(`  ! ${row.deal_id}: текст Opus короткий, пропуск`); continue; }
+    if (!solText || solText === 'Отказ правомерен' || solText.length < 200) { console.log(`  ! ${row.deal_id}: текст Sol короткий, пропуск`); continue; }
+    candidates.push({
+      dealId: row.deal_id,
+      opus: renderComment(golden.judge, opusText),
+      sol: renderComment(row.judge, solText),
+      opusLen: opusText.length, solLen: solText.length
+    });
+  }
+} else
 for (const f of fs.readdirSync(rawDir)) {
   const m = f.match(/^(\d+)\.writer\.json$/);
   if (!m) continue;
