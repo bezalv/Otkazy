@@ -1,5 +1,5 @@
 // Прогон детектора «разговора не было» по всем коротким звонкам из базы, без правок в n8n.
-// Запуск: node bench/test-no-conversation.mjs [--seed 1] [--samples 10]
+// Запуск: node bench/test-no-conversation.mjs [--samples 10]
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
@@ -12,7 +12,11 @@ const SAMPLES = Number(arg('samples', 10));
 
 // Детектор берём из файла как есть — тот же код уйдёт в ноды.
 const src = fs.readFileSync(path.join(ROOT, 'prototype', 'lib', 'no-conversation.js'), 'utf8');
-const detect = new Function(src + '\nreturn { detectNoConversation: detectNoConversation, NOTALK_MAX_SEC: NOTALK_MAX_SEC, NOTALK_MACHINE: NOTALK_MACHINE, NOTALK_GREETING: NOTALK_GREETING, NOTALK_PURPOSE: NOTALK_PURPOSE, notalkNormalize: notalkNormalize, notalkStripGreetings: notalkStripGreetings };')();
+const D = new Function(src + `
+return { detectNoConversation: detectNoConversation, notalkNormalize: notalkNormalize,
+  NOTALK_MACHINE: NOTALK_MACHINE, NOTALK_BOT_SMALLTALK: NOTALK_BOT_SMALLTALK,
+  NOTALK_NOT_CLIENT: NOTALK_NOT_CLIENT, NOTALK_PURPOSE: NOTALK_PURPOSE,
+  NOTALK_MAX_SEC: NOTALK_MAX_SEC, notalkHit: notalkHit };`)();
 
 // Списки существующего detectVoicemail из agent-facts-assembler — чтобы отделить,
 // что он уже ловит, а что детектор добирает.
@@ -32,110 +36,132 @@ const calls = JSON.parse(fs.readFileSync(path.join(DATA, 'short-calls.json'), 'u
 
 const flagged = [], notFlagged = [];
 for (const c of calls) {
-  const res = detect.detectNoConversation(c.transcript_client_text, c.transcript_manager_text, c.call_duration_seconds);
-  const norm = detect.notalkNormalize(c.transcript_client_text);
-  const row = {
-    ...c,
-    verdict: res,
-    norm_client: norm,
-    norm_manager: detect.notalkNormalize(c.transcript_manager_text),
-    already_vm: c.transcript_status === 'voicemail' || vmHit(norm)
-  };
+  const res = D.detectNoConversation(c.transcript_client_text, c.transcript_manager_text, c.call_duration_seconds);
+  const norm = D.notalkNormalize(c.transcript_client_text);
+  const row = { ...c, verdict: res, norm_client: norm, norm_manager: D.notalkNormalize(c.transcript_manager_text), already_vm: c.transcript_status === 'voicemail' || vmHit(norm) };
   (res ? flagged : notFlagged).push(row);
+}
+
+const cut = (s, n) => { s = (s || '').replace(/\s+/g, ' ').trim(); return s.length > n ? s.slice(0, n) + '…' : s; };
+function pick(arr, n, salt) {
+  const scored = arr.map(x => ({ x, h: crypto.createHash('sha256').update(`${SEED}|${salt}|${x.id}`).digest('hex') }));
+  scored.sort((a, b) => a.h < b.h ? -1 : 1);
+  return scored.slice(0, n).map(s => s.x);
 }
 
 // ── сводка ──────────────────────────────────────────────────────────────────
 const tr = calls.filter(c => c.transcript_status === 'transcribed');
 const flaggedTr = flagged.filter(c => c.transcript_status === 'transcribed');
 const newlyCaught = flaggedTr.filter(c => !c.already_vm);
-
-console.log('='.repeat(78));
-console.log(`Всего коротких звонков (≤${detect.NOTALK_MAX_SEC} сек): ${calls.length}`);
-console.log(`  из них transcribed: ${tr.length}, voicemail: ${calls.length - tr.length}`);
-console.log(`\nПОМЕЧЕНО «разговора не было»: ${flagged.length} из ${calls.length} (${Math.round(flagged.length / calls.length * 100)}%)`);
-console.log(`  среди transcribed: ${flaggedTr.length} из ${tr.length} (${Math.round(flaggedTr.length / tr.length * 100)}%)`);
-console.log(`  из них НЕ ловит существующий detectVoicemail: ${newlyCaught.length} — это и есть прирост`);
 const byReason = {};
 for (const c of flagged) byReason[c.verdict.reason] = (byReason[c.verdict.reason] || 0) + 1;
+
+console.log('='.repeat(78));
+console.log(`Коротких звонков: ${calls.length} (transcribed ${tr.length}, voicemail ${calls.length - tr.length})`);
+console.log(`ПОМЕЧЕНО: ${flagged.length} из ${calls.length} (${Math.round(flagged.length / calls.length * 100)}%)`);
 console.log(`  по причине:`, byReason);
-console.log(`\nНЕ помечено: ${notFlagged.length}`);
-const nfEmpty = notFlagged.filter(c => !c.norm_client);
-const nfPurpose = notFlagged.filter(c => c.norm_client && detect.NOTALK_PURPOSE.some(p => c.norm_manager.indexOf(p) !== -1));
-console.log(`  из них: пустой транскрипт клиента ${nfEmpty.length}, менеджер назвал цель ${nfPurpose.length}, клиент сказал своё ${notFlagged.length - nfEmpty.length - nfPurpose.length}`);
+console.log(`  прирост к существующему detectVoicemail: ${newlyCaught.length}`);
+console.log(`НЕ помечено: ${notFlagged.length}`);
 
-// ── случайная выборка ───────────────────────────────────────────────────────
-function pick(arr, n, salt) {
-  const scored = arr.map(x => ({ x, h: crypto.createHash('sha256').update(`${SEED}|${salt}|${x.id}`).digest('hex') }));
-  scored.sort((a, b) => a.h < b.h ? -1 : 1);
-  return scored.slice(0, n).map(s => s.x);
+// Прирост именно от стоп-листа Сани: фразы, которых не было в моей первой версии.
+const SANY_ONLY = ['защитник', 'умный бот', 'защита от спама', 'антиспам', 'знакомы с абонентом',
+  'личному или деловому', 'личный или деловой', 'длительность сообщения', 'сообщение достигло',
+  'сообщение готово', 'консультация оператора', 'на удержание', 'not available', 'please try again',
+  'the number is', 'at the moment', 'try again later', 'switched off', 'номер не существует',
+  'сеть перегружена', 'аппарат вызываемого'];
+const fromSanyList = flagged.filter(c => D.notalkHit(c.norm_client, SANY_ONLY) || D.notalkHit(c.norm_client, D.NOTALK_BOT_SMALLTALK));
+console.log(`  из них поймано фразами из стоп-листа Сани: ${fromSanyList.length}`);
+
+// ── ГЛАВНАЯ ПРОВЕРКА: помеченные, где клиент говорит живыми словами ─────────
+const LIVE = /(не актуальн|не надо|не нужн|заказал|поставил|не интересн|передумал|дорого|подума|на работе|перезвон|хорошо|спасибо|нет,|позже|в проекте)/;
+const suspect = flagged.filter(c => LIVE.test((c.transcript_client_text || '').toLowerCase()));
+
+console.log('\n' + '='.repeat(78));
+console.log(`ГЛАВНАЯ ПРОВЕРКА: помеченные, где в реплике клиента есть живые слова — ${suspect.length}`);
+console.log('='.repeat(78));
+for (const c of suspect) {
+  console.log(`\nсделка ${c.deal_id} | ${c.call_duration_seconds} сек | ${c.transcript_status} | причина: ${c.verdict.reason}${c.verdict.matched ? ` («${c.verdict.matched}»)` : ''}`);
+  console.log(`  КЛИЕНТ:   ${cut(c.transcript_client_text, 400) || '(пусто)'}`);
+  console.log(`  МЕНЕДЖЕР: ${cut(c.transcript_manager_text, 200) || '(пусто)'}`);
+  console.log(`  остаток после вырезания: «${c.verdict.rest}» (${c.verdict.rest.length} симв., порог 12)`);
 }
-const cut = (s, n) => { s = (s || '').replace(/\s+/g, ' ').trim(); return s.length > n ? s.slice(0, n) + '…' : s; };
 
+// ── контроль на разобранных сделках ─────────────────────────────────────────
+console.log('\n' + '='.repeat(78));
+console.log('КОНТРОЛЬ: сделки, которые Саня разобрал глазами');
+console.log('='.repeat(78));
+// Проверяем КОНКРЕТНЫЕ звонки по фрагменту транскрипта: в сделке их несколько, и часть
+// помечена правильно. Фрагмент ищем в реплике клиента, либо в реплике менеджера (поле mgr).
+const CONTROL = [
+  { deal: 110387, frag: 'все в проекте', flag: false, what: 'живой клиент «у нас ещё всё в проекте»' },
+  { deal: 110387, frag: 'его телефон занят', flag: true, what: 'в той же сделке — автоответчик' },
+  { deal: 118715, frag: 'прослушала ваш голосовой', mgr: true, flag: false, what: 'живой разговор, менеджер прослушала голосовое' },
+  { deal: 118715, frag: 'перенаправлен на голосовой почтовый', flag: true, what: 'в той же сделке — голосовая почта' },
+  { deal: 109433, frag: 'хорошо можно', flag: false, what: 'живой контакт, менеджер представилась' },
+  { deal: 119215, frag: 'по какому вопросу звоните', flag: true, what: 'исходный дефект, звонок 11 сек' },
+  { deal: 119215, frag: 'слушаю', flag: true, what: 'исходный дефект, звонок 6 сек' },
+  { deal: 121167, frag: 'сейчас нет вы по какому', flag: true, what: 'трубку снял не клиент' },
+  { deal: 123295, frag: 'сейчас нет вы по какому', flag: true, what: 'то же' },
+  { deal: 118181, frag: 'уже поставили', flag: false, what: 'живой отказ «мы уже поставили»' },
+  { deal: 120721, frag: 'уже заказали в другом месте', flag: false, what: 'живой отказ «заказали в другом месте»' },
+  { deal: 118055, frag: 'не актуально', flag: false, what: 'живой отказ «не актуально»' },
+  { deal: 116425, frag: 'неудобно разговаривать давайте завтра', flag: false, what: 'живой «мне неудобно, давайте завтра»' },
+  { deal: 115839, frag: 'абоненту пока неудобно', flag: true, what: 'бот «абоненту пока неудобно»' }
+];
+let fails = 0;
+for (const t of CONTROL) {
+  const rows = calls.filter(c => {
+    if (c.deal_id !== t.deal) return false;
+    const hay = D.notalkNormalize(t.mgr ? c.transcript_manager_text : c.transcript_client_text);
+    return hay.indexOf(D.notalkNormalize(t.frag)) !== -1;
+  });
+  if (!rows.length) { console.log(`  ?    ${t.deal}: звонок с «${t.frag}» не найден`); fails++; continue; }
+  const res = rows.map(c => D.detectNoConversation(c.transcript_client_text, c.transcript_manager_text, c.call_duration_seconds));
+  const anyFlag = res.some(Boolean);
+  const ok = t.flag ? anyFlag : !anyFlag;
+  if (!ok) fails++;
+  console.log(`  ${ok ? 'ok  ' : 'FAIL'} ${t.deal} «${t.frag}»: [${res.map(r => r ? r.reason : 'нет').join(', ')}] — ${t.what}`);
+}
+console.log(`\nКонтроль: ${CONTROL.length - fails} из ${CONTROL.length} сошлось${fails ? ', есть расхождения' : ''}`);
+if (fails) process.exitCode = 1;
+
+// ── пограничные: живые короткие отказы ──────────────────────────────────────
+const EDGE_WORDS = ['я занят', 'мне неудобно', 'сейчас неудобно', 'не актуальн', 'не нужно',
+  'не надо', 'некогда', 'перезвоните мне', 'перезвоните позже', 'позвоните позже',
+  'я подумаю', 'за рулем', 'я на работе', 'на совещании', 'уже заказал', 'уже купил',
+  'не интересует', 'я отказыва', 'не буду', 'я решил', 'мы решили', 'уже поставили',
+  'в проекте', 'давайте завтра', 'давайте позже'];
+const edges = calls.filter(c => {
+  const n = D.notalkNormalize(c.transcript_client_text);
+  if (D.notalkHit(n, D.NOTALK_MACHINE) || D.notalkHit(n, D.NOTALK_BOT_SMALLTALK)) return false;
+  return EDGE_WORDS.some(w => n.indexOf(w) !== -1);
+});
+const edgesFlagged = edges.filter(c => D.detectNoConversation(c.transcript_client_text, c.transcript_manager_text, c.call_duration_seconds));
+console.log('\n' + '='.repeat(78));
+console.log(`ПОГРАНИЧНЫЕ (живые короткие отказы без признаков машины): ${edges.length}`);
+console.log(`Ошибочно помечено: ${edgesFlagged.length} ${edgesFlagged.length ? '✗' : '✓ ни одного'}`);
+for (const c of edgesFlagged) {
+  console.log(`\n  сделка ${c.deal_id} | ${c.call_duration_seconds} сек | причина ${D.detectNoConversation(c.transcript_client_text, c.transcript_manager_text, c.call_duration_seconds).reason}`);
+  console.log(`    КЛИЕНТ: ${cut(c.transcript_client_text, 220)}`);
+}
+
+// ── выборки ─────────────────────────────────────────────────────────────────
 function show(title, rows) {
   console.log('\n' + '='.repeat(78));
   console.log(title);
   console.log('='.repeat(78));
   for (const c of rows) {
-    console.log(`\nсделка ${c.deal_id} | ${c.call_duration_seconds} сек | ${c.direction} | статус ${c.transcript_status}${c.verdict ? ` | причина: ${c.verdict.reason}${c.verdict.matched ? ` («${c.verdict.matched}»)` : ''}` : ''}`);
-    console.log(`  КЛИЕНТ:   ${cut(c.transcript_client_text, 240) || '(пусто)'}`);
-    console.log(`  МЕНЕДЖЕР: ${cut(c.transcript_manager_text, 240) || '(пусто)'}`);
-    if (c.verdict && c.verdict.reason === 'greeting_only') console.log(`  остаток после вырезания приветствий: «${c.verdict.rest}»`);
+    console.log(`\nсделка ${c.deal_id} | ${c.call_duration_seconds} сек | ${c.transcript_status}${c.verdict ? ` | ${c.verdict.reason}${c.verdict.matched ? ` («${c.verdict.matched}»)` : ''}` : ''}`);
+    console.log(`  КЛИЕНТ:   ${cut(c.transcript_client_text, 220) || '(пусто)'}`);
+    console.log(`  МЕНЕДЖЕР: ${cut(c.transcript_manager_text, 180) || '(пусто)'}`);
   }
 }
-
-show(`10 СЛУЧАЙНЫХ ПОМЕЧЕННЫХ (детектор говорит: разговора не было)`, pick(flagged, SAMPLES, 'flagged'));
-show(`10 СЛУЧАЙНЫХ НЕ ПОМЕЧЕННЫХ (детектор говорит: разговор был)`, pick(notFlagged.filter(c => c.norm_client), SAMPLES, 'notflagged'));
-
-// ── пограничные: клиент сказал что-то содержательное коротко ────────────────
-// Ищем именно человеческие формулировки. Слова «перезвонить» и «занят» встречаются и внутри
-// фраз роботов («попробуйте перезвонить», «абонент занят»), поэтому звонки с признаком робота
-// из пограничных исключаем — там детектор прав по построению.
-const EDGE_WORDS = ['я занят', 'мне неудобно', 'сейчас неудобно', 'не актуальн', 'не нужно',
-  'не надо', 'некогда', 'перезвоните мне', 'перезвоните позже', 'позвоните позже', 'наберите позже',
-  'я подумаю', 'за рулем', 'я на работе', 'на совещании', 'уже заказал', 'уже купил',
-  'не интересует', 'я отказыва', 'не буду', 'я решил', 'мы решили', 'занята сейчас',
-  'позже перезвоните', 'давайте позже', 'потом наберите'];
-const edges = calls.map(c => {
-  const norm = detect.notalkNormalize(c.transcript_client_text);
-  if (detect.NOTALK_MACHINE.some(p => norm.indexOf(p) !== -1)) return null;  // это робот, не пограничный
-  const hit = EDGE_WORDS.find(w => norm.indexOf(w) !== -1);
-  return hit ? { c, hit, norm } : null;
-}).filter(Boolean);
-const edgesFlagged = edges.filter(e => detect.detectNoConversation(e.c.transcript_client_text, e.c.transcript_manager_text, e.c.call_duration_seconds));
-
-console.log('\n' + '='.repeat(78));
-console.log(`ПОГРАНИЧНЫЕ: клиент сказал что-то по существу в коротком звонке`);
-console.log('='.repeat(78));
-console.log(`Найдено таких звонков: ${edges.length}`);
-console.log(`Из них детектор ОШИБОЧНО помечает: ${edgesFlagged.length} ${edgesFlagged.length ? '✗ смотреть ниже' : '✓ ни одного'}`);
-for (const e of (edgesFlagged.length ? edgesFlagged : pick(edges.map(x => x.c), 8, 'edges').map(c => ({ c, hit: EDGE_WORDS.find(w => detect.notalkNormalize(c.transcript_client_text).indexOf(w) !== -1) })))) {
-  const c = e.c;
-  console.log(`\nсделка ${c.deal_id} | ${c.call_duration_seconds} сек | слово «${e.hit}» | помечен: ${detect.detectNoConversation(c.transcript_client_text, c.transcript_manager_text, c.call_duration_seconds) ? 'ДА (ошибка)' : 'нет ✓'}`);
-  console.log(`  КЛИЕНТ:   ${cut(c.transcript_client_text, 200)}`);
-  console.log(`  МЕНЕДЖЕР: ${cut(c.transcript_manager_text, 160) || '(пусто)'}`);
-}
-
-// ── отдельно: робот ответил, но менеджер успел назвать цель ─────────────────
-const machineButPurpose = calls.filter(c => {
-  const norm = detect.notalkNormalize(c.transcript_client_text);
-  const mnorm = detect.notalkNormalize(c.transcript_manager_text);
-  const machine = detect.NOTALK_MACHINE.some(p => norm.indexOf(p) !== -1);
-  const purpose = detect.NOTALK_PURPOSE.some(p => mnorm.indexOf(p) !== -1);
-  return machine && purpose;
-});
-console.log('\n' + '='.repeat(78));
-console.log(`ОТДЕЛЬНЫЙ СЛУЧАЙ: ответил робот, но менеджер успел назвать цель — ${machineButPurpose.length} звонков`);
-console.log('По твоему ТЗ такие НЕ помечаются (нужны все три условия). По смыслу разговора тоже не было —');
-console.log('менеджер говорил с автоответчиком. Примеры для решения:');
-for (const c of pick(machineButPurpose, 3, 'mbp')) {
-  console.log(`\nсделка ${c.deal_id} | ${c.call_duration_seconds} сек`);
-  console.log(`  КЛИЕНТ:   ${cut(c.transcript_client_text, 180)}`);
-  console.log(`  МЕНЕДЖЕР: ${cut(c.transcript_manager_text, 180)}`);
-}
+show(`${SAMPLES} СЛУЧАЙНЫХ ПОМЕЧЕННЫХ`, pick(flagged, SAMPLES, 'flagged'));
+show(`${SAMPLES} СЛУЧАЙНЫХ НЕ ПОМЕЧЕННЫХ`, pick(notFlagged.filter(c => c.norm_client), SAMPLES, 'notflagged'));
 
 fs.writeFileSync(path.join(DATA, 'notalk-result.json'), JSON.stringify({
   итого: calls.length, помечено: flagged.length, прирост_к_detectVoicemail: newlyCaught.length,
-  по_причине: byReason,
-  помеченные: flagged.map(c => ({ deal_id: c.deal_id, id: c.id, sec: c.call_duration_seconds, reason: c.verdict.reason, matched: c.verdict.matched, client: c.transcript_client_text, manager: c.transcript_manager_text }))
+  по_причине: byReason, из_стоп_листа_Сани: fromSanyList.length,
+  помеченные: flagged.map(c => ({ deal_id: c.deal_id, id: c.id, sec: c.call_duration_seconds, reason: c.verdict.reason, matched: c.verdict.matched, rest: c.verdict.rest, client: c.transcript_client_text, manager: c.transcript_manager_text }))
 }, null, 2), 'utf8');
 console.log(`\nПолный список помеченных: bench/data/notalk-result.json`);
