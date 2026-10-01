@@ -47,8 +47,8 @@ function pick(file, names, consts) {
   return new Function(src + '\nreturn {' + names.map(n => n + ':' + n).join(',') + '};')();
 }
 
-const names = ['pgVoiceUnsupported', 'pgIsRecognitionFailure', 'pgIncompleteSources'];
-const consts = ['PG_SOURCES', 'PG_VOICE_UNSUPPORTED'];
+const names = ['pgVoiceUnsupported', 'pgChannelsMismatch', 'pgCallDuration', 'pgIsRecognitionFailure', 'pgIncompleteSources'];
+const consts = ['PG_SOURCES', 'PG_VOICE_UNSUPPORTED', 'PG_SILENCE_MAX_SEC'];
 const LIB = pick(path.join(ROOT, 'prototype', 'lib', 'pipeline-gate.js'), names, consts);
 const GATE = pick(path.join(D, 'gate.js'), names, consts);
 
@@ -72,6 +72,23 @@ const marks = [
   { calls: { complete: true }, openlines: { complete: false }, comments: { complete: true }, tasks: { complete: true } }
 ];
 marks.forEach((m, i) => same(`incompleteSources.length[${i}]`, GATE.pgIncompleteSources(m).length, LIB.pgIncompleteSources(m).length));
+
+// Отказ по каналам против длительности записи — защита, добавленная 01.10 после сделки 124041.
+const KANALY = 'Audio has 2 channels, but 1 requested in specification';
+for (const d of [0, 6, 29, 30, 31, 400, 863, undefined]) {
+  const it = { retryable: false, error: KANALY, duration_sec: d };
+  same(`channelsFailure(dur=${d})`, GATE.pgIsRecognitionFailure(it), LIB.pgIsRecognitionFailure(it));
+}
+const durCases = [
+  { duration_seconds: 42 },
+  { duration_start: '2026-08-17T14:08:07+03:00', duration_end: '2026-08-17T14:08:13+03:00' },
+  { duration_start: '2026-09-23T11:26:33+03:00', duration_end: '2026-09-23T11:40:56+03:00' },
+  {}, { duration_start: 'x', duration_end: 'y' }
+];
+for (const c of durCases) same(`callDuration(${JSON.stringify(c)})`, GATE.pgCallDuration(c), LIB.pgCallDuration(c));
+for (const m of [KANALY, 'Audio has 1 channels, but 2 requested', '503 upstream', '']) {
+  same(`channelsMismatch(${JSON.stringify(m)})`, GATE.pgChannelsMismatch(m), LIB.pgChannelsMismatch(m));
+}
 
 console.log(bad === 0 ? '\nвсе ноды: синтаксис ок, поведение совпадает с библиотекой' : `\nпроблем: ${bad}`);
 process.exit(bad === 0 ? 0 : 1);
