@@ -139,6 +139,43 @@ function sttNeedsMonoFallback(subResult, requestedChannels) {
   return r.success === true && formatted === '';
 }
 
+// Меньше килобайта аудиозаписи не бывает: это либо заголовок без данных, либо страница
+// ошибки Битрикса, отданная с кодом 200. Такой файл грузить в S3 бессмысленно — SpeechKit
+// всё равно вернёт пустой результат, и звонок молча останется без текста.
+var STT_MIN_AUDIO_BYTES = 1024;
+
+// Проверка скачанной записи ДО загрузки в S3.
+// Возвращает null, если файл годный, либо готовый ответ об ошибке.
+// retryable: true везде — и битый ответ Битрикса, и обрыв на скачивании имеет смысл повторить.
+function sttDownloadFailure(statusCode, byteLength, meta) {
+  var status = Number(statusCode);
+  var size = Number(byteLength) || 0;
+  var m = meta || {};
+  var why = null;
+
+  if (!status || status !== 200) {
+    why = 'Запись не скачана: HTTP ' + (status ? String(status) : 'без кода ответа');
+  } else if (size === 0) {
+    why = 'Запись скачана пустой (0 байт)';
+  } else if (size < STT_MIN_AUDIO_BYTES) {
+    why = 'Запись подозрительно малая: ' + size
+      + ' байт при пороге ' + STT_MIN_AUDIO_BYTES;
+  }
+
+  if (!why) return null;
+  return {
+    success: false,
+    retryable: true,
+    download_failed: true,
+    http_status: status || null,
+    bytes: size,
+    activity_id: m.activity_id,
+    comm_index: m.comm_index,
+    channel_count: m.channel_count || 2,
+    error: why
+  };
+}
+
 // Адрес записи звонка: и audio_files[0].url, и audio_url (SETTINGS.RECORD_URL).
 // Фильтр звонков брал только первое, и запись из audio_url не распознавалась вовсе.
 function sttPickAudioUrl(call) {

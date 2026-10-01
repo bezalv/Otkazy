@@ -16,7 +16,7 @@ var path = require('path');
 var src = fs.readFileSync(path.join(__dirname, '..', '..', 'prototype', 'lib', 'stt-reliability.js'), 'utf8');
 var L = new Function(src + '\nreturn {' + [
   'sttTransient', 'sttChannelsMismatch', 'sttErrorText', 'sttOperationFailure',
-  'sttMergePollState', 'sttRetryOrTimeout', 'sttNeedsMonoFallback', 'sttPickAudioUrl',
+  'sttMergePollState', 'sttRetryOrTimeout', 'sttNeedsMonoFallback', 'sttPickAudioUrl', 'sttDownloadFailure', 'STT_MIN_AUDIO_BYTES',
   'STT_MAX_ATTEMPTS'
 ].map(function (n) { return n + ':' + n; }).join(',') + '};')();
 
@@ -189,6 +189,43 @@ check('после трёх помех ошибка пробрасывается'
 var r5 = fakeRetry([{ error: '400 Bad Request' }]);
 eq('400 падает сразу, без повторов', [r5.calls, r5.pauses], [1, []]);
 check('400 пробрасывается', /400/.test(r5.thrown));
+
+console.log('\n=== Скачивание записи: проверка до загрузки в S3 ===');
+var okFile = L.sttDownloadFailure(200, 250000, META);
+eq('годная запись проходит', okFile, null);
+check('ровно порог тоже проходит', L.sttDownloadFailure(200, L.STT_MIN_AUDIO_BYTES, META) === null);
+
+var f404 = L.sttDownloadFailure(404, 0, META);
+check('HTTP 404: success false', f404.success === false);
+check('HTTP 404: retryable true', f404.retryable === true);
+check('HTTP 404: причина понятная, с кодом', /404/.test(f404.error) && /не скачана/i.test(f404.error));
+check('HTTP 404: помечено download_failed', f404.download_failed === true);
+check('HTTP 404: activity_id сохранён', f404.activity_id === '12345');
+
+var f500 = L.sttDownloadFailure(500, 0, META);
+check('HTTP 500 тоже ошибка скачивания', f500.success === false && f500.retryable === true);
+
+var fNoStatus = L.sttDownloadFailure(undefined, 100000, META);
+check('кода ответа нет вовсе — ошибка', fNoStatus.success === false);
+check('в причине сказано, что кода нет', /без кода ответа/.test(fNoStatus.error));
+
+var fEmpty = L.sttDownloadFailure(200, 0, META);
+check('200 с пустым файлом — ошибка', fEmpty.success === false);
+check('пустой файл: причина про 0 байт', /0 байт/.test(fEmpty.error));
+check('пустой файл: retryable true', fEmpty.retryable === true);
+
+var fTiny = L.sttDownloadFailure(200, 300, META);
+check('200 с огрызком (300 байт) — ошибка', fTiny.success === false);
+check('огрызок: в причине виден размер и порог', /300/.test(fTiny.error) && /1024/.test(fTiny.error));
+eq('огрызок: размер записан в поле', fTiny.bytes, 300);
+
+// Страница ошибки Битрикса, отданная с кодом 200 — тот самый случай, который раньше
+// уходил в S3 и возвращался от SpeechKit пустым результатом.
+var fHtml = L.sttDownloadFailure(200, 820, META);
+check('страница ошибки под кодом 200 не уходит в S3', fHtml.success === false);
+
+check('ошибка скачивания моно-проход НЕ запускает',
+  !L.sttNeedsMonoFallback({ success: false, retryable: true, download_failed: true, error: 'Запись не скачана: HTTP 404' }, 2));
 
 console.log('\nИТОГО: ' + pass + ' ok, ' + fail + ' fail');
 if (fail > 0) process.exit(1);

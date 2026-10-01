@@ -26,6 +26,8 @@ const files = {
   'Запустить SpeechKit': T + '/speechkit.js',
   'stt-poll-state': T + '/poll-state.js',
   'stt-timeout': T + '/timeout.js',
+  'stt-download-valid': T + '/download-valid.js',
+  'stt-download-failed': T + '/download-failed.js',
   'Транскрибировать все звонки': G + '/transcribe-all.js',
   'Config + Фильтр звонков': G + '/config-filter.js'
 };
@@ -37,7 +39,7 @@ for (const [name, f] of Object.entries(files)) {
 }
 
 // ── поведение функций из нод против библиотеки ──
-const libNames = ['sttTransient', 'sttChannelsMismatch', 'sttErrorText', 'sttMergePollState', 'sttNeedsMonoFallback'];
+const libNames = ['sttTransient', 'sttChannelsMismatch', 'sttErrorText', 'sttMergePollState', 'sttNeedsMonoFallback', 'sttDownloadFailure'];
 const LIB = new Function(read(ROOT + '/prototype/lib/stt-reliability.js') +
   '\nreturn {' + libNames.map(n => n + ':' + n).join(',') + '};')();
 
@@ -62,6 +64,7 @@ const POLL = pick(T + '/poll-state.js', ['sttTransient', 'sttErrorText', 'sttMer
 const PARSE = pick(T + '/parsing.js', ['sttChannelsMismatch']);
 const SPEECH = pick(T + '/speechkit.js', ['sttTransient']);
 const TRANS = pick(G + '/transcribe-all.js', ['sttChannelsMismatch', 'sttNeedsMonoFallback']);
+const DL = pick(T + '/download-valid.js', ['sttDownloadFailure']);
 
 const msgs = ['503 Service Unavailable', '500 err', 'ETIMEDOUT', 'socket hang up', 'ECONNRESET',
   '400 Bad Request', 'Audio has 1 channels, but 2 requested in specification',
