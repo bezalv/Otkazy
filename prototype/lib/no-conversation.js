@@ -248,6 +248,13 @@ function detectNoConversation(clientText, managerText, durationSec, isMono) {
   var cnRaw = notalkNormalize(clientText);
   var mn = notalkNormalize(managerText);
 
+  // Транскрипта нет вообще: оба канала пусты. Анализировать нечего, и утверждать
+  // «прозвучало только приветствие» мы не вправе — мы просто не знаем, что было в записи.
+  // Такой звонок отдаём сборщику фактов: он скажет честно «запись есть, но не распознана»
+  // либо «записи нет». До этой правки 25 коротких звонков без текста получали
+  // greeting_only и шли судье как доказанное отсутствие разговора.
+  if (!cnRaw && !mn) return null;
+
   // Короткий ли звонок. При нулевой длительности поле не значит ничего — судим по транскрипту.
   var isShort;
   if (durationSec === 0 || durationSec === null || typeof durationSec !== 'number') {

@@ -142,6 +142,7 @@ function detectNoConversationMono(wholeText, durationSec) {
 function detectNoConversation(clientText, managerText, durationSec, isMono) {
   var cnRaw = notalkNormalize(clientText);
   var mn = notalkNormalize(managerText);
+  if (!cnRaw && !mn) return null;
   var isShort;
   if (durationSec === 0 || durationSec === null || typeof durationSec !== 'number') {
     isShort = (cnRaw.length + mn.length) <= NOTALK_ZERO_SEC_CHARS;
