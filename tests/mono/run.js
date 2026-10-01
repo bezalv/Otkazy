@@ -218,5 +218,54 @@ check('правильный пруф не ругается',
 check('metric-пруф этой проверкой не затронут',
   proofWarning('metric', { actor: 'unknown', source: 'call_transcript' }) === null);
 
+console.log('\n=== Инициатива в b4.5: моно считается, «разговора не было» — нет ===');
+// Слепок цикла инициативы из ноды b4.5 Comm Analytics.
+// Направление звонка берётся из активности Битрикса и от режима транскрипции не зависит,
+// поэтому моно-звонок в инициативе участвует наравне со стерео. Исключаются только звонки,
+// где разговора не было: там контакта не случилось вовсе.
+function initiative(comms, noTalkIdx, monoIdx) {
+  var mgr = 0, cli = 0;
+  for (var ii = 0; ii < comms.length; ii++) {
+    var cm = comms[ii];
+    if (noTalkIdx[ii]) continue;
+    if (cm.type === 'call') {
+      if (cm.direction === 'outgoing') mgr++;
+      else if (cm.direction === 'incoming') cli++;
+    } else if (cm.type === 'chat') {
+      if (cm.role === 'unknown') continue;
+      if (cm.direction === 'outgoing' || cm.role === 'manager') mgr++;
+      else if (cm.direction === 'incoming' || cm.role === 'client') cli++;
+    }
+  }
+  return { mgr: mgr, cli: cli };
+}
+
+// Три исходящих (одно моно), один входящий, один звонок без разговора.
+var potok = [
+  { type: 'call', direction: 'outgoing' },
+  { type: 'call', direction: 'outgoing' },
+  { type: 'call', direction: 'outgoing' },
+  { type: 'call', direction: 'incoming' },
+  { type: 'call', direction: 'outgoing' }
+];
+var mono1 = { 2: true };
+var notalk1 = { 4: true };
+
+var ini = initiative(potok, notalk1, mono1);
+eq('моно-звонок остался в инициативе менеджера', ini.mgr, 3);
+eq('входящий у клиента', ini.cli, 1);
+check('звонок без разговора в инициативу не попал', ini.mgr + ini.cli === 4,
+  'получилось ' + (ini.mgr + ini.cli) + ' вместо 4');
+
+// Сделка, где все содержательные звонки — моно. Инициатива не должна обнуляться.
+var tolkoMono = [
+  { type: 'call', direction: 'outgoing' },
+  { type: 'call', direction: 'outgoing' },
+  { type: 'call', direction: 'incoming' }
+];
+var iniMono = initiative(tolkoMono, {}, { 0: true, 1: true, 2: true });
+eq('сделка целиком из моно: инициатива менеджера не нулевая', iniMono.mgr, 2);
+eq('сделка целиком из моно: инициатива клиента не нулевая', iniMono.cli, 1);
+
 console.log('\nИТОГО: ' + pass + ' ok, ' + fail + ' fail');
 if (fail > 0) process.exit(1);
