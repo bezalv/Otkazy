@@ -96,7 +96,7 @@ const PROMPTS = promptDir
   : path.join(ROOT, 'prototype', 'prompts');
 const judgeFile = fs.existsSync(path.join(PROMPTS, 'judge.md'))
   ? path.join(PROMPTS, 'judge.md')
-  : path.join(ROOT, 'prototype', 'prompts', 'judge_v2.7.md');
+  : path.join(ROOT, 'prototype', 'prompts', 'judge_v2.8.md');
 const writerFile = fs.existsSync(path.join(PROMPTS, 'writer.md'))
   ? path.join(PROMPTS, 'writer.md')
   : path.join(ROOT, 'prototype', 'prompts', 'writer_v2.5.md');

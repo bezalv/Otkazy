@@ -9,7 +9,7 @@ const arg = (n, d) => { const i = process.argv.indexOf('--' + n); return i === -
 const model = arg('model', 'gpt-6-sol');
 const dir = path.join(ROOT, 'prototype', 'prompts', 'models', model);
 
-const base = fs.readFileSync(path.join(ROOT, 'prototype', 'prompts', 'judge_v2.7.md'), 'utf8');
+const base = fs.readFileSync(path.join(ROOT, 'prototype', 'prompts', 'judge_v2.8.md'), 'utf8');
 const skip = new Set((arg('skip', '') || '').split(',').filter(Boolean));
 const outName = arg('out', 'judge.md');
 // enabled: false — патч остаётся в файле как история, но в сборку не идёт.
