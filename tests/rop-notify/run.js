@@ -114,6 +114,58 @@ check('вердикт не из тех, что уведомляют — не о�
 check('повтор по цене после успешной отправки по цене — молчим',
   claim([{ deal_id: 5, verdict: 'правомерен', notification_status: 'ok' }], 5, 'правомерен', 'price') === null);
 
+console.log('\n=== Несколько строк по одной сделке ===');
+// Уникальности по deal_id в lost_deal_analyses нет: каждый прогон добавляет новую строку
+// (у 125336 и 123831 их по три). Поэтому claim ищет status='ok' по ВСЕМ строкам сделки,
+// а не только по текущей — иначе повторный прогон слал бы уведомление снова.
+// Слепок NOT EXISTS из notify-claim: условие по deal_id и вердикту, без привязки к id.
+function claimPoVsemStrokam(stroki, dealId, verdict, closure) {
+  if (!L.ropShouldNotify(verdict, closure)) return null;
+  var uzhe = (stroki || []).some(function (s) {
+    return s.deal_id === dealId && s.verdict === verdict && s.notification_status === 'ok';
+  });
+  return uzhe ? null : { deal_id: dealId, verdict: verdict };
+}
+
+// Три строки по сделке: отметка стоит на самой старой, текущая — третий прогон.
+var tryStroki = [
+  { id: 1, deal_id: 124927, verdict: 'неправомерен', notification_status: 'ok' },
+  { id: 2, deal_id: 124927, verdict: 'неправомерен', notification_status: null },
+  { id: 3, deal_id: 124927, verdict: 'неправомерен', notification_status: null }
+];
+check('вторая строка той же сделки, тот же вердикт — не шлём',
+  claimPoVsemStrokam(tryStroki, 124927, 'неправомерен', 'manager_dropped') === null);
+check('третий прогон тоже молчит',
+  claimPoVsemStrokam(tryStroki.concat([{ id: 4, deal_id: 124927, verdict: 'неправомерен', notification_status: null }]),
+    124927, 'неправомерен', 'manager_dropped') === null);
+check('отметка на старой строке, а не на текущей — всё равно находим',
+  claimPoVsemStrokam([
+    { id: 1, deal_id: 5, verdict: 'правомерен', notification_status: 'ok' },
+    { id: 2, deal_id: 5, verdict: 'правомерен', notification_status: null }
+  ], 5, 'правомерен', 'price') === null);
+
+check('другой вердикт в той же сделке — шлём',
+  claimPoVsemStrokam(tryStroki, 124927, 'правомерен', 'price') !== null);
+check('вердикт сменился обратно на прежний — молчим',
+  claimPoVsemStrokam(tryStroki.concat([{ id: 4, deal_id: 124927, verdict: 'правомерен', notification_status: 'ok' }]),
+    124927, 'неправомерен', 'manager_dropped') === null);
+check('по второму вердикту тоже молчим после его отправки',
+  claimPoVsemStrokam(tryStroki.concat([{ id: 4, deal_id: 124927, verdict: 'правомерен', notification_status: 'ok' }]),
+    124927, 'правомерен', 'price') === null);
+
+// Разборы до правки отметок не имеют вовсе — по ним уведомление уйдёт один раз, это нормально.
+check('строки без отметки (разборы до правки) отправку не блокируют',
+  claimPoVsemStrokam([
+    { id: 1, deal_id: 7, verdict: 'неправомерен', notification_status: undefined },
+    { id: 2, deal_id: 7, verdict: 'неправомерен', notification_status: null }
+  ], 7, 'неправомерен', 'manager_dropped') !== null);
+check('status=sending не считается доставкой — повтор возможен',
+  claimPoVsemStrokam([{ id: 1, deal_id: 8, verdict: 'неправомерен', notification_status: 'sending' }],
+    8, 'неправомерен', 'manager_dropped') !== null);
+check('строки другой сделки не мешают',
+  claimPoVsemStrokam([{ id: 1, deal_id: 999, verdict: 'неправомерен', notification_status: 'ok' }],
+    124927, 'неправомерен', 'manager_dropped') !== null);
+
 console.log('\n=== Порядок: сначала база, потом уведомление ===');
 // Слепок порядка нод в пакете после правки.
 var poryadok = ['Записать в Supabase', 'Разблокировать сделку', 'Собрать AI-комментарий',
