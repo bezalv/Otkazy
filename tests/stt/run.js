@@ -289,6 +289,24 @@ check('режим «только SpeechKit» — в резерв не уходи
   !L.sttReserveAfterFailure('speechkit', FAIL_RETRY));
 check('пустой результат без признаков — не в резерв', !L.sttReserveAfterFailure('auto', {}));
 
+console.log('\n=== Авария SpeechKit выглядит как 401 (13.10.2026) ===');
+// Авария Yandex Cloud подтверждена самим Яндексом, но у клиента она проявилась
+// НЕ пятисотками: SpeechKit отвечал «Request failed with status code 401».
+// Вывод, который надо сохранить: 401 — постоянная ошибка, повторять создание задания
+// по ней бессмысленно, НО в резерв по ней уходить обязательно. Если бы резерв включался
+// только по sttTransient (5xx, таймаут, обрыв), в эту аварию он не включился бы вовсе.
+check('401 не считается временной помехой — задание не пересоздаём', !L.sttTransient('Request failed with status code 401'));
+check('503 остаётся временной помехой', L.sttTransient('Request failed with status code 503'));
+// Так ведёт себя нода «Запустить SpeechKit»: любой сбой создания задания возвращается
+// с retryable:true, независимо от того, временный он или постоянный.
+var sbojZapuska = { success: false, retryable: true, speechkit_start_failed: true,
+  error: 'SpeechKit: Request failed with status code 401' };
+check('авария-401 уводит звонок в резерв', L.sttReserveAfterFailure('auto', sbojZapuska));
+check('и взводит предохранитель на 15 минут', L.sttBreakerOpen(L.sttBreakerUntil(NOW), NOW));
+check('в режиме «только SpeechKit» 401 в резерв не уводит', !L.sttReserveAfterFailure('speechkit', sbojZapuska));
+check('сбой скачивания записи по-прежнему в резерв не уходит даже с retryable',
+  !L.sttReserveAfterFailure('auto', { success: false, retryable: true, download_failed: true, error: 'HTTP 404' }));
+
 console.log('\n=== Параметр channels для сервиса ===');
 eq('просили 2 канала — stereo', L.sttReserveChannels(2), 'stereo');
 eq('просили 1 канал — mono', L.sttReserveChannels(1), 'mono');
