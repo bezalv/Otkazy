@@ -12,7 +12,7 @@ Dinal (производство окон и дверей, Новосибирск
 AI-driven pipeline в n8n, который для каждой сделки в стадии Отказ:
 
 Собирает данные сделки + историю коммуникаций из Bitrix24
-Транскрибирует звонки и голосовые из чатов (Yandex SpeechKit)
+Транскрибирует звонки и голосовые из чатов (Yandex SpeechKit, при его сбое — резервный сервис stt-reserve через Polza)
 Строит хронологический журнал событий
 Считает 30+ метрик коммуникации (тренд, инициатива, разрывы, качество контактов)
 Прогоняет через LLM (Claude Sonnet 3.7 через Polza.ai) с промптом «постмортем + возможность реанимации»
@@ -24,9 +24,10 @@ AI-driven pipeline в n8n, который для каждой сделки в с
 Всё остальное идентично — стек, принципы, паттерны.
 Стек (наследуется как есть)
 
-n8n self-hosted, bezalv.ru, версия 2.12.3, Docker Compose
+n8n self-hosted, bezalv.ru, версия 2.42.5 (обновлён 09.10.2026), Docker Compose. Воркер общий для всех проектов, держит 10 выполнений одновременно
 Bitrix24 REST API (dinalnsk.bitrix24.ru/rest/65/<token>/) — токен в path URL, хардкод в HTTP Request нодах
 Yandex SpeechKit — longRunningRecognize, S3 бакет n8n-transcription-audio, credential FQYoK9n3AGNz0G16
+Резерв распознавания — сервис stt-reserve на сервере n8n (http://172.18.0.1:8790, только из контейнеров), credential «stt-reserve: ключ». Делит стерео на каналы и распознаёт через Polza (ai-sage/gigaam-v3). Включается сам при сбое SpeechKit; переключатель STT_MODE в ноде stt-route подворкфлоу транскрипции. Сервис общий со СПИН, его код и сервер — не наша зона. Подробности — в CLAUDE.md, раздел «Резервное распознавание»
 Polza.ai — https://api.polza.ai/api/v1, модель anthropic/claude-3.7-sonnet
 Supabase — новый проект под этот репо (см. доступы ниже)
 

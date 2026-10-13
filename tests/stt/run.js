@@ -7,7 +7,9 @@
 //   4. счётчик попыток берёт attempt из предыдущей итерации, предел 60 работает;
 //   5. временная ошибка опроса не прерывает цикл, считается в poll_transient;
 //   6. адрес записи берётся и из audio_files[0].url, и из audio_url;
-//   7. успешный ответ по-прежнему проходит насквозь.
+//   7. успешный ответ по-прежнему проходит насквозь;
+//   8. резерв распознавания: переключатель, предохранитель, разбор ответа сервиса,
+//      роли по каналам, сборка транскрипта и совпадение формата с ответом SpeechKit.
 //
 // Запуск: node tests/stt/run.js
 var fs = require('fs');
@@ -17,7 +19,11 @@ var src = fs.readFileSync(path.join(__dirname, '..', '..', 'prototype', 'lib', '
 var L = new Function(src + '\nreturn {' + [
   'sttTransient', 'sttChannelsMismatch', 'sttErrorText', 'sttOperationFailure',
   'sttMergePollState', 'sttRetryOrTimeout', 'sttNeedsMonoFallback', 'sttPickAudioUrl', 'sttDownloadFailure', 'STT_MIN_AUDIO_BYTES',
-  'STT_MAX_ATTEMPTS'
+  'STT_MAX_ATTEMPTS',
+  // резерв распознавания (13.10.2026)
+  'sttMode', 'STT_BREAKER_MS', 'sttBreakerOpen', 'sttBreakerUntil', 'sttUseReserveFirst',
+  'sttReserveAfterFailure', 'sttReserveChannels', 'sttReserveFailure', 'sttEngineLabel',
+  'STT_ENGINE_SPEECHKIT', 'sttReserveRole', 'sttReserveToTranscript'
 ].map(function (n) { return n + ':' + n; }).join(',') + '};')();
 
 var pass = 0, fail = 0;
@@ -226,6 +232,201 @@ check('страница ошибки под кодом 200 не уходит в 
 
 check('ошибка скачивания моно-проход НЕ запускает',
   !L.sttNeedsMonoFallback({ success: false, retryable: true, download_failed: true, error: 'Запись не скачана: HTTP 404' }, 2));
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// РЕЗЕРВНОЕ РАСПОЗНАВАНИЕ (13.10.2026)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+console.log('\n=== Переключатель STT_MODE ===');
+eq('auto', L.sttMode('auto'), 'auto');
+eq('speechkit', L.sttMode('speechkit'), 'speechkit');
+eq('reserve', L.sttMode('reserve'), 'reserve');
+eq('регистр не важен', L.sttMode('ReSeRvE'), 'reserve');
+eq('пробелы по краям', L.sttMode('  speechkit  '), 'speechkit');
+eq('пустая строка — авто', L.sttMode(''), 'auto');
+eq('null — авто', L.sttMode(null), 'auto');
+eq('undefined — авто', L.sttMode(undefined), 'auto');
+eq('опечатка не останавливает распознавание', L.sttMode('rezerv'), 'auto');
+
+console.log('\n=== Предохранитель: окно 15 минут (Д2) ===');
+eq('окно ровно 15 минут', L.STT_BREAKER_MS, 900000);
+var NOW = Date.parse('2026-10-13T10:00:00.000Z');
+check('отметки нет — закрыт', !L.sttBreakerOpen(null, NOW));
+check('пустая строка — закрыт', !L.sttBreakerOpen('', NOW));
+check('мусор вместо даты — закрыт', !L.sttBreakerOpen('позже', NOW));
+check('отметка в будущем — открыт', L.sttBreakerOpen('2026-10-13T10:05:00.000Z', NOW));
+check('отметка в прошлом — закрыт', !L.sttBreakerOpen('2026-10-13T09:59:00.000Z', NOW));
+check('отметка ровно сейчас — закрыт', !L.sttBreakerOpen('2026-10-13T10:00:00.000Z', NOW));
+check('отметка числом миллисекунд', L.sttBreakerOpen(NOW + 60000, NOW));
+eq('новая отметка — через 15 минут', L.sttBreakerUntil(NOW), '2026-10-13T10:15:00.000Z');
+
+console.log('\n=== Куда идти ДО попытки SpeechKit ===');
+check('режим «только резерв» — сразу в резерв', L.sttUseReserveFirst('reserve', null, NOW));
+check('режим «только резерв» не смотрит на предохранитель',
+  L.sttUseReserveFirst('reserve', '2026-10-13T09:00:00.000Z', NOW));
+check('режим «только SpeechKit» — резерв не трогаем', !L.sttUseReserveFirst('speechkit', null, NOW));
+check('режим «только SpeechKit»: предохранитель не действует (Д2)',
+  !L.sttUseReserveFirst('speechkit', '2026-10-13T10:10:00.000Z', NOW));
+check('авто + предохранитель открыт — сразу в резерв',
+  L.sttUseReserveFirst('auto', '2026-10-13T10:10:00.000Z', NOW));
+check('авто + предохранитель закрыт — сначала SpeechKit',
+  !L.sttUseReserveFirst('auto', '2026-10-13T09:50:00.000Z', NOW));
+check('авто без отметки — сначала SpeechKit', !L.sttUseReserveFirst('auto', null, NOW));
+
+console.log('\n=== Куда идти ПОСЛЕ сбоя SpeechKit ===');
+var FAIL_RETRY = { success: false, retryable: true, error: 'SpeechKit: HTTP 503' };
+check('повторяемый сбой — в резерв', L.sttReserveAfterFailure('auto', FAIL_RETRY));
+check('успех — резерв не нужен', !L.sttReserveAfterFailure('auto', { success: true, formatted_dialog: 'Менеджер: да' }));
+check('тишина (успех с пустым диалогом) — резерв не нужен',
+  !L.sttReserveAfterFailure('auto', { success: true, formatted_dialog: '' }));
+check('отказ по числу каналов — не резерв, а моно-проход',
+  !L.sttReserveAfterFailure('auto', { success: false, retryable: false, channels_mismatch: true, error: 'Audio has 1 channels, but 2 requested' }));
+check('сбой скачивания записи — резерв не поможет, файл тот же (Д3)',
+  !L.sttReserveAfterFailure('auto', { success: false, retryable: true, download_failed: true, error: 'Запись не скачана: HTTP 404' }));
+check('неповторяемый сбой — не в резерв',
+  !L.sttReserveAfterFailure('auto', { success: false, retryable: false, error: 'bad request' }));
+check('режим «только SpeechKit» — в резерв не уходим даже при сбое',
+  !L.sttReserveAfterFailure('speechkit', FAIL_RETRY));
+check('пустой результат без признаков — не в резерв', !L.sttReserveAfterFailure('auto', {}));
+
+console.log('\n=== Параметр channels для сервиса ===');
+eq('просили 2 канала — stereo', L.sttReserveChannels(2), 'stereo');
+eq('просили 1 канал — mono', L.sttReserveChannels(1), 'mono');
+eq('не указано — stereo', L.sttReserveChannels(undefined), 'stereo');
+eq('ноль — stereo (как и у SpeechKit по умолчанию)', L.sttReserveChannels(0), 'stereo');
+
+console.log('\n=== Разбор ошибок сервиса (по его договору) ===');
+var RMETA = { activity_id: '777', comm_index: 5, channel_count: 2 };
+var RMETA1 = { activity_id: '888', comm_index: 1, channel_count: 1 };
+check('успешный ответ — ошибки нет', L.sttReserveFailure(200, { ok: true, segments: [] }, RMETA) === null);
+
+var eProv = L.sttReserveFailure(502, { ok: false, error: { code: 'provider_error', message: 'Polza HTTP 503', retryable: true } }, RMETA);
+check('provider_error повторяем', eProv.retryable === true);
+check('помечен как сбой резерва', eProv.reserve_failed === true);
+check('в тексте ошибки виден код', eProv.error.indexOf('provider_error') !== -1);
+eq('метаданные звонка на месте', [eProv.activity_id, eProv.comm_index, eProv.channel_count], ['777', 5, 2]);
+
+var eMono = L.sttReserveFailure(422, { ok: false, error: { code: 'bad_audio', message: 'stereo requested, file is mono', retryable: false } }, RMETA);
+check('stereo у моно-файла → признак «нужен моно-проход»', eMono.channels_mismatch === true);
+check('и он не повторяемый', eMono.retryable === false);
+check('моно-проход запустится по этому ответу', L.sttNeedsMonoFallback(eMono, 2));
+
+var eBadMono = L.sttReserveFailure(422, { ok: false, error: { code: 'bad_audio', message: 'нет звуковой дорожки', retryable: false } }, RMETA1);
+check('битый моно-файл — это не mismatch', eBadMono.channels_mismatch === false);
+check('и моно-проход второй раз не запускается', !L.sttNeedsMonoFallback(eBadMono, 1));
+
+check('401 не повторяем', L.sttReserveFailure(401, { ok: false, error: { code: 'unauthorized', message: 'нет ключа', retryable: false } }, RMETA).retryable === false);
+check('413 не повторяем', L.sttReserveFailure(413, { ok: false, error: { code: 'too_large', message: 'больше 50 МБ', retryable: false } }, RMETA).retryable === false);
+check('503 перегрузка повторяема', L.sttReserveFailure(503, { ok: false, error: { code: 'overloaded', message: 'очередь полна', retryable: true } }, RMETA).retryable === true);
+check('504 таймаут повторяем', L.sttReserveFailure(504, { ok: false, error: { code: 'timeout', message: '600 с', retryable: true } }, RMETA).retryable === true);
+check('500 сервиса повторяем', L.sttReserveFailure(500, { ok: false, error: { code: 'internal', message: 'сбой', retryable: true } }, RMETA).retryable === true);
+check('тела нет, 502 — повторяем', L.sttReserveFailure(502, null, RMETA).retryable === true);
+check('тела нет, 400 — не повторяем', L.sttReserveFailure(400, null, RMETA).retryable === false);
+check('обрыв соединения (кода нет) — повторяем', L.sttReserveFailure(0, null, RMETA).retryable === true);
+check('429 без тела — повторяем', L.sttReserveFailure(429, null, RMETA).retryable === true);
+check('ok:false при коде 200 — всё равно ошибка',
+  L.sttReserveFailure(200, { ok: false, error: { code: 'internal', message: 'сбой', retryable: true } }, RMETA) !== null);
+
+console.log('\n=== Пометка «кто распознал» (Д5) ===');
+eq('speechkit', L.STT_ENGINE_SPEECHKIT, 'speechkit');
+eq('GigaAM', L.sttEngineLabel('ai-sage/gigaam-v3'), 'reserve:gigaam');
+eq('Aiesa', L.sttEngineLabel('aiesa/transcribe'), 'reserve:aiesa');
+eq('Aiesa fast — та же пометка', L.sttEngineLabel('aiesa/transcribe-fast'), 'reserve:aiesa');
+eq('модель не названа', L.sttEngineLabel(''), 'reserve:unknown');
+eq('модели нет вовсе', L.sttEngineLabel(null), 'reserve:unknown');
+eq('незнакомая модель — из имени', L.sttEngineLabel('openai/whisper-large-v3'), 'reserve:whisper-large-v3');
+check('пометка влезает в varchar(32)', L.sttEngineLabel('vendor/ochen-dlinnoe-imya-modeli-dlya-proverki-granicy').length <= 32);
+
+console.log('\n=== Роли по каналам (Д8) ===');
+eq('канал 0 — менеджер', L.sttReserveRole(0), 'Менеджер');
+eq('канал 1 — клиент', L.sttReserveRole(1), 'Клиент');
+eq('канал строкой', L.sttReserveRole('0'), 'Менеджер');
+
+console.log('\n=== Сборка транскрипта: стерео ===');
+var SEG = [
+  { channel: 0, start: 0.4, end: 3.1, text: 'Здравствуйте, компания Динал' },
+  { channel: 1, start: 3.4, end: 5.0, text: 'Да, слушаю' },
+  { channel: 0, start: 5.2, end: 7.0, text: 'Вам удобно говорить' },
+  { channel: 0, start: 7.1, end: 9.0, text: 'по замеру' },
+  { channel: 1, start: 9.5, end: 11.0, text: 'Я уже купил окна' }
+];
+var tr = L.sttReserveToTranscript(
+  { ok: true, model: 'ai-sage/gigaam-v3', channels: 2, duration_sec: 11.2, speech_sec: 8.1, request_id: 'abc123', segments: SEG },
+  { activity_id: '999', comm_index: 2, channel_count: 2, call_date: '2026-10-12T09:00:00+07:00', call_direction: 'outgoing' });
+check('распознано успешно', tr.success === true);
+eq('реплик после склейки подряд идущих', tr.total_replicas, 4);
+eq('первая реплика — менеджер', tr.conversation[0].speaker, 'Менеджер');
+eq('вторая — клиент', tr.conversation[1].speaker, 'Клиент');
+eq('подряд идущие реплики одного канала склеены', tr.conversation[2].text, 'Вам удобно говорить по замеру');
+eq('текст менеджера собран', tr.manager_text, 'Здравствуйте, компания Динал Вам удобно говорить по замеру');
+eq('текст клиента собран', tr.client_text, 'Да, слушаю Я уже купил окна');
+check('диалог в прежнем формате «Роль: текст»', tr.formatted_dialog.indexOf('Менеджер: Здравствуйте') === 0);
+eq('пометка движка', tr.transcript_engine, 'reserve:gigaam');
+eq('метаданные звонка пробрасываются', [tr.activity_id, tr.comm_index, tr.direction], ['999', 2, 'outgoing']);
+eq('идентификатор запроса сервиса вместо operation_id', tr.operation_id, 'abc123');
+eq('в S3 резерв ничего не кладёт', tr.s3_file, null);
+
+var trSort = L.sttReserveToTranscript(
+  { ok: true, model: 'ai-sage/gigaam-v3', channels: 2, segments: [
+    { channel: 1, start: 9.0, end: 10.0, text: 'Второй' },
+    { channel: 0, start: 1.0, end: 2.0, text: 'Первый' }
+  ] }, { channel_count: 2 });
+eq('отрезки сортируются по времени', trSort.conversation.map(function (c) { return c.text; }), ['Первый', 'Второй']);
+
+var trEmpty = L.sttReserveToTranscript({ ok: true, model: 'ai-sage/gigaam-v3', channels: 2, segments: [] }, { channel_count: 2 });
+check('тишина — это успех, а не сбой (Д3)', trEmpty.success === true);
+eq('реплик нет', trEmpty.total_replicas, 0);
+eq('диалог пустой', trEmpty.formatted_dialog, '');
+check('тишина вердикт не блокирует: моно-проход по ней не запускается',
+  L.sttNeedsMonoFallback(trEmpty, 2) === true);
+
+var trBlank = L.sttReserveToTranscript(
+  { ok: true, model: 'ai-sage/gigaam-v3', channels: 2, segments: [
+    { channel: 0, start: 1, end: 2, text: '   ' },
+    { channel: 1, start: 3, end: 4, text: 'Слушаю' }
+  ] }, { channel_count: 2 });
+eq('пустые отрезки в реплики не идут', trBlank.total_replicas, 1);
+eq('и роль у оставшейся верная', trBlank.conversation[0].speaker, 'Клиент');
+
+console.log('\n=== Сборка транскрипта: моно (урок СПИН) ===');
+var MONO = { ok: true, model: 'ai-sage/gigaam-v3', channels: 1, source_channels: 1, segments: [
+  { channel: 0, start: 0.5, end: 2.0, text: 'Алло, да' },
+  { channel: 0, start: 2.5, end: 4.0, text: 'я вас слушаю' }
+] };
+var trMono = L.sttReserveToTranscript(MONO, { channel_count: 1, speaker_role: 'Говорящий' });
+eq('моно даёт одну реплику', trMono.total_replicas, 1);
+eq('без разделения сторон', trMono.conversation[0].speaker, 'Говорящий');
+eq('весь текст слит', trMono.conversation[0].text, 'Алло, да я вас слушаю');
+eq('префикс «Говорящий:» в диалоге — по нему режим узнаёт «Собрать итог»',
+  trMono.formatted_dialog, 'Говорящий: Алло, да я вас слушаю');
+eq('текст клиента пуст — сторон нет', trMono.client_text, '');
+check('текст лежит в manager_text, как в моно-ветке SpeechKit', trMono.manager_text.length > 0);
+
+var trMonoVoice = L.sttReserveToTranscript(MONO, { channel_count: 1, speaker_role: 'Клиент' });
+eq('голосовое клиента — в client_text', trMonoVoice.client_text, 'Алло, да я вас слушаю');
+eq('и manager_text пуст', trMonoVoice.manager_text, '');
+var trMonoChat = L.sttReserveToTranscript(MONO, { channel_count: 1, speaker_role: 'Участник чата' });
+eq('«Участник чата» — роль сохраняется', trMonoChat.conversation[0].speaker, 'Участник чата');
+
+// Та самая ловушка СПИН: просили стерео, а сервис вернул один канал.
+// Если бы такой ответ разобрали как стерео, вышел бы звонок «без содержания».
+var trTrap = L.sttReserveToTranscript(
+  { ok: true, model: 'ai-sage/gigaam-v3', channels: 1, source_channels: 1, segments: [
+    { channel: 0, start: 1, end: 3, text: 'Один канал в ответе' }
+  ] }, { channel_count: 2 });
+eq('ответ с одним каналом разбирается как моно, даже если просили стерео', trTrap.total_replicas, 1);
+eq('и роль не приписывается менеджеру наугад', trTrap.conversation[0].speaker, 'Говорящий');
+
+console.log('\n=== Формат совпадает с ответом SpeechKit ===');
+// Ключи, которые отдаёт «Парсинг транскрипта»: ниже ничего не должно пропасть,
+// иначе «Собрать итог» и сборщик фактов потеряют поле молча.
+var KLUCHI_SPEECHKIT = ['activity_id', 'comm_index', 'date', 'direction', 'channel_count',
+  'speaker_role', 'total_replicas', 'conversation', 'formatted_dialog', 'manager_text',
+  'client_text', 'operation_id', 's3_file', 'success'];
+var poteryano = KLUCHI_SPEECHKIT.filter(function (k) { return !(k in tr); });
+eq('ни одно поле прежнего формата не потеряно', poteryano, []);
+check('добавлена только пометка движка и метрики резерва',
+  'transcript_engine' in tr && 'reserve_duration_sec' in tr && 'reserve_speech_sec' in tr);
 
 console.log('\nИТОГО: ' + pass + ' ok, ' + fail + ' fail');
 if (fail > 0) process.exit(1);
