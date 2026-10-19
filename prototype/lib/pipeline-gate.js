@@ -159,9 +159,27 @@ function pgFailuresText(failures) {
   var prichina = '';
   for (var i = 0; i < list.length; i++) {
     var e = String((list[i] && list[i].error) || '').trim();
-    if (e) { prichina = e.length > PG_REASON_MAX ? e.slice(0, PG_REASON_MAX).replace(/\s+\S*$/, '') + '…' : e; break; }
+    if (e) {
+      var ec = pgSafeReason(e);
+      prichina = ec.length > PG_REASON_MAX ? ec.slice(0, PG_REASON_MAX).replace(/\s+\S*$/, '') + '…' : ec;
+      break;
+    }
   }
   return what + (prichina ? ' — ' + prichina : '');
+}
+
+// Причина приходит из текста ошибки API и уходит дальше в базу (pipeline_error) и в
+// суточную сводку Сане. В таком тексте может оказаться секрет: у вебхука Битрикса токен
+// стоит прямо в пути (/rest/65/<токен>/), ключ SpeechKit — в заголовке, ответ Polza может
+// прийти телом целиком. Поэтому причину чистим, а не подставляем как есть.
+function pgSafeReason(text) {
+  var s = String(text || '');
+  s = s.replace(/\/rest\/\d+\/[A-Za-z0-9]+/g, '/rest/**');
+  s = s.replace(/\b(Api-Key|Bearer|apikey)\b[:=\s]+\S+/gi, '$1 ***');
+  s = s.replace(/([?&](apikey|api_key|key|token|access_token|signature)=)[^&\s]+/gi, '$1***');
+  // Длинная сплошная строка — почти всегда ключ, подпись или идентификатор сессии.
+  s = s.replace(/[A-Za-z0-9_-]{32,}/g, '***');
+  return s.replace(/\s+/g, ' ').trim();
 }
 
 // Причина сбоя сбора — из отметки первого непрочитанного источника. Нужна там же, где
@@ -172,7 +190,8 @@ function pgSourcesReason(marks, incomplete) {
   for (var i = 0; i < list.length; i++) {
     var e = String((m[list[i]] && m[list[i]].error) || '').trim();
     if (e && e !== 'неизвестная ошибка') {
-      return ' — ' + (e.length > PG_REASON_MAX ? e.slice(0, PG_REASON_MAX).replace(/\s+\S*$/, '') + '…' : e);
+      var ec2 = pgSafeReason(e);
+      return ' — ' + (ec2.length > PG_REASON_MAX ? ec2.slice(0, PG_REASON_MAX).replace(/\s+\S*$/, '') + '…' : ec2);
     }
   }
   return '';

@@ -235,5 +235,40 @@ var dBoth = L.pgDecide({ sources: marksPart, recognition: recCall });
 eq('при двух бедах сначала сообщаем про сбор', dBoth.kind, 'collect');
 check('и текст про сбор', /сбор неполный/.test(dBoth.pipeline_error));
 
+console.log('\n=== Причина сбоя не выносит секреты (находка проверки безопасности) ===');
+// Текст ошибки приходит от API и уходит в базу и в суточную сводку. У вебхука Битрикса
+// токен стоит прямо в пути URL, поэтому причину чистим перед подстановкой.
+function prichinaIz(oshibka) {
+  return L.pgDecide({
+    sources: vseProchitano(),
+    recognition: { calls: [{ activity_id: '9', retryable: true, error: oshibka }] }
+  }).pipeline_error;
+}
+var sTokenom = prichinaIz('502 от https://dinalnsk.bitrix24.ru/rest/65/tokenprimer9z8y7x/disk.file.get');
+check('токен вебхука Битрикса вырезан', !/tokenprimer9z8y7x/.test(sTokenom), sTokenom);
+check('путь остался узнаваемым', /\/rest\/\*\*/.test(sTokenom), sTokenom);
+
+var sKlyuchom = prichinaIz('SpeechKit отказал: Api-Key AQVNprimerklyucha0123456789abcdefghij');
+check('ключ после Api-Key вырезан', !/AQVN0UdCv1xKfHU/.test(sKlyuchom), sKlyuchom);
+
+var vQuery = prichinaIz('GET /v1/x?token=abcdef0123456789abcdef&channels=2 вернул 403');
+check('секрет из query вырезан', !/abcdef0123456789abcdef/.test(vQuery), vQuery);
+
+var dlinnaya = prichinaIz('сбой подписи eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9abcdefghij');
+check('длинная сплошная строка вырезана', !/eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9/.test(dlinnaya), dlinnaya);
+
+// Полезные причины при этом должны оставаться читаемыми — иначе сигнал бесполезен.
+check('timeout виден', /timeout/.test(prichinaIz('Резерв распознавания: timeout')));
+check('код ответа виден', /503/.test(prichinaIz('Polza HTTP 503')));
+check('имя хоста не секрет и остаётся', /dinalnsk\.bitrix24\.ru/.test(prichinaIz('getaddrinfo EAI_AGAIN dinalnsk.bitrix24.ru')));
+check('overloaded виден', /overloaded/.test(prichinaIz('Резерв распознавания: overloaded')));
+
+// То же и для сбоя сбора
+var marksTok = vseProchitano();
+L.pgMarkFailed(marksTok, 'calls', 'HTTP 401 https://dinalnsk.bitrix24.ru/rest/65/tokenprimer9z8y7x/crm.activity.list', 3);
+var sborSTokenom = L.pgDecide({ sources: marksTok, recognition: {} }).pipeline_error;
+check('в сбое сбора токен тоже вырезан', !/tokenprimer9z8y7x/.test(sborSTokenom), sborSTokenom);
+check('а код ответа остался', /401/.test(sborSTokenom), sborSTokenom);
+
 console.log('\nИТОГО: ' + pass + ' ok, ' + fail + ' fail');
 if (fail > 0) process.exit(1);

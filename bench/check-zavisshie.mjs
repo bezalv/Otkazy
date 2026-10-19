@@ -106,6 +106,20 @@ const gateNode = kod(WF.analiz, 'pipeline-gate') || '';
 gateNode.includes('pgFailuresText') && gateNode.includes('pgSourcesReason')
   ? ok('обе функции причины стоят в ноде') : bad('в ноде нет функций причины');
 
+// Находка проверки безопасности: причина уходит в базу и в сводку, секреты из неё вычищаем.
+gateNode.includes('pgSafeReason') ? ok('очистка причины стоит в ноде') : bad('в ноде нет pgSafeReason');
+const S = new Function(lib + '\nreturn { pgSafeReason };')();
+const gryaznye = [
+  ['502 от https://dinalnsk.bitrix24.ru/rest/65/tokenprimer9z8y7x/disk.file.get', /tokenprimer9z8y7x/],
+  ['Api-Key AQVNprimerklyucha0123456789abcdefghij', /AQVN0UdCv1xKfHU/],
+  ['GET /v1/x?token=abcdef0123456789abcdef вернул 403', /abcdef0123456789abcdef/],
+];
+const utechki = gryaznye.filter(([txt, re]) => re.test(S.pgSafeReason(txt)));
+utechki.length ? bad('очистка пропускает секрет', utechki.length + ' случаев') : ok('секреты из причины вычищаются (' + gryaznye.length + ' случая)');
+const poleznye = [['Резерв распознавания: timeout', /timeout/], ['Polza HTTP 503', /503/]];
+poleznye.every(([txt, re]) => re.test(S.pgSafeReason(txt)))
+  ? ok('полезные причины остаются читаемыми') : bad('очистка съедает полезное');
+
 console.log('\n=== Партии ночного повтора и ручного прогона ===');
 const NR = fs.readFileSync(ROOT + '/prototype/lib/nightly-retry.js', 'utf8');
 const N = new Function(NR + '\nreturn { nightlyBatches, manualBatch };')();
