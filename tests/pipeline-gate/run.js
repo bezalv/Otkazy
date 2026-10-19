@@ -249,7 +249,7 @@ check('токен вебхука Битрикса вырезан', !/tokenprimer
 check('путь остался узнаваемым', /\/rest\/\*\*/.test(sTokenom), sTokenom);
 
 var sKlyuchom = prichinaIz('SpeechKit отказал: Api-Key AQVNprimerklyucha0123456789abcdefghij');
-check('ключ после Api-Key вырезан', !/AQVN0UdCv1xKfHU/.test(sKlyuchom), sKlyuchom);
+check('ключ после Api-Key вырезан', !/AQVNprimerklyucha/.test(sKlyuchom), sKlyuchom);
 
 var vQuery = prichinaIz('GET /v1/x?token=abcdef0123456789abcdef&channels=2 вернул 403');
 check('секрет из query вырезан', !/abcdef0123456789abcdef/.test(vQuery), vQuery);
@@ -257,7 +257,27 @@ check('секрет из query вырезан', !/abcdef0123456789abcdef/.test(v
 var dlinnaya = prichinaIz('сбой подписи eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9abcdefghij');
 check('длинная сплошная строка вырезана', !/eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9/.test(dlinnaya), dlinnaya);
 
+// Формы, которые очистка пропускала до второй находки проверки безопасности.
+var bezId = prichinaIz('502 https://dinalnsk.bitrix24.ru/rest/tokenprimer9z8y7x/disk.file.get');
+check('токен Битрикса без номера пользователя тоже вырезан', !/tokenprimer9z8y7x/.test(bezId), bezId);
+
+var sParolem = prichinaIz('connect failed postgres://user:parolprimer@db.host:5432/postgres');
+check('пароль из строки подключения вырезан', !/parolprimer/.test(sParolem), sParolem);
+check('хост при этом остался', /db\.host/.test(sParolem), sParolem);
+
+var sJwt = prichinaIz('401 eyJhbGciOiJIUzI1NiJ9.eyJyb2xlIjoic2VydmljZV9yb2xlIn0.podpis');
+check('JWT вырезан целиком, хотя его куски короче порога длины', !/eyJ/.test(sJwt), sJwt);
+
+var korotkiy = prichinaIz('GET /x?secret=abc123 403');
+check('короткий секрет в строке запроса вырезан', !/abc123/.test(korotkiy), korotkiy);
+check('код ответа при этом остался', /403/.test(korotkiy), korotkiy);
+
+var sbPub = prichinaIz('401 apikey sb_publishable_primerKlyucha12');
+check('ключ Supabase вырезан', !/primerKlyucha12/.test(sbPub), sbPub);
+
 // Полезные причины при этом должны оставаться читаемыми — иначе сигнал бесполезен.
+check('BucketMaxSizeExceeded выживает (21 знак, короче порога)', /BucketMaxSizeExceeded/.test(prichinaIz('S3: BucketMaxSizeExceeded')));
+check('«timeout of 720000ms exceeded» выживает', /720000ms/.test(prichinaIz('timeout of 720000ms exceeded')));
 check('timeout виден', /timeout/.test(prichinaIz('Резерв распознавания: timeout')));
 check('код ответа виден', /503/.test(prichinaIz('Polza HTTP 503')));
 check('имя хоста не секрет и остаётся', /dinalnsk\.bitrix24\.ru/.test(prichinaIz('getaddrinfo EAI_AGAIN dinalnsk.bitrix24.ru')));

@@ -110,13 +110,19 @@ gateNode.includes('pgFailuresText') && gateNode.includes('pgSourcesReason')
 gateNode.includes('pgSafeReason') ? ok('очистка причины стоит в ноде') : bad('в ноде нет pgSafeReason');
 const S = new Function(lib + '\nreturn { pgSafeReason };')();
 const gryaznye = [
-  ['502 от https://dinalnsk.bitrix24.ru/rest/65/tokenprimer9z8y7x/disk.file.get', /tokenprimer9z8y7x/],
-  ['Api-Key AQVNprimerklyucha0123456789abcdefghij', /AQVN0UdCv1xKfHU/],
+  ['502 от https://dinalnsk.bitrix24.ru/rest/65/tokenprimer9z8y7x/x', /tokenprimer9z8y7x/],
+  ['502 от https://dinalnsk.bitrix24.ru/rest/tokenprimer9z8y7x/x', /tokenprimer9z8y7x/],
+  ['Api-Key AQVNprimerklyucha0123456789abcdefghij', /AQVNprimerklyucha/],
   ['GET /v1/x?token=abcdef0123456789abcdef вернул 403', /abcdef0123456789abcdef/],
+  ['connect failed postgres://user:parolprimer@db.host:5432/db', /parolprimer/],
+  ['401 eyJhbGciOiJIUzI1NiJ9.eyJyb2xlIjoiciJ9.podpis', /eyJ/],
+  ['401 apikey sb_publishable_primerKlyucha12', /primerKlyucha12/],
+  ['GET /x?secret=abc123 403', /abc123/],
 ];
 const utechki = gryaznye.filter(([txt, re]) => re.test(S.pgSafeReason(txt)));
 utechki.length ? bad('очистка пропускает секрет', utechki.length + ' случаев') : ok('секреты из причины вычищаются (' + gryaznye.length + ' случая)');
-const poleznye = [['Резерв распознавания: timeout', /timeout/], ['Polza HTTP 503', /503/]];
+const poleznye = [['Резерв распознавания: timeout', /timeout/], ['Polza HTTP 503', /503/],
+  ['S3: BucketMaxSizeExceeded', /BucketMaxSizeExceeded/], ['timeout of 720000ms exceeded', /720000ms/]];
 poleznye.every(([txt, re]) => re.test(S.pgSafeReason(txt)))
   ? ok('полезные причины остаются читаемыми') : bad('очистка съедает полезное');
 
