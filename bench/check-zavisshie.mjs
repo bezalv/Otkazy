@@ -126,6 +126,45 @@ const poleznye = [['Резерв распознавания: timeout', /timeout/
 poleznye.every(([txt, re]) => re.test(S.pgSafeReason(txt)))
   ? ok('полезные причины остаются читаемыми') : bad('очистка съедает полезное');
 
+console.log('\n=== Сырой текст ошибки не уходит ни одним путём ===');
+// Третья находка проверки: очистка стояла на одном выходе, а текст уходил ещё двумя путями —
+// в gate_failures (видно в данных выполнений n8n) и в _error из «Обработать 1 сделку» прямо
+// в базу, минуя гейт. Теперь чистим на входе и в единой точке записи в базу.
+const GRYAZNO = '502 https://dinalnsk.bitrix24.ru/rest/65/tokenprimer9z8y7x/x?token=abc123';
+const SEKRETY = /tokenprimer9z8y7x|abc123/;
+const LF = new Function(lib + '\nreturn { pgRecognitionFailures, pgDecide, pgSafeReason };')();
+const marki2 = { calls: { complete: true }, openlines: { complete: true }, comments: { complete: true }, tasks: { complete: true } };
+
+const sboi = LF.pgRecognitionFailures({ calls: [{ activity_id: '9', retryable: true, error: GRYAZNO }] });
+SEKRETY.test(JSON.stringify(sboi)) ? bad('секрет остался в gate_failures', sboi[0].error) : ok('gate_failures без секретов');
+
+const resh = LF.pgDecide({ sources: marki2, recognition: { calls: [{ activity_id: '9', retryable: true, error: GRYAZNO }] } });
+SEKRETY.test(JSON.stringify(resh)) ? bad('секрет остался в решении гейта') : ok('решение гейта без секретов');
+
+const gateSrc = kod(WF.analiz, 'pipeline-gate') || '';
+/error: pgSafeReason\(/.test(gateSrc) ? ok('нода чистит текст на входе, а не на выходе') : bad('в ноде нет очистки на входе');
+
+// «Подготовить SQL» — единая точка записи в базу для текста исключения
+const sqlSrc = kod(WF.paket, 'Подготовить SQL') || '';
+if (!sqlSrc.includes('function sqlSafeReason')) bad('в «Подготовить SQL» нет очистки текста исключения');
+else {
+  const i2 = sqlSrc.indexOf('function sqlSafeReason(text) {');
+  let g2 = 0, k2 = -1;
+  for (let j = sqlSrc.indexOf('{', i2); j < sqlSrc.length; j++) {
+    if (sqlSrc[j] === '{') g2++;
+    else if (sqlSrc[j] === '}') { g2--; if (g2 === 0) { k2 = j + 1; break; } }
+  }
+  const SQLF = new Function(sqlSrc.slice(i2, k2) + '\nreturn sqlSafeReason;')();
+  const formy = [GRYAZNO, 'postgres://user:parolprimer@db.host:5432/db',
+    'Api-Key AQVNprimerklyucha0123456789abcdefghij', '401 eyJhbGciOiJIUzI1NiJ9.eyJyb2xlIjoiciJ9.podpis',
+    'timeout of 720000ms exceeded', 'S3: BucketMaxSizeExceeded'];
+  const rashod2 = formy.filter((s) => SQLF(s) !== LF.pgSafeReason(s));
+  rashod2.length ? bad('очистка в SQL-ноде расходится с библиотекой', rashod2.length + ' форм')
+    : ok('очистка в SQL-ноде совпадает с библиотекой (' + formy.length + ' форм)');
+  SQLF('timeout of 720000ms exceeded') === 'timeout of 720000ms exceeded'
+    ? ok('полезная причина в базу попадает целиком') : bad('очистка в SQL съедает полезное');
+}
+
 console.log('\n=== Партии ночного повтора и ручного прогона ===');
 const NR = fs.readFileSync(ROOT + '/prototype/lib/nightly-retry.js', 'utf8');
 const N = new Function(NR + '\nreturn { nightlyBatches, manualBatch };')();
