@@ -56,18 +56,26 @@ console.log('\n=== Сбор неполный: блокирует всегда ==
 var dCollect = L.pgDecide({ sources: marksPart, recognition: {} });
 check('блокирует', dCollect.block === true);
 eq('вид сбоя', dCollect.kind, 'collect');
-eq('текст ошибки', dCollect.pipeline_error, 'сбор неполный: открытые линии');
+// 19.10: в текст добавлена причина — по ней суточная сводка группирует зависшие сделки.
+eq('текст ошибки с причиной', dCollect.pipeline_error, 'сбор неполный: открытые линии — 503 Service Unavailable');
 check('помечено как окончательное — повтор не поможет сам собой', dCollect.final === true);
 
+// Флага last_attempt больше нет вовсе: даже если он прилетит из старого тела запроса,
+// на решение он не влияет — это защита от забытого поля в чужом вызове.
 var dCollectLast = L.pgDecide({ sources: marksPart, recognition: {}, last_attempt: true });
-check('и на третьей попытке тоже блокирует: без данных вердикта нет', dCollectLast.block === true);
-eq('на третьей попытке вид тот же', dCollectLast.kind, 'collect');
+check('посторонний last_attempt ничего не меняет: без данных вердикта нет', dCollectLast.block === true);
+eq('вид сбоя тот же', dCollectLast.kind, 'collect');
 
 var marksTwo = vseProchitano();
 L.pgMarkFailed(marksTwo, 'calls', 'timeout', 3);
 L.pgMarkFailed(marksTwo, 'tasks', 'ECONNRESET', 3);
-eq('два источника перечисляются через запятую',
-  L.pgDecide({ sources: marksTwo, recognition: {} }).pipeline_error, 'сбор неполный: звонки, задачи');
+eq('два источника перечисляются через запятую, причина — от первого',
+  L.pgDecide({ sources: marksTwo, recognition: {} }).pipeline_error, 'сбор неполный: звонки, задачи — timeout');
+// Причина берётся осмысленная: заглушку «неизвестная ошибка» в текст не тащим.
+var marksBezPrichiny = vseProchitano();
+L.pgMarkFailed(marksBezPrichiny, 'comments', null, 3);
+eq('без внятной причины текст как раньше',
+  L.pgDecide({ sources: marksBezPrichiny, recognition: {} }).pipeline_error, 'сбор неполный: комментарии');
 
 console.log('\n=== Технический сбой распознавания ===');
 var recCall = { calls: [{ activity_id: '555', retryable: true, error: '503 upstream' }] };
@@ -75,7 +83,9 @@ var dRec = L.pgDecide({ sources: vseProchitano(), recognition: recCall });
 check('блокирует', dRec.block === true);
 eq('вид сбоя', dRec.kind, 'recognition');
 check('в тексте виден звонок', /звонок 555/.test(dRec.pipeline_error), dRec.pipeline_error);
-check('не помечено окончательным — повтор имеет смысл', dRec.final === false);
+check('помечено окончательным: разбора не будет, нужно починить причину', dRec.final === true);
+// 19.10: причина сбоя попадает в текст ошибки — по ней сводка группирует зависшие.
+check('в тексте видна причина сбоя', /503 upstream/.test(dRec.pipeline_error), dRec.pipeline_error);
 
 var dVoice = L.pgDecide({
   sources: vseProchitano(),
@@ -145,7 +155,7 @@ var dDlinnyy = L.pgDecide({
 });
 check('такая сделка блокируется', dDlinnyy.block === true);
 eq('и это сбой распознавания', dDlinnyy.kind, 'recognition');
-check('значит уйдёт в ночной повтор', dDlinnyy.final === false);
+check('и это окончательно: сделка висит, пока не починят', dDlinnyy.final === true);
 
 var dKorotkiy = L.pgDecide({
   sources: vseProchitano(),
@@ -167,13 +177,44 @@ check('формулировка СПИН', L.pgChannelsMismatch(KANALY));
 check('без «in specification»', L.pgChannelsMismatch('Audio has 1 channels, but 2 requested'));
 check('посторонняя ошибка', !L.pgChannelsMismatch('503 upstream'));
 
-console.log('\n=== Третья попытка: сделку больше не держим ===');
+console.log('\n=== Попытки исчерпаны: разбора нет совсем (19.10.2026) ===');
+// Прежде третья попытка снимала блокировку и сделка разбиралась на том, что собрали.
+// При аварии 16–17.10 это дало 12 разборов на неполных данных и два ложных «неправомерен».
+// Теперь число попыток на решение гейта не влияет вообще.
 var dLast = L.pgDecide({ sources: vseProchitano(), recognition: recCall, last_attempt: true });
-check('не блокирует', dLast.block === false);
-eq('но сбой записан в решении', dLast.kind, 'recognition_accepted');
-eq('и перечислен', dLast.failures.length, 1);
+check('блокирует и при исчерпанных попытках', dLast.block === true);
+eq('вид сбоя', dLast.kind, 'recognition');
+check('окончательно', dLast.final === true);
+eq('сбой перечислен', dLast.failures.length, 1);
 eq('с видом и номером', [dLast.failures[0].kind, dLast.failures[0].id], ['звонок', '555']);
-eq('порог попыток', L.PG_MAX_ATTEMPTS, 3);
+check('вида recognition_accepted больше не существует', dLast.kind !== 'recognition_accepted');
+eq('порог попыток у ночного повтора остался', L.PG_MAX_ATTEMPTS, 3);
+
+console.log('\n=== Сбой, попытки ещё есть: та же блокировка ===');
+// Разницы между «попытки есть» и «исчерпаны» для гейта нет: решение одно и то же,
+// попытки считает только ночной повтор.
+var dPervaya = L.pgDecide({ sources: vseProchitano(), recognition: recCall });
+eq('решение совпадает с исчерпанными попытками',
+  [dPervaya.block, dPervaya.kind, dPervaya.final], [dLast.block, dLast.kind, dLast.final]);
+
+console.log('\n=== Тишина и автоответчик: разбор идёт как обычно ===');
+// Это нормальные случаи, а не сбой: пустой результат без ошибки и неподдерживаемый формат.
+var dTishina = L.pgDecide({
+  sources: vseProchitano(),
+  recognition: { calls: [{ activity_id: '900', retryable: false, error: '', duration_sec: 12 }] }
+});
+check('тишина в записи вердикт не держит', dTishina.block === false);
+eq('и сбоев не записано', dTishina.failures.length, 0);
+var dAvtootvet = L.pgDecide({
+  sources: vseProchitano(),
+  recognition: { calls: [{ activity_id: '901', retryable: false, error: '', duration_sec: 6 }] }
+});
+check('короткий сброс тоже не держит', dAvtootvet.block === false);
+var dGolosM4a = L.pgDecide({
+  sources: vseProchitano(),
+  recognition: { voices: [{ file_id: '902', retryable: true, error: 'формат не поддержан', file_name: 'zapis.m4a' }] }
+});
+check('m4a — известное ограничение, не сбой', dGolosM4a.block === false);
 
 console.log('\n=== Факт для нераспознанного звонка ===');
 var factUnrec = L.pgUnrecognizedCallFact('outgoing', 185, true);

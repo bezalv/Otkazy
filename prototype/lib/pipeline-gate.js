@@ -149,14 +149,48 @@ function pgRecognitionFailures(recognition) {
   return out;
 }
 
+// Что именно не получено и почему. Причина нужна в тексте ошибки, потому что по ней
+// суточная сводка группирует зависшие сделки («4 — звонки не распознаны (timeout)»), а Саня
+// по ней решает, что чинить. Раньше в pipeline_error был только список звонков, без причины.
+var PG_REASON_MAX = 90;
+function pgFailuresText(failures) {
+  var list = failures || [];
+  var what = list.map(function (f) { return f.kind + (f.id ? ' ' + f.id : ''); }).join(', ');
+  var prichina = '';
+  for (var i = 0; i < list.length; i++) {
+    var e = String((list[i] && list[i].error) || '').trim();
+    if (e) { prichina = e.length > PG_REASON_MAX ? e.slice(0, PG_REASON_MAX).replace(/\s+\S*$/, '') + '…' : e; break; }
+  }
+  return what + (prichina ? ' — ' + prichina : '');
+}
+
+// Причина сбоя сбора — из отметки первого непрочитанного источника. Нужна там же, где
+// и причина распознавания: по ней сводка группирует зависшие сделки.
+function pgSourcesReason(marks, incomplete) {
+  var m = marks || {};
+  var list = incomplete || [];
+  for (var i = 0; i < list.length; i++) {
+    var e = String((m[list[i]] && m[list[i]].error) || '').trim();
+    if (e && e !== 'неизвестная ошибка') {
+      return ' — ' + (e.length > PG_REASON_MAX ? e.slice(0, PG_REASON_MAX).replace(/\s+\S*$/, '') + '…' : e);
+    }
+  }
+  return '';
+}
+
 // Главное решение: пускать ли сделку к судье.
 //
 // state.sources     — карта отметок полноты
 // state.recognition — { calls: [], voices: [], screenshots: [] } с полями retryable/error
-// state.last_attempt — третья попытка: сбой распознавания больше не держит сделку
 //
-// Сбор неполный по API блокирует ВСЕГДА, в том числе на последней попытке: без данных
-// вердикт выносить нельзя, такую сделку показываем в отчёте.
+// 19.10.2026 (решение Сани): разбора при неполных данных больше нет вовсе. Раньше третья
+// попытка (last_attempt) снимала блокировку по распознаванию, и сделка разбиралась на том,
+// что успели собрать. При аварии 16–17.10 это дало 12 разборов на неполных данных, и у двух
+// менеджеров вышло ложное «неправомерен». Теперь неполные данные — сбой процесса, а не повод
+// для вердикта: сделка висит в списке зависших, сигналит в суточной сводке и поднимается
+// руками воркфлоу «Отказ: Прогон зависших».
+//
+// Поэтому у обеих веток блокировки final = true: ждать больше нечего, нужно починить причину.
 function pgDecide(state) {
   var s = state || {};
   var incomplete = pgIncompleteSources(s.sources);
@@ -165,30 +199,27 @@ function pgDecide(state) {
     return {
       block: true,
       kind: 'collect',
-      pipeline_error: 'сбор неполный: ' + labels,
+      pipeline_error: 'сбор неполный: ' + labels + pgSourcesReason(s.sources, incomplete),
       sources: incomplete,
       final: true
     };
   }
 
   var failures = pgRecognitionFailures(s.recognition);
-  if (failures.length && s.last_attempt !== true) {
-    var what = failures.map(function (f) { return f.kind + (f.id ? ' ' + f.id : ''); }).join(', ');
+  if (failures.length) {
     return {
       block: true,
       kind: 'recognition',
-      pipeline_error: 'технический сбой распознавания: ' + what,
+      pipeline_error: 'технический сбой распознавания: ' + pgFailuresText(failures),
       failures: failures,
-      final: false
+      final: true
     };
   }
 
-  // Третья попытка со сбоем распознавания: разбор идём, но в фактах будет честно сказано,
-  // что запись есть и она не распознана.
   return {
     block: false,
-    kind: failures.length ? 'recognition_accepted' : 'ok',
-    failures: failures
+    kind: 'ok',
+    failures: []
   };
 }
 

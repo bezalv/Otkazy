@@ -8,7 +8,7 @@ var fs = require('fs');
 var path = require('path');
 
 var src = fs.readFileSync(path.join(__dirname, '..', '..', 'prototype', 'lib', 'nightly-retry.js'), 'utf8');
-var L = new Function(src + '\nreturn { nightlyIsFresh: nightlyIsFresh, nightlyBatches: nightlyBatches, NIGHTLY_FRESH_DAYS: NIGHTLY_FRESH_DAYS, NIGHTLY_MAX_DEALS: NIGHTLY_MAX_DEALS };')();
+var L = new Function(src + '\nreturn { nightlyIsFresh: nightlyIsFresh, nightlyBatches: nightlyBatches, manualBatch: manualBatch, NIGHTLY_FRESH_DAYS: NIGHTLY_FRESH_DAYS, NIGHTLY_MAX_DEALS: NIGHTLY_MAX_DEALS };')();
 
 var pass = 0, fail = 0;
 function check(name, cond, hint) {
@@ -46,7 +46,7 @@ console.log('\n=== Свежая сделка: живой разбор ===');
 var zhivaya = L.nightlyBatches([{ deal_id: 125900, lose_date: dnyNazad(2), next_is_last: false }], NOW);
 eq('одна партия', zhivaya.length, 1);
 check('silent выключен — уведомления уйдут', zhivaya[0].silent === false);
-check('попытка не последняя', zhivaya[0].last_attempt === false);
+check('флага номера попытки больше нет', zhivaya[0].last_attempt === undefined);
 eq('сделка в партии', zhivaya[0].deal_ids, [125900]);
 
 console.log('\n=== Старая сделка: тихий разбор ===');
@@ -61,13 +61,13 @@ var smesh = L.nightlyBatches([
   { deal_id: 3, lose_date: dnyNazad(40), next_is_last: false },
   { deal_id: 4, lose_date: dnyNazad(90), next_is_last: true }
 ], NOW);
-eq('четыре партии', smesh.length, 4);
+// 19.10: деление по номеру попытки убрано вместе с last_attempt — остались живые и тихие.
+eq('две партии', smesh.length, 2);
 eq('порядок: сначала живые', smesh.map(function (b) { return b._partiya; }),
-  ['live-normal', 'live-last', 'quiet-normal', 'quiet-last']);
-eq('живая обычная', [smesh[0].deal_ids, smesh[0].silent, smesh[0].last_attempt], [[1], false, false]);
-eq('живая последняя', [smesh[1].deal_ids, smesh[1].silent, smesh[1].last_attempt], [[2], false, true]);
-eq('тихая обычная', [smesh[2].deal_ids, smesh[2].silent, smesh[2].last_attempt], [[3], true, false]);
-eq('тихая последняя', [smesh[3].deal_ids, smesh[3].silent, smesh[3].last_attempt], [[4], true, true]);
+  ['live', 'quiet']);
+eq('живые собраны в одну партию', [smesh[0].deal_ids, smesh[0].silent], [[1, 2], false]);
+eq('тихие — в другую', [smesh[1].deal_ids, smesh[1].silent], [[3, 4], true]);
+check('флага попытки в партиях нет', smesh.every(function (b) { return b.last_attempt === undefined; }));
 
 console.log('\n=== Пустые партии не отправляются ===');
 eq('очередь пуста — ни одной партии', L.nightlyBatches([], NOW), []);
@@ -96,6 +96,33 @@ check('живых партий нет вовсе',
 
 console.log('\n=== Предохранитель на число сделок ===');
 eq('лимит вынесен константой', L.NIGHTLY_MAX_DEALS, 20);
+
+console.log('\n=== Ручной прогон зависших (19.10.2026) ===');
+// «Отказ: Прогон зависших»: берём всех из списка, живой режим, фильтра свежести нет —
+// сделка ни разу не получала вердикт, и РОП должен о ней узнать, даже если закрыта давно.
+var ruchnoy = L.manualBatch([
+  { deal_id: 111023, lose_date: dnyNazad(1) },
+  { deal_id: 118697, lose_date: '2026-06-03' },
+  { deal_id: 126200, lose_date: null }
+]);
+eq('одна партия', ruchnoy.length, 1);
+eq('все сделки в ней', ruchnoy[0].deal_ids, [111023, 118697, 126200]);
+check('режим живой', ruchnoy[0].silent === false);
+check('флага попытки нет', ruchnoy[0].last_attempt === undefined);
+eq('пометка партии', ruchnoy[0]._partiya, 'manual');
+eq('счётчик', ruchnoy[0]._skolko, 3);
+
+// Старая сделка в ручном прогоне НЕ уходит в тихий режим — в этом и отличие от ночного повтора.
+var tolkoStaraya = L.manualBatch([{ deal_id: 115963, lose_date: '2026-07-24' }]);
+check('закрытая месяцы назад всё равно разбирается живьём', tolkoStaraya[0].silent === false);
+check('а ночной повтор такую сделку разобрал бы тихо',
+  L.nightlyBatches([{ deal_id: 115963, lose_date: '2026-07-24' }], NOW)[0].silent === true);
+
+eq('пустой список — партий нет', L.manualBatch([]), []);
+eq('список не передан', L.manualBatch(), []);
+eq('сделки без номера пропускаются', L.manualBatch([{ deal_id: null }, { deal_id: 7 }])[0].deal_ids, [7]);
+eq('повторы в списке не дублируются',
+  L.manualBatch([{ deal_id: 7 }, { deal_id: 7 }, { deal_id: 8 }])[0].deal_ids, [7, 8]);
 
 console.log('\nИТОГО: ' + pass + ' ok, ' + fail + ' fail');
 if (fail > 0) process.exit(1);

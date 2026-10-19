@@ -31,30 +31,27 @@ function nightlyIsFresh(loseDate, nowMs) {
   return ageDays <= NIGHTLY_FRESH_DAYS;
 }
 
-// Партии для lost-batch. Делим по двум признакам: свежесть (silent) и номер попытки
-// (last_attempt) — оба флага действуют на весь запуск, поэтому в одну партию их не смешать.
-// Порядок партий: сначала живые, внутри — обычные попытки перед последними.
+// Партии для lost-batch. Делим только по свежести: она решает, живой разбор или тихий.
+//
+// 19.10.2026: деление по номеру попытки убрано вместе с механизмом last_attempt. Раньше
+// третья попытка снимала блокировку по распознаванию и сделка разбиралась на неполных
+// данных; теперь такая сделка просто остаётся в списке зависших и ждёт ручного прогона.
 function nightlyBatches(rows, nowMs) {
   var list = rows || [];
   var now = nowMs || Date.now();
   var buckets = {
-    'live-normal': { deal_ids: [], silent: false, last_attempt: false },
-    'live-last': { deal_ids: [], silent: false, last_attempt: true },
-    'quiet-normal': { deal_ids: [], silent: true, last_attempt: false },
-    'quiet-last': { deal_ids: [], silent: true, last_attempt: true }
+    live: { deal_ids: [], silent: false },
+    quiet: { deal_ids: [], silent: true }
   };
 
   for (var i = 0; i < list.length; i++) {
     var row = list[i] || {};
     var id = Number(row.deal_id);
     if (!id) continue;
-    var fresh = nightlyIsFresh(row.lose_date, now);
-    var last = row.next_is_last === true;
-    var key = (fresh ? 'live' : 'quiet') + '-' + (last ? 'last' : 'normal');
-    buckets[key].deal_ids.push(id);
+    buckets[nightlyIsFresh(row.lose_date, now) ? 'live' : 'quiet'].deal_ids.push(id);
   }
 
-  var order = ['live-normal', 'live-last', 'quiet-normal', 'quiet-last'];
+  var order = ['live', 'quiet'];
   var out = [];
   for (var k = 0; k < order.length; k++) {
     var b = buckets[order[k]];
@@ -62,10 +59,28 @@ function nightlyBatches(rows, nowMs) {
     out.push({
       deal_ids: b.deal_ids,
       silent: b.silent,
-      last_attempt: b.last_attempt,
       _partiya: order[k],
       _skolko: b.deal_ids.length
     });
   }
   return out;
+}
+
+// Ручной прогон зависших («Отказ: Прогон зависших», 19.10.2026).
+//
+// Отличия от ночного повтора, оба — решение Сани:
+//   * фильтра свежести нет: сделка ни разу не получала вердикт, и РОП должен о ней узнать,
+//     даже если закрыта давно;
+//   * берутся ВСЕ зависшие, а не только те, у кого остались ночные попытки;
+//   * одна партия: делить не по чему, флаг один.
+// Сделка, которая снова не собралась, останется в списке — её видно в следующей сводке.
+function manualBatch(rows) {
+  var ids = [];
+  var list = rows || [];
+  for (var i = 0; i < list.length; i++) {
+    var id = Number((list[i] || {}).deal_id);
+    if (id && ids.indexOf(id) === -1) ids.push(id);
+  }
+  if (!ids.length) return [];
+  return [{ deal_ids: ids, silent: false, _partiya: 'manual', _skolko: ids.length }];
 }
