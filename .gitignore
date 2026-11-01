@@ -9,6 +9,7 @@ workflows/
 
 # Зависимости
 node_modules/
+supabase/.temp/
 
 # Временные файлы
 tmp/
