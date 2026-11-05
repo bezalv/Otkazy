@@ -145,7 +145,7 @@ async function launchMock(t, scenario, model = 'gigaam') {
     await delay(50);
   }
   assert.ok(started, `STT не запустился: ${errors}`);
-  return { base, work, service };
+  return { base, work, service, logFile: path.join(temp, 'service.log') };
 }
 
 async function mockTranscribe(base) {
@@ -156,6 +156,15 @@ async function mockTranscribe(base) {
   });
   return { status: response.status, body: await response.json() };
 }
+
+test('сообщение провайдера не попадает в ответ и журнал', async t => {
+  const { base, logFile } = await launchMock(t, 'provider_secret');
+  const result = await mockTranscribe(base);
+  assert.equal(result.status, 502);
+  assert.equal(result.body.error.code, 'provider_error');
+  assert.doesNotMatch(JSON.stringify(result.body), /secret-must-not-appear/);
+  assert.doesNotMatch(await fs.readFile(logFile, 'utf8'), /secret-must-not-appear/);
+});
 
 for (const scenario of ['invalid_json', 'missing_text']) {
   test(`gigaam: ${scenario} остаётся техническим сбоем`, async t => {

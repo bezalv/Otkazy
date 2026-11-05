@@ -1,0 +1,42 @@
+-- Очередь автономного обработчика. Применяется отдельно после интеграционных проверок.
+-- Содержимое коммуникаций и токены в очередь не помещаются.
+create table public.lost_processing_jobs (
+  id uuid primary key,
+  request_key text not null unique,
+  deal_id bigint not null,
+  lose_date timestamptz not null,
+  trigger_type text not null,
+  silent boolean not null default false,
+  screenshots boolean not null default true,
+  status text not null default 'pending'
+    check (status in ('pending', 'processing', 'done', 'failed', 'needs_review')),
+  attempts integer not null default 0 check (attempts >= 0),
+  available_at timestamptz not null default now(),
+  lease_token uuid,
+  lease_until timestamptz,
+  last_error text,
+  comment_state text not null default 'pending' check (comment_state in ('pending', 'sending', 'ok', 'unknown', 'skipped')),
+  comment_id text,
+  notify_state text not null default 'pending' check (notify_state in ('pending', 'sending', 'ok', 'unknown', 'skipped')),
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  constraint lost_jobs_lease_consistent check (
+    (status = 'processing' and lease_token is not null and lease_until is not null)
+    or (status <> 'processing' and lease_token is null and lease_until is null)
+  )
+);
+
+-- Два разных события одной сделки нельзя обрабатывать одновременно.
+create unique index lost_jobs_one_processing_per_deal
+  on public.lost_processing_jobs (deal_id) where status = 'processing';
+create index lost_jobs_ready
+  on public.lost_processing_jobs (available_at, created_at) where status = 'pending';
+
+-- Новые разборы имеют устойчивый идентификатор операции. NULL оставляет
+-- исторические записи и существующих потребителей без изменений.
+alter table public.lost_deal_analyses add column pipeline_operation_id uuid;
+create unique index lost_analyses_pipeline_operation_id
+  on public.lost_deal_analyses (pipeline_operation_id) where pipeline_operation_id is not null;
+
+alter table public.lost_processing_jobs enable row level security;
+revoke all on public.lost_processing_jobs from anon, authenticated;

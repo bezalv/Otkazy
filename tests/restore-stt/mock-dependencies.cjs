@@ -61,6 +61,7 @@ childProcess.execFile = function (command, args, options, callback) {
 
 global.fetch = async function (url) {
   if (!String(url).startsWith('https://api.polza.ai/api/v1/audio/transcriptions')) throw new Error('external network forbidden');
+  if (scenario === 'provider_secret') return Response.json({ error: { message: 'secret-must-not-appear' } }, { status: 400 });
   if (scenario === 'aiesa_poll_invalid') {
     return String(url).endsWith('/test-job') ? new Response('{', { status: 200 }) : Response.json({ status: 'processing', id: 'test-job' });
   }

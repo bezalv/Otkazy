@@ -100,7 +100,7 @@ async function polzaUpload(file, model, deadline) {
   fd.append('model', model); fd.append('language', 'ru');
   const r = await fetch(POLZA + '/audio/transcriptions', { method: 'POST', headers: { Authorization: 'Bearer ' + CFG.polza }, body: fd, signal: AbortSignal.timeout(Math.min(120000, Math.max(1000, deadline - Date.now()))) });
   const j = await r.json().catch(() => null);
-  if (!r.ok) throw new HttpError(502, 'provider_error', 'Polza HTTP ' + r.status + ': ' + String((j && j.error && j.error.message) || '').slice(0, 200), r.status >= 500 || r.status === 429);
+  if (!r.ok) throw new HttpError(502, 'provider_error', 'Polza HTTP ' + r.status, r.status >= 500 || r.status === 429);
   if (!j || typeof j !== 'object' || Array.isArray(j) || (model === MODELS.gigaam && typeof j.text !== 'string')) {
     throw new HttpError(502, 'provider_error', 'Polza вернула некорректный ответ распознавания', true);
   }
@@ -108,9 +108,9 @@ async function polzaUpload(file, model, deadline) {
 }
 async function aiesaPoll(j, deadline) {
   while (j.status !== 'completed') {
-    if (j.status === 'failed' || j.status === 'error') { const msg = String((j.error && (j.error.message || j.error)) || j.status); throw new HttpError(502, 'provider_error', 'Aiesa: ' + msg.slice(0, 200), /временно|недоступ|unavailable|timeout|retry/i.test(msg)); }
+    if (j.status === 'failed' || j.status === 'error') { const msg = String((j.error && (j.error.message || j.error)) || j.status); throw new HttpError(502, 'provider_error', 'Aiesa вернула ошибку задачи', /временно|недоступ|unavailable|timeout|retry/i.test(msg)); }
     if (typeof j.status !== 'string' || !j.status || typeof j.id !== 'string' || !j.id) throw new HttpError(502, 'provider_error', 'Aiesa вернула некорректный статус задачи', true);
-    if (Date.now() > deadline) throw new HttpError(504, 'timeout', 'Aiesa не закончила задачу ' + j.id + ' до общего таймаута', true);
+    if (Date.now() > deadline) throw new HttpError(504, 'timeout', 'Aiesa не закончила задачу до общего таймаута', true);
     await sleep(3000);
     const g = await fetch(POLZA + '/audio/transcriptions/' + j.id, { headers: { Authorization: 'Bearer ' + CFG.polza }, signal: AbortSignal.timeout(Math.min(60000, Math.max(1000, deadline - Date.now()))) });
     const n = await g.json().catch(() => null);
@@ -137,7 +137,7 @@ async function withRetry(fn, deadline, info) {
       catch (e) {
         info.calls++;
         const retry = e.retryable && attempt < CFG.retries.length && Date.now() + CFG.retries[attempt] * 1000 < deadline && !info.cancelled;
-        if (info.errors.length < 10) info.errors.push(String(e.message).slice(0, 160));
+        if (info.errors.length < 10) info.errors.push(e instanceof HttpError ? e.message : 'Внутренняя ошибка распознавания');
         if (!retry) { if (!info.cancelled) { info.cancelled = true; info.failure = e; } throw e; }
         info.retries++;
         await sleep(CFG.retries[attempt] * 1000);
@@ -287,7 +287,8 @@ const server = http.createServer((req, res) => {
       try { out = await transcribe(src, size, url.searchParams, id); }
       catch (e) {
         status = e instanceof HttpError ? e.status : 500;
-        out = { ok: false, error: { code: e.code || 'internal', message: String(e.message).slice(0, 400), retryable: e instanceof HttpError ? e.retryable : true } };
+        // Посторонние ошибки могут содержать URL, данные записи или секреты.
+        out = { ok: false, error: { code: e instanceof HttpError ? e.code : 'internal', message: e instanceof HttpError ? e.message : 'Внутренняя ошибка распознавания', retryable: e instanceof HttpError ? e.retryable : true } };
       } finally { done(); }
       log({ status, ms: Date.now() - t0, bytes: size, model: out.model, channels: out.channels, duration: out.duration_sec, segments: out.segments ? out.segments.length : undefined, parts: out.speech_parts, speech_sec: out.speech_sec, calls: out.polza_calls, retries: out.retries || undefined, test: out.test || undefined, error: out.error });
       send(res, status, out);

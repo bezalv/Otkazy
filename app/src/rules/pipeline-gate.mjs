@@ -131,12 +131,15 @@ function pgVoiceUnsupported(fileName) {
   return PG_VOICE_UNSUPPORTED.indexOf(ext) !== -1;
 }
 
-// Технический сбой распознавания — только то, что помечено retryable.
+// Технический сбой распознавания отмечается retryable или technical_failure.
 // Не сбой: неподдерживаемый формат, отсутствие записи, пустой результат без ошибки,
 // моно-запись после моно-прохода (у неё есть текст и свой режим).
 function pgIsRecognitionFailure(item) {
   var it = item || {};
   if (it.unsupported === true) return false;
+  // Новый автономный обработчик отдельно отмечает неповторяемые технические ошибки,
+  // не меняя retryable, которое описывает возможность автоматического повтора.
+  if (it.technical_failure === true) return true;
   if (pgVoiceUnsupported(it.file_name)) return false;
   if (it.retryable === true) return true;
 

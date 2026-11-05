@@ -12,6 +12,7 @@ node_modules/
 
 # Временные файлы
 tmp/
+supabase/.temp/
 *.tmp
 *.log
 

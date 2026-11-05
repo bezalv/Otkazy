@@ -1,0 +1,11 @@
+.env
+.env.*
+!.env.example
+node_modules
+data
+tmp
+*.log
+.git
+.codex
+.agents
+Dockerfile*
