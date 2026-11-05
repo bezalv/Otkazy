@@ -150,6 +150,7 @@ for (const expired of [false, true]) {
     const input = {
       ...processed,
       multi_agent_analysis: { ...processed.multi_agent_analysis, verdict: expired ? 'недостаточно_данных' : 'неправомерен' },
+      communications_with_transcripts: expired ? [] : processed.communications_with_transcripts,
       audio_wait: audioWait,
       audio_wait_expired: expired,
     };

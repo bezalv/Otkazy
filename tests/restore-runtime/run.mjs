@@ -24,8 +24,9 @@ test('проверка бинарников различает отсутств�
     if (path === 'missing') throw new Error('sensitive path');
     return { stdout: `${path} version 1` };
   };
-  assert.deepEqual(await checkRuntime({ execute, env: {}, nodeVersion: '24.14.0' }),
+  assert.deepEqual(await checkRuntime({ execute, env: {}, nodeVersion: '24.14.0', binaryPath: name => name }),
     { ok: true, node: true, ffmpeg: true, ffprobe: true, ready: false });
+  assert.equal((await checkRuntime({ execute, env: {}, nodeVersion: '24.0.0', binaryPath: name => name })).node, true);
   const bad = await checkRuntime({ execute, env: { STT_FFMPEG_PATH: 'missing', STT_FFPROBE_PATH: 'other' }, nodeVersion: '23.9.0' });
   assert.deepEqual(bad, { ok: false, node: false, ffmpeg: false, ffprobe: false, ready: false });
   assert.doesNotMatch(JSON.stringify(bad), /sensitive|missing/);

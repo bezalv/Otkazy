@@ -14,6 +14,11 @@ const rules = [
     target: 'app/src/rules/data-sufficiency.mjs',
     exports: ['dsEvaluate', 'dsInsufficientJudge'],
   },
+  {
+    source: 'prototype/lib/nightly-retry.js',
+    target: 'app/src/rules/nightly-retry.mjs',
+    exports: ['NIGHTLY_FRESH_DAYS', 'NIGHTLY_MAX_DEALS', 'nightlyIsFresh', 'nightlyBatches', 'manualBatch'],
+  },
 ];
 const check = process.argv.includes('--check');
 let different = false;

@@ -1,4 +1,5 @@
 import { buildBitrixComment } from './comment.mjs';
+import { createHash } from 'node:crypto';
 
 const recipients = [65, 26175, 19601];
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -72,7 +73,10 @@ export function createDelivery(pool, client, { now = () => Date.now() } = {}) {
       }
       if (row.comment_state !== 'pending') return { state: row.comment_state };
       const body = buildBitrixComment({ deal_id: row.deal_id, prompt_version: row.prompt_version, multi_agent_analysis: row.ai_judge_json }, now());
-      await fencedUpdate(db, jobId, lease, "comment_state='sending'");
+      // Хеш и время позволяют сверить возможную отправку без записи текста в очередь.
+      // Несовпадение не доказывает отсутствие комментария: Битрикс может изменить текст.
+      const digest = createHash('sha256').update(body.fields.COMMENT, 'utf8').digest('hex');
+      await fencedUpdate(db, jobId, lease, "comment_state='sending', comment_sha256=$3, comment_attempted_at=clock_timestamp()", [digest]);
       return { state: 'send', body };
     });
   }
@@ -167,6 +171,21 @@ export function createDelivery(pool, client, { now = () => Date.now() } = {}) {
     });
   }
 
+  async function markNotificationNotStarted(jobId, lease, userId) {
+    return transaction(pool, async db => {
+      const row = await lockJob(db, jobId, lease);
+      const mark = row.ai_judge_json.notification;
+      if (row.notify_state !== 'sending' || mark?.recipient_states?.[userId] !== 'sending'
+          || !Array.isArray(mark.failed)) throw new Error('Некорректное состояние уведомления');
+      // Состояние получателя совместимо с существующим форматом; причина
+      // отдельно фиксирует, что HTTP-вызов точно не начался.
+      mark.recipient_states[userId] = 'unknown';
+      mark.failed.push({ user_id: userId, error: 'запрос не был отправлен' });
+      await db.query("UPDATE public.lost_deal_analyses SET ai_judge_json=jsonb_set(coalesce(ai_judge_json, '{}'::jsonb), '{notification}', $2::jsonb, true) WHERE id=$1", [row.analysis_id, JSON.stringify(mark)]);
+      await fencedUpdate(db, jobId, lease, "notify_state='sending'");
+    });
+  }
+
   async function markNotification(jobId, lease) {
     return transaction(pool, async db => {
       const row = await lockJob(db, jobId, lease);
@@ -204,18 +223,40 @@ export function createDelivery(pool, client, { now = () => Date.now() } = {}) {
     } finally { db.release(); }
   }
 
+  // Эта проверка запускается уже после получения слота ограничителя.
+  // Между ответом БД и HTTP нет общей транзакции с Битриксом: при обрыве
+  // после начала fetch результат по-прежнему считается неоднозначным.
+  async function beforeDelivery(jobId, lease, action, userId) {
+    const db = await pool.connect();
+    try {
+      const sql = action === 'comment'
+        ? `SELECT id FROM public.lost_processing_jobs WHERE id=$1 AND lease_token=$2
+            AND status='processing' AND lease_until>clock_timestamp() AND comment_state='sending'`
+        : `SELECT j.id FROM public.lost_processing_jobs j
+            JOIN public.lost_deal_analyses a ON a.pipeline_operation_id=j.id
+            WHERE j.id=$1 AND j.lease_token=$2 AND j.status='processing'
+              AND j.lease_until>clock_timestamp() AND j.notify_state='sending'
+              AND a.ai_judge_json->'notification'->'recipient_states'->>$3='sending'`;
+      const r = await db.query(sql, action === 'comment' ? [jobId, lease] : [jobId, lease, String(userId)]);
+      return r.rows.length === 1;
+    } finally { db.release(); }
+  }
+
   return {
     async deliver(jobId, lease) {
       ids(jobId, lease);
       const comment = await claimComment(jobId, lease);
       if (comment.state === 'send') {
-        let id;
+        let id, notStarted = false;
         try {
-          const response = await client.request('crm.timeline.comment.add', comment.body);
+          const response = await client.request('crm.timeline.comment.add', comment.body, {
+            beforeSend: () => beforeDelivery(jobId, lease, 'comment'),
+          });
           if ((typeof response.result === 'number' && Number.isSafeInteger(response.result) && response.result > 0)
               || (typeof response.result === 'string' && /^[1-9]\d*$/.test(response.result))) id = response.result;
-        } catch { /* Ответ потерян или запрос отклонён: состояние неизвестно. */ }
-        await markComment(jobId, lease, id);
+        } catch (error) { notStarted = error?.requestStarted === false; }
+        try { await markComment(jobId, lease, id); }
+        catch (error) { if (!notStarted) throw error; }
         if (id == null) return { state: 'unknown', action: 'comment' };
       } else if (!['ok', 'skipped'].includes(comment.state)) return { state: comment.state, action: 'comment' };
       const notification = await claimNotification(jobId, lease);
@@ -224,11 +265,19 @@ export function createDelivery(pool, client, { now = () => Date.now() } = {}) {
           // Утерявший аренду обработчик не начинает следующие сетевые вызовы.
           if (!await stillSendingNotification(jobId, lease)) return { state: 'unknown', action: 'notification' };
           if (!await claimRecipient(jobId, lease, userId)) continue;
-          let delivered = false;
+          let delivered = false, notStarted = false;
           try {
-            const response = await client.request('im.notify.system.add', { USER_ID: userId, MESSAGE: notification.message });
+            const response = await client.request('im.notify.system.add', { USER_ID: userId, MESSAGE: notification.message }, {
+              beforeSend: () => beforeDelivery(jobId, lease, 'notification', userId),
+            });
             delivered = response.result === true || (Number.isSafeInteger(Number(response.result)) && Number(response.result) > 0);
-          } catch { /* Результат запроса неизвестен. */ }
+          } catch (error) { notStarted = error?.requestStarted === false; }
+          if (notStarted) {
+            // При утрате аренды новый владелец сам разберёт состояние.
+            try { await markNotificationNotStarted(jobId, lease, userId); }
+            catch { return { state: 'unknown', action: 'notification' }; }
+            continue;
+          }
           // Сохраняем каждое подтверждение прежде, чем начать следующий вызов.
           await recordNotificationAttempt(jobId, lease, userId, delivered);
         }

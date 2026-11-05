@@ -196,6 +196,12 @@ export async function collectDeal({ client, dealId, silent = false, now = Date.n
       order: { CREATED_TIME: 'DESC' },
       select: ['ID', 'STAGE_ID', 'CREATED_TIME', 'CATEGORY_ID'],
     }, page => Array.isArray(page) ? page : page?.items, wait);
+    // Карточка и история могут обновляться не одновременно. Старый отказ в
+    // истории не доказывает, что новый переход уже записан.
+    if (!history.length || history[0]?.STAGE_ID !== 'C23:LOSE' || !history[0]?.CREATED_TIME
+      || !Number.isFinite(new Date(history[0].CREATED_TIME).getTime())) {
+      throw new Error('История стадий ещё не подтверждает текущий отказ');
+    }
   } catch (error) {
     return { ...result, _status: 'error', _step: 'deal_or_history', _error: safeError(error) };
   }
@@ -211,6 +217,37 @@ export async function collectDeal({ client, dealId, silent = false, now = Date.n
       chat_messages_raw: 0, tasks: 0, chats_count: 0, screenshots_found: 0,
     };
     return { ...result, _status: 'skipped_by_reason', _skip_reason_key: reason };
+  }
+
+  // Для свежего отказа даём Voximplant завершить запись: исходный пакет
+  // ждал до пяти минут от перехода, если сделка моложе десяти минут.
+  const loseMs = new Date(dealData.lose_date).getTime();
+  const age = now - loseMs;
+  if (!Number.isFinite(age) || age < -600000) {
+    return { ...result, _status: 'error', _step: 'fresh_deal_wait', _error: 'Некорректное время перехода в отказ' };
+  }
+  const delayMs = age < 600000 ? Math.max(0, 300000 - age) : 0;
+  if (delayMs > 0) {
+    try {
+      await wait(delayMs);
+      const current = await request(client, 'crm.deal.get', { id }, wait);
+      if (!current.result || typeof current.result.STAGE_ID !== 'string') throw new Error('Неизвестна текущая стадия');
+      if (current.result.STAGE_ID !== 'C23:LOSE') {
+        return { ...result, _status: 'skipped', _reason: 'not_in_lost_stage' };
+      }
+      const refreshed = await request(client, 'crm.stagehistory.list', {
+        entityTypeId: 2, filter: { OWNER_ID: id }, order: { CREATED_TIME: 'DESC' },
+        select: ['ID', 'STAGE_ID', 'CREATED_TIME', 'CATEGORY_ID'], start: 0,
+      }, wait);
+      const latest = (Array.isArray(refreshed.result) ? refreshed.result : refreshed.result?.items)?.[0];
+      const latestMs = latest?.CREATED_TIME ? new Date(latest.CREATED_TIME).getTime() : NaN;
+      if (latest?.STAGE_ID !== 'C23:LOSE' || !Number.isFinite(latestMs) || latestMs < loseMs) {
+        throw new Error('История стадий ещё не подтверждает текущий отказ');
+      }
+      if (latestMs > loseMs) return { ...result, _status: 'obsolete_transition' };
+    } catch (error) {
+      return { ...result, _status: 'error', _step: 'fresh_deal_wait', _error: safeError(error) };
+    }
   }
 
   const raw = { calls: [], comments: [], tasks: [], chats: [], openline_activities: [], sessions: [] };

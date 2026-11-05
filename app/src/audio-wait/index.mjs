@@ -4,7 +4,9 @@
 export const AW_DAY_MS = 86400000;
 export const AW_CHECK_MINUTES = [5, 15, 30, 60, 120, 180, 240, 300, 360, 420, 480, 1440];
 export function awTime(value) {
-  var t = value ? Date.parse(value) : NaN;
+  // Драйвер PostgreSQL возвращает timestamptz как Date; строковое преобразование
+  // Date теряет миллисекунды и незаметно смещает исходные сроки ожидания.
+  var t = value instanceof Date ? value.getTime() : value ? Date.parse(value) : NaN;
   return isFinite(t) ? t : null;
 }
 export function awHasAudio(call) {
@@ -88,7 +90,25 @@ export function planAudioWait({ stageId, callsComplete, calls, loseDate, enabled
     return { action: 'source_incomplete', reason: 'audio_wait_call_data_incomplete', queueChange: null };
   }
 
-  const assessment = awAssess(calls, loseDate, enabledAt, saved, nowMs);
+  // Повторное задание не должно заново открывать завершённую очередь, но
+  // запись могла появиться позже. Проверяем те же звонки и прежний срок;
+  // результат передаём без queue, чтобы не изменять терминальную строку.
+  const recheckTerminal = saved?._recheck_terminal === true
+    && ['done', 'expired', 'cancelled'].includes(saved.state)
+    && awTime(saved.lose_date) === loseMs;
+  const assessment = awAssess(calls, loseDate, enabledAt,
+    recheckTerminal ? { ...saved, state: 'waiting' } : saved, nowMs);
+  if (recheckTerminal && assessment.state !== 'disabled') {
+    // Ранее замеченная запись не гарантирует, что она доступна сейчас:
+    // для нового анализа каждый отслеженный звонок должен присутствовать
+    // в свежем ответе и содержать актуальную ссылку на файл.
+    const trackedAvailable = Object.keys(saved.observations || {}).every(id =>
+      calls.some(call => String(call.ID) === id && awHasAudio(call)));
+    if (assessment.state === 'ready' && trackedAvailable) return { action: 'analyze', queue: null };
+    // Повтор без новых записей не должен создавать ещё один pipeline_error
+    // или заменять прежний вердикт: прежний цикл уже дал конечный результат.
+    return { action: 'skip', reason: 'audio_wait_terminal_recordings_missing', queueChange: null };
+  }
   if (assessment.state === 'terminal') {
     return { action: 'skip', reason: 'audio_wait_terminal', queueChange: null };
   }

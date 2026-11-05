@@ -22,7 +22,7 @@ const COMM_UPDATES = [
   'transcript_formatted', 'transcript_manager_text', 'transcript_client_text',
   'transcript_replicas', 'transcript_status',
 ];
-const COMM_PRESERVE = ['transcript_engine', 'screenshot_files', 'screenshot_turns', 'screenshot_text', 'screenshot_extract_status'];
+const COMM_PRESERVE = ['screenshot_files', 'screenshot_turns', 'screenshot_text', 'screenshot_extract_status'];
 
 function insertStatement(table, row, { timestamps = [], conflict = '', returning = '' } = {}) {
   // Имена таблиц, колонок и SQL-фрагменты формируются только из кода приложения.
@@ -51,6 +51,14 @@ function dealConflict(processed) {
 const commConflict = ' ON CONFLICT (deal_id, event_type, event_id) DO UPDATE SET '
   + COMM_UPDATES.map((name) => `${name}=EXCLUDED.${name}`).concat(
     COMM_PRESERVE.map((name) => `${name}=COALESCE(EXCLUDED.${name}, lost_deal_communications.${name})`),
+    `transcript_engine=CASE
+      WHEN (coalesce(EXCLUDED.transcript_formatted,'')='' AND coalesce(EXCLUDED.transcript_manager_text,'')=''
+        AND coalesce(EXCLUDED.transcript_client_text,'')='')
+        OR EXCLUDED.transcript_formatted IS DISTINCT FROM lost_deal_communications.transcript_formatted
+        OR EXCLUDED.transcript_manager_text IS DISTINCT FROM lost_deal_communications.transcript_manager_text
+        OR EXCLUDED.transcript_client_text IS DISTINCT FROM lost_deal_communications.transcript_client_text
+      THEN EXCLUDED.transcript_engine
+      ELSE COALESCE(EXCLUDED.transcript_engine, lost_deal_communications.transcript_engine) END`,
   ).join(', ');
 
 function dealId(value) {
@@ -222,6 +230,61 @@ async function rescheduleFailedAudioCheck(connection, job, id) {
   });
 }
 
+// Снимок существует только если содержательная старая запись будет изменена.
+// FOR UPDATE удерживает текущую строку до той же транзакции записи результата.
+async function archiveCommunication(connection, operation, id, row) {
+  await connection.query({
+    text: `WITH previous AS (
+        SELECT event_type,event_id,full_content,transcript_formatted,transcript_manager_text,
+          transcript_client_text,transcript_replicas,transcript_status,transcript_engine,event_date
+        FROM public.lost_deal_communications
+        WHERE deal_id=$2 AND event_type=$3 AND event_id=$4 FOR UPDATE
+      )
+      INSERT INTO public.lost_overwrite_history (operation_id,deal_id,record_type,event_type,event_id,previous_values)
+      SELECT $1,$2,'communication',event_type,event_id,
+        jsonb_build_object('event_date',event_date,'full_content',full_content,
+          'transcript_formatted',transcript_formatted,'transcript_manager_text',transcript_manager_text,
+          'transcript_client_text',transcript_client_text,'transcript_replicas',transcript_replicas,
+          'transcript_status',transcript_status,'transcript_engine',transcript_engine)
+      FROM previous
+      WHERE (coalesce(btrim(transcript_formatted),'') <> '' OR coalesce(btrim(transcript_manager_text),'') <> ''
+          OR coalesce(btrim(transcript_client_text),'') <> '')
+        AND (full_content IS DISTINCT FROM $5 OR transcript_formatted IS DISTINCT FROM $6
+          OR transcript_manager_text IS DISTINCT FROM $7 OR transcript_client_text IS DISTINCT FROM $8
+          OR transcript_replicas IS DISTINCT FROM $9 OR transcript_status IS DISTINCT FROM $10
+          OR ($11::text IS NOT NULL AND transcript_engine IS DISTINCT FROM $11))
+      ON CONFLICT (operation_id,record_type,event_type,event_id) DO NOTHING`,
+    values: [operation, id, row.event_type, row.event_id, row.full_content, row.transcript_formatted,
+      row.transcript_manager_text, row.transcript_client_text, row.transcript_replicas, row.transcript_status, row.transcript_engine],
+  });
+}
+
+async function archiveExpiredCard(connection, operation, id) {
+  await connection.query({
+    text: `WITH previous AS (
+        SELECT lose_date,last_analyzed_at,analysis_count,comm_total_events,comm_calls,comm_calls_with_audio,
+          comm_comments,comm_chat_messages,comm_tasks,comm_chats_count,trans_calls_transcribed,trans_calls_failed,
+          full_prompt_text,journal_text,comm_analytics,last_ai_probability,last_ai_misplaced,last_ai_recovery_probability,
+          last_ai_reason_class,last_ai_maturity,last_ai_route,last_ai_closure_correctness,last_ai_closure_reason_class,
+          last_ai_recoverable_now,last_ai_recovery_route
+        FROM public.lost_deals WHERE deal_id=$2 FOR UPDATE
+      )
+      INSERT INTO public.lost_overwrite_history (operation_id,deal_id,record_type,previous_values)
+      SELECT $1,$2,'card',jsonb_build_object('lose_date',lose_date,'last_analyzed_at',last_analyzed_at,
+        'analysis_count',analysis_count,'comm_total_events',comm_total_events,'comm_calls',comm_calls,
+        'comm_calls_with_audio',comm_calls_with_audio,'comm_comments',comm_comments,'comm_chat_messages',comm_chat_messages,
+        'comm_tasks',comm_tasks,'comm_chats_count',comm_chats_count,'trans_calls_transcribed',trans_calls_transcribed,
+        'trans_calls_failed',trans_calls_failed,'full_prompt_text',full_prompt_text,'journal_text',journal_text,
+        'comm_analytics',comm_analytics,'last_ai_probability',last_ai_probability,
+        'last_ai_misplaced',last_ai_misplaced,'last_ai_recovery_probability',last_ai_recovery_probability,
+        'last_ai_reason_class',last_ai_reason_class,'last_ai_maturity',last_ai_maturity,'last_ai_route',last_ai_route,
+        'last_ai_closure_correctness',last_ai_closure_correctness,'last_ai_closure_reason_class',last_ai_closure_reason_class,
+        'last_ai_recoverable_now',last_ai_recoverable_now,'last_ai_recovery_route',last_ai_recovery_route) FROM previous
+      ON CONFLICT (operation_id,record_type,event_type,event_id) DO NOTHING`,
+    values: [operation, id],
+  });
+}
+
 /**
  * Параметризованная запись результата одной сделки в существующие таблицы.
  * Никаких уведомлений и комментариев в Битрикс функция не отправляет.
@@ -249,6 +312,7 @@ export async function persistResult(pool, result) {
   }
   const comms = result.communications_with_transcripts ?? result.communications ?? deal?.communications ?? [];
   if (!Array.isArray(comms)) throw new TypeError('Некорректный список коммуникаций');
+  if (result.audio_wait_expired === true && comms.length) throw new TypeError('Для истёкшего ожидания коммуникации не собирались');
 
   try {
     return await inTransaction(pool, async (connection) => {
@@ -307,13 +371,16 @@ export async function persistResult(pool, result) {
     }
     const rows = processedRows(result, deal, comms);
     rows.analysis.pipeline_operation_id = operation;
+    if (result.audio_wait_expired === true) await archiveExpiredCard(connection, operation, id);
     await connection.query(insertStatement('lost_deals', rows.deal, {
       timestamps: ['last_analyzed_at', 'updated_at'], conflict: dealConflict(true),
     }));
     const inserted = await connection.query(insertStatement('lost_deal_analyses', rows.analysis, { returning: ' RETURNING id' }));
     if (inserted.rowCount !== 1 || !inserted.rows?.[0]?.id) throw new Error('Не удалось сохранить анализ');
     for (let index = 0; index < comms.length; index++) {
-      await connection.query(insertStatement('lost_deal_communications', communicationRow(id, comms[index], index), { conflict: commConflict }));
+      const communication = communicationRow(id, comms[index], index);
+      await archiveCommunication(connection, operation, id, communication);
+      await connection.query(insertStatement('lost_deal_communications', communication, { conflict: commConflict }));
     }
     await finishWaiting(connection, result, id);
     return { status, dealId: id, analysisId: inserted.rows[0].id };

@@ -113,13 +113,14 @@ function abortAfter(ms) {
   return { signal: controller.signal, close: () => clearTimeout(timer) };
 }
 
-async function withTimeout(promise, timeoutMs) {
+async function withTimeout(action, timeoutMs) {
+  const controller = new AbortController();
   let timer;
   try {
     return await Promise.race([
-      promise,
+      action(controller.signal),
       new Promise((_, reject) => {
-        timer = setTimeout(() => reject(new AudioError('Превышено время запроса к Битриксу')), timeoutMs);
+        timer = setTimeout(() => { controller.abort(); reject(new AudioError('Превышено время запроса к Битриксу')); }, timeoutMs);
         timer.unref?.();
       }),
     ]);
@@ -204,7 +205,7 @@ export function createSttClient({
       }
       if (!bitrix || typeof bitrix.request !== 'function') return failure(meta, 'Не настроен клиент Битрикса', { downloadFailed: true });
       try {
-        const response = await withTimeout(bitrix.request('disk.file.get', { id: Number(meta.file_id) }), downloadTimeoutMs);
+        const response = await withTimeout(signal => bitrix.request('disk.file.get', { id: Number(meta.file_id) }, { signal }), downloadTimeoutMs);
         downloadUrl = response?.result?.DOWNLOAD_URL;
       } catch { return failure(meta, 'Не удалось получить файл из Битрикса', { downloadFailed: true }); }
     } else {

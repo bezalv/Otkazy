@@ -48,9 +48,14 @@ test('неизвестная дата включения ожидания не �
 
 test('старое событие не запускает разбор нового перехода в отказ', async () => {
   const result = await processDeal(fixture({ expectedLoseDate: '2026-11-03T00:00:00Z' }));
-  assert.equal(result.status, 'error');
-  assert.match(result.collection._error, /Дата отказа/);
+  assert.equal(result.status, 'obsolete_transition');
   assert.equal(result.analysis, undefined);
+});
+
+test('история старше ожидаемого перехода остаётся техническим сбоем', async () => {
+  const result = await processDeal(fixture({ expectedLoseDate: '2026-11-05T00:00:00Z' }));
+  assert.equal(result.status, 'error');
+  assert.match(result.collection._error, /История стадий/);
 });
 
 test('ожидание поздней записи останавливает разбор до внешних вызовов', async () => {
@@ -68,6 +73,25 @@ test('ожидание поздней записи останавливает р
   assert.equal(result.status, 'waiting');
   assert.deepEqual(result.audioWait.queue.pending_calls, ['99']);
   assert.equal(result.analysis, undefined);
+});
+
+test('звонок, завершившийся во время сбора, оценивается по актуальному времени', async () => {
+  const initial = Date.parse('2026-11-05T00:00:00Z');
+  let clockCalls = 0;
+  const args = fixture({ nowMs: null, clock: () => clockCalls++ === 0 ? initial : initial + 180000 });
+  const original = args.bitrix.request;
+  args.bitrix.request = async (method, body) => {
+    if (method === 'crm.activity.list' && body.filter.TYPE_ID) return { result: [{
+      ID: '99', PROVIDER_ID: 'VOXIMPLANT_CALL', COMPLETED: 'Y',
+      CREATED: '2026-11-05T00:01:00Z', START_TIME: '2026-11-05T00:01:00Z',
+      END_TIME: '2026-11-05T00:02:00Z', FILES: [],
+    }] };
+    return original(method, body);
+  };
+  const result = await processDeal(args);
+  assert.equal(result.status, 'waiting');
+  assert.deepEqual(result.audioWait.queue.pending_calls, ['99']);
+  assert.equal(result.audioWait.queue.first_seen_at, '2026-11-05T00:03:00.000Z');
 });
 
 test('ошибка скриншота блокирует судью', async () => {

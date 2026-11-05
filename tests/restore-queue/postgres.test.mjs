@@ -34,6 +34,11 @@ test('миграция и очередь на локальном движке Po
   assert.notEqual(recovered.lease_token, claimed.lease_token);
   assert.equal(await queue.renew(claimed.id, claimed.lease_token), false);
 
+  await db.query("update public.lost_processing_jobs set status='needs_review', lease_token=null, lease_until=null where id=$1", [recovered.id]);
+  assert.equal(await queue.claim(), null, 'нельзя повторно разбирать сделку до сверки доставки');
+  await queue.enqueue({ ...request, dealId: 43, requestKey: 'test:other' });
+  assert.equal(Number((await queue.claim()).deal_id), 43, 'другая сделка не блокируется');
+
   await db.query("insert into public.lost_deal_analyses (id, pipeline_operation_id) values (1, $1)", [claimed.id]);
   await assert.rejects(db.query("insert into public.lost_deal_analyses (id, pipeline_operation_id) values (2, $1)", [claimed.id]), { code: '23505' });
 });

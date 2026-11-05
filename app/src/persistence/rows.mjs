@@ -44,7 +44,9 @@ export function baseDealRow(deal) {
 
 export function processedRows(result, deal, comms) {
   const classification = result.classification || {};
-  const analysis = result.multi_agent_analysis;
+  const analysis = result.audio_wait_expired === true
+    ? { ...result.multi_agent_analysis, data_scope: 'not_collected', data_scope_reason: 'audio_wait_expired' }
+    : result.multi_agent_analysis;
   const meta = result.llm_meta || {};
   const stats = result.comm_stats || {};
   const screenshots = result.screenshot_stats || {};
@@ -101,12 +103,28 @@ export function processedRows(result, deal, comms) {
     writer_completion_tokens: numeric(writerUsage.completion_tokens), screenshots_total: numeric(screenshots.screenshots_total),
     screenshots_extracted: numeric(screenshots.screenshots_extracted), screenshots_failed: numeric(screenshots.screenshots_failed),
   };
+  if (result.audio_wait_expired === true) {
+    // Ожидание истекло до сбора: нули означали бы подтверждённое отсутствие данных.
+    for (const name of ['comm_total_events', 'comm_calls', 'comm_calls_with_audio', 'comm_comments',
+      'comm_chat_messages', 'comm_tasks', 'comm_chats_count', 'trans_calls_transcribed', 'trans_calls_failed',
+      'full_prompt_text', 'journal_text', 'comm_analytics', 'last_ai_probability', 'last_ai_misplaced',
+      'last_ai_recovery_probability']) row[name] = null;
+    for (const name of ['comm_total_at_run', 'calls_transcribed_at_run', 'full_prompt_text', 'journal_text',
+      'prompt_chars', 'prompt_approx_tokens', 'ai_facts_json', 'ai_facts_count', 'screenshots_total',
+      'screenshots_extracted', 'screenshots_failed', 'ai_probability', 'ai_misplaced', 'ai_recovery_probability',
+      'ai_key_signals', 'ai_risk_factors', 'ai_manager_mistakes', 'ai_manager_script']) history[name] = null;
+  }
   return { deal: row, analysis: history };
 }
 
 export function communicationRow(dealId, comm, index) {
   const eventType = comm.type || 'unknown';
-  const eventId = comm.activity_id || comm.comment_id || comm.message_id || comm.task_id || `idx_${index}`;
+  const eventId = comm.activity_id || comm.comment_id || comm.message_id || comm.task_id;
+  if ((typeof eventId !== 'string' && typeof eventId !== 'number')
+    || (typeof eventId === 'number' && (!Number.isSafeInteger(eventId) || eventId <= 0))
+    || !/^[a-zA-Z0-9_:-]{1,50}$/.test(String(eventId))) {
+    throw new TypeError('У коммуникации нет устойчивого идентификатора');
+  }
   const start = Date.parse(comm.duration_start);
   const end = Date.parse(comm.duration_end);
   let duration = Number.isFinite(start) && Number.isFinite(end) ? Math.max(0, Math.round((end - start) / 1000)) : 0;

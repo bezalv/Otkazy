@@ -55,6 +55,12 @@ export async function runJob({ job, queue, store, loadAudioWait, delivery, proce
       if (typeof delivery !== 'function') return { status: 'awaiting_delivery', analysisId: saved.analysisId };
       return await delivery({ job, saved, checkLease });
     }
+    if (job.trigger_type === 'nightly') {
+      await checkLease();
+      if (typeof queue.finishObsoleteNightly !== 'function') throw new Error('Не подключена проверка ночного повтора');
+      if (await queue.finishObsoleteNightly(job.id, job.lease_token)) return { status: 'obsolete' };
+      await checkLease();
+    }
     const audioWait = await loadAudioWait(job);
     if (job.trigger_type === 'audio_wait'
       && (!audioWait || audioWait.state !== 'waiting' || audioWait._scheduled_request_key !== job.request_key)) {
@@ -67,16 +73,31 @@ export async function runJob({ job, queue, store, loadAudioWait, delivery, proce
     }
     let outcome;
     try {
+      // Ручной и ночной повторы должны видеть поздно появившиеся записи,
+      // даже если предыдущий цикл ожидания уже завершён. Старую очередь при
+      // этом не открываем повторно и её прежний срок не продлеваем.
+      const recheckTerminalAudio = ['manual', 'nightly'].includes(job.trigger_type)
+        && audioWait && ['done', 'expired', 'cancelled'].includes(audioWait.state);
       outcome = await process({ ...processOptions, dealId: Number(job.deal_id), expectedLoseDate: job.lose_date,
-        silent: job.silent === true, screenshots: job.screenshots === true, savedAudioWait: audioWait });
+        silent: job.silent === true, screenshots: job.screenshots === true,
+        savedAudioWait: recheckTerminalAudio ? { ...audioWait, _recheck_terminal: true } : audioWait });
     } catch {
       // Исключения нормализации не должны исчезать вместе с процессом.
       outcome = { status: 'error', collection: { _error: 'Сбой обработки данных сделки' } };
     }
     await checkLease();
+    if (outcome?.status === 'obsolete_transition') {
+      if (typeof queue.finishObsoleteTransition !== 'function'
+        || !await queue.finishObsoleteTransition(job.id, job.lease_token)) {
+        throw new Error('Не удалось завершить устаревший переход');
+      }
+      return { status: 'obsolete' };
+    }
     const result = toPersistenceResult(job, outcome);
     const stored = await store.persistResult(result);
-    if (!stored.needsExternalActions) return { status: stored.status, analysisId: stored.analysisId || null };
+    if (!stored.needsExternalActions) return { status: stored.status, analysisId: stored.analysisId || null,
+      ...(outcome?.audioWait?.reason === 'audio_wait_terminal_recordings_missing'
+        ? { reason: outcome.audioWait.reason } : {}) };
     await checkLease();
     if (typeof delivery !== 'function') return { status: 'awaiting_delivery', analysisId: stored.analysisId };
     const resume = await store.loadResumableResult({ operation_id: job.id, lease_token: job.lease_token });

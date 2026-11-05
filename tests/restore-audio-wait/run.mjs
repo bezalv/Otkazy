@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { awAssess, awCandidate, awHasAudio, planAudioWait, queueStateAfterAnalysis } from '../../app/src/audio-wait/index.mjs';
+import { awAssess, awCandidate, awHasAudio, awTime, planAudioWait, queueStateAfterAnalysis } from '../../app/src/audio-wait/index.mjs';
 
 const now = Date.parse('2026-11-01T10:00:00Z');
 const iso = ms => new Date(ms).toISOString();
@@ -16,6 +16,10 @@ const assess = (calls = [call], saved = null, at = now, lost = loseDate) =>
 const first = assess();
 const saved = { ...first.queue, state: 'waiting' };
 const input = { stageId: 'C23:LOSE', callsComplete: true, calls: [call], loseDate, enabledAt, saved, nowMs: now };
+
+test('даты драйвера PostgreSQL сохраняют миллисекунды', () => {
+  assert.equal(awTime(new Date('2026-11-01T10:00:00.123Z')), now + 123);
+});
 
 test('включается только для отказов после даты активации', () => {
   assert.equal(assess([call], null, now, iso(now - 7200000)).state, 'disabled');
@@ -86,6 +90,35 @@ test('завершённые ожидания не перерассчитыва�
   const next = assess([call], oldQueue, now + 1000);
   assert.equal(next.state, 'waiting');
   assert.equal(next.queue.first_seen_at, iso(now + 1000));
+});
+
+test('ручной повтор использует позднюю запись без открытия завершённой очереди', () => {
+  const file = { ...call, FILES: [{ url: 'https://example.test/audio' }] };
+  for (const state of ['done', 'expired', 'cancelled']) {
+    const terminal = { ...structuredClone(saved), state, _recheck_terminal: true };
+    const snapshot = structuredClone(terminal);
+    assert.deepEqual(planAudioWait({ ...input, saved: terminal, calls: [file], nowMs: now + 2 * 86400000 }),
+      { action: 'analyze', queue: null });
+    assert.deepEqual(terminal, snapshot);
+    assert.deepEqual(planAudioWait({ ...input, saved: terminal, nowMs: now + 2 * 86400000 }),
+      { action: 'skip', reason: 'audio_wait_terminal_recordings_missing', queueChange: null });
+    assert.deepEqual(planAudioWait({ ...input, saved: terminal, calls: [], nowMs: now + 2 * 86400000 }),
+      { action: 'skip', reason: 'audio_wait_terminal_recordings_missing', queueChange: null });
+    assert.equal(planAudioWait({ ...input, saved: { ...terminal, _recheck_terminal: false }, calls: [file] }).reason,
+      'audio_wait_terminal');
+  }
+});
+
+test('в повторе нужна актуальная ссылка даже для прежде доступной записи', () => {
+  const file = { ...call, FILES: [{ url: 'https://example.test/audio' }] };
+  const terminal = { ...structuredClone(saved), state: 'done', _recheck_terminal: true };
+  terminal.observations['123'].first_audio_seen_at = iso(now + 1000);
+  for (const calls of [[], [call]]) {
+    assert.deepEqual(planAudioWait({ ...input, saved: terminal, calls, nowMs: now + 2 * 86400000 }),
+      { action: 'skip', reason: 'audio_wait_terminal_recordings_missing', queueChange: null });
+  }
+  assert.deepEqual(planAudioWait({ ...input, saved: terminal, calls: [file], nowMs: now + 2 * 86400000 }),
+    { action: 'analyze', queue: null });
 });
 
 test('ожидание и истечение сохраняют silent и screenshots', () => {

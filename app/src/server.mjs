@@ -3,6 +3,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
 import { resolve } from 'node:path';
+import { resolveBinary } from './stt/binaries.mjs';
 
 const execFileAsync = promisify(execFile);
 
@@ -34,9 +35,9 @@ export function createAppServer() {
 }
 
 // Не возвращаем путь бинарника или сырой текст ошибки в журналы и ответы.
-export async function checkRuntime({ execute = execFileAsync, env = process.env, nodeVersion = process.versions.node } = {}) {
-  const [major, minor] = String(nodeVersion).split('.').map(Number);
-  const node = major === 24 && minor >= 14;
+export async function checkRuntime({ execute = execFileAsync, env = process.env, nodeVersion = process.versions.node, binaryPath = resolveBinary } = {}) {
+  const [major] = String(nodeVersion).split('.').map(Number);
+  const node = major === 24;
   async function binary(name, path) {
     try {
       const { stdout } = await execute(path, ['-version'], { timeout: 5000, maxBuffer: 65536, windowsHide: true });
@@ -44,8 +45,8 @@ export async function checkRuntime({ execute = execFileAsync, env = process.env,
     } catch { return false; }
   }
   const [ffmpeg, ffprobe] = await Promise.all([
-    binary('ffmpeg', env.STT_FFMPEG_PATH || 'ffmpeg'),
-    binary('ffprobe', env.STT_FFPROBE_PATH || 'ffprobe'),
+    binary('ffmpeg', binaryPath('ffmpeg', env)),
+    binary('ffprobe', binaryPath('ffprobe', env)),
   ]);
   return { ok: node && ffmpeg && ffprobe, node, ffmpeg, ffprobe, ready: false };
 }

@@ -21,6 +21,22 @@ const sessionHistory = {
   },
 };
 
+test('коммуникация без ID не может затереть другое событие', async () => {
+  for (const raw of [{ calls: [{}] }, { comments: [{}] }, { tasks: [{}] },
+    { calls: [{ ID: {} }] }, { comments: [{ ID: true }] }, { tasks: [{ id: [] }] }]) {
+    await assert.rejects(normalizeCommunications({ collection: collected(raw) }), /устойчивого идентификатора/);
+  }
+  await assert.rejects(normalizeCommunications({ collection: collected({ sessions: [{ session_id: 1, history: {
+    message: [{ text: 'Сообщение без ID' }], chat: {}, files: {}, users: {},
+  } }] }) }), /устойчивого идентификатора/);
+});
+
+test('повтор ID на страницах не превращается в два факта и одну запись', async () => {
+  for (const calls of [[{ ID: 123 }, { ID: 123 }], [{ ID: 123 }, { ID: 123, SUBJECT: 'другая версия' }]]) {
+    await assert.rejects(normalizeCommunications({ collection: collected({ calls }) }), /повтор идентификатора/);
+  }
+});
+
 function collected(overrides = {}) {
   return {
     deal_id: 42, silent: true, _status: 'pending_normalization',

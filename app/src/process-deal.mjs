@@ -14,21 +14,30 @@ import { runAgents } from './agents/index.mjs';
 export async function processDeal({
   dealId, bitrix, llm, resolveFile, downloadFile, transcribe,
   judgeSystemPrompt, writerSystemPrompt, audioWaitEnabledAt, savedAudioWait = null,
-  silent = false, screenshots = true, nowMs = Date.now(), expectedLoseDate = null, wait,
+  silent = false, screenshots = true, nowMs = null, clock = Date.now, expectedLoseDate = null, wait,
 }) {
   if (typeof judgeSystemPrompt !== 'string' || !judgeSystemPrompt.trim()) {
     throw new Error('Не задан промпт судьи');
   }
-  const collected = await collectDeal({ client: bitrix, dealId, silent, now: nowMs, wait });
+  if (typeof clock !== 'function') throw new TypeError('Не заданы часы обработки');
+  const startedAt = nowMs ?? clock();
+  if (!Number.isFinite(startedAt)) throw new TypeError('Некорректное время обработки');
+  const collected = await collectDeal({ client: bitrix, dealId, silent, now: startedAt, wait });
   if (collected.deal_data && expectedLoseDate != null) {
     const expected = new Date(expectedLoseDate).getTime();
     const actual = new Date(collected.deal_data.lose_date).getTime();
-    if (!Number.isFinite(expected) || !collected.deal_data.lose_date || !Number.isFinite(actual) || actual !== expected) {
-      return { status: 'error', collection: { ...collected, _error: 'Дата отказа изменилась или неизвестна' } };
+    if (!Number.isFinite(expected) || !collected.deal_data.lose_date || !Number.isFinite(actual)) {
+      return { status: 'error', collection: { ...collected, _error: 'Неизвестна дата отказа' } };
     }
+    if (actual > expected) return { status: 'obsolete_transition', collection: collected };
+    if (actual < expected) return { status: 'error', collection: { ...collected, _error: 'История стадий ещё не подтверждает дату отказа' } };
   }
   if (collected._status !== 'pending_normalization') return { status: collected._status, collection: collected };
 
+  // Сбор и ожидание готовности записи могут занять минуты. Сравнивать время
+  // завершения звонка с моментом начала сбора означало бы терять новые звонки.
+  const evaluatedAt = nowMs ?? clock();
+  if (!Number.isFinite(evaluatedAt)) throw new TypeError('Некорректное время обработки');
   const audioWait = planAudioWait({
     stageId: collected.deal_data.stage_id,
     callsComplete: collected._sources.calls.complete,
@@ -36,7 +45,7 @@ export async function processDeal({
     loseDate: collected.deal_data.lose_date,
     enabledAt: audioWaitEnabledAt,
     saved: savedAudioWait,
-    nowMs, silent, screenshots,
+    nowMs: evaluatedAt, silent, screenshots,
   });
   if (audioWait.action !== 'analyze') return { status: audioWait.action, collection: collected, audioWait };
 
@@ -49,7 +58,7 @@ export async function processDeal({
   if (initialGate.block) return { status: 'blocked', collection: collected, audioWait, calls, pipelineGate: initialGate };
 
   const journalInput = { ...normalized.deal_data, communications: calls.communications, transcription_stats: calls.transcription_stats };
-  const analytics = buildCommunicationAnalytics(buildJournal(journalInput), nowMs);
+  const analytics = buildCommunicationAnalytics(buildJournal(journalInput), evaluatedAt);
   const screenshotResult = await processScreenshots({ base: analytics, resolveFile, downloadFile, client: llm });
   recognition.screenshots = screenshotResult.failures;
   const pipelineGate = pgDecide({ sources: collected._sources, recognition });
@@ -63,7 +72,7 @@ export async function processDeal({
   const analysis = await runAgents({
     prepared, pipelineGate, analytics: screenshotResult.output,
     screenshotStats: screenshotResult.output.screenshot_stats,
-    writerSystemPrompt, client: llm, now: nowMs,
+    writerSystemPrompt, client: llm, now: evaluatedAt,
   });
   return {
     status: analysis.pipeline_error ? 'error' : 'processed',

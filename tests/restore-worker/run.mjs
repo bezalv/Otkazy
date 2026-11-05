@@ -52,3 +52,39 @@ test('ожидание и истечение записи передаются �
 test('неизвестное состояние не становится успешным разбором', () => {
   assert.equal(toPersistenceResult(job, { status: 'unexpected' })._status, 'error');
 });
+
+test('только ручной и ночной повтор переоценивают завершённую очередь, не меняя её', async () => {
+  for (const trigger of ['manual', 'nightly', 'live', 'audio_wait']) {
+    const terminal = { state: 'expired', lose_date: job.lose_date };
+    let processed = false;
+    const localJob = { ...job, trigger_type: trigger };
+    const { calls, args } = deps({ job: localJob, loadAudioWait: async () => terminal,
+      queue: { async renew() { return true; }, async finishObsoleteNightly() { return false; },
+        async finishObsoleteAudioCheck() { return true; } },
+      process: async options => {
+        processed = true;
+        assert.equal(options.savedAudioWait._recheck_terminal === true, trigger === 'manual' || trigger === 'nightly');
+        return { status: 'skip', audioWait: { reason: 'audio_wait_terminal_recordings_missing' } };
+      } });
+    const result = await runJob(args);
+    assert.equal(terminal._recheck_terminal, undefined);
+    if (trigger === 'audio_wait') {
+      assert.equal(result.status, 'obsolete');
+      assert.equal(processed, false);
+      assert.equal(calls.length, 0);
+    } else {
+      assert.equal(processed, true);
+      assert.equal(result.status, 'skipped');
+      assert.equal(calls[0]._status, 'skipped');
+    }
+  }
+});
+
+test('устаревший переход завершается без технического сбоя нового отказа', async () => {
+  let finished = false;
+  const { calls, args } = deps({ queue: { async renew() { return true; }, async finishObsoleteTransition() { finished = true; return true; } },
+    process: async () => ({ status: 'obsolete_transition' }) });
+  assert.equal((await runJob(args)).status, 'obsolete');
+  assert.equal(finished, true);
+  assert.equal(calls.length, 0);
+});

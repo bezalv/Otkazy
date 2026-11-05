@@ -4,9 +4,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /opt/app
 COPY package.json package-lock.json ./
-RUN npm ci --omit=dev --ignore-scripts
+RUN npm ci --omit=dev
 COPY src ./src
+COPY certs ./certs
+COPY prompts ./prompts
 ENV NODE_ENV=production TZ=UTC HOST=0.0.0.0 PORT=3000
 USER node
 EXPOSE 3000
-CMD ["node", "src/server.mjs"]
+CMD ["node", "src/main.mjs"]

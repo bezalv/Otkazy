@@ -57,6 +57,45 @@ test('техническая причина пропускается после 
   }
 });
 
+test('необновлённая история не подставляет старый отказ текущей сделке', async () => {
+  const { client, calls } = fixture({ respond(method) {
+    if (method === 'crm.stagehistory.list') return { result: { items: [
+      { STAGE_ID: 'C23:NEW', CREATED_TIME: '2026-11-04T00:01:00Z' },
+      { STAGE_ID: 'C23:LOSE', CREATED_TIME: '2026-10-01T00:00:00Z' },
+    ] } };
+  } });
+  const result = await collectDeal({ client, dealId: 42, now: NOW, wait });
+  assert.equal(result._status, 'error');
+  assert.equal(calls.some(call => call.method === 'crm.activity.list'), false);
+});
+
+test('свежий отказ ждёт готовности записи и перепроверяет стадию', async () => {
+  const waits = [];
+  const { client, calls } = fixture({ respond(method) {
+    if (method === 'crm.stagehistory.list') return { result: { items: [
+      { STAGE_ID: 'C23:LOSE', CREATED_TIME: '2026-11-04T23:59:00Z' },
+    ] } };
+  } });
+  const result = await collectDeal({ client, dealId: 42, now: NOW, wait: async ms => { waits.push(ms); } });
+  assert.equal(result._status, 'pending_normalization');
+  assert.deepEqual(waits, [240000]);
+  assert.equal(calls.filter(call => call.method === 'crm.deal.get').length, 2);
+  assert.equal(calls.filter(call => call.method === 'crm.stagehistory.list').length, 2);
+});
+
+test('при смене стадии во время ожидания общение не собирается', async () => {
+  let dealReads = 0;
+  const { client, calls } = fixture({ respond(method) {
+    if (method === 'crm.deal.get' && ++dealReads === 2) return { result: { STAGE_ID: 'C23:NEW' } };
+    if (method === 'crm.stagehistory.list') return { result: { items: [
+      { STAGE_ID: 'C23:LOSE', CREATED_TIME: '2026-11-04T23:59:00Z' },
+    ] } };
+  } });
+  const result = await collectDeal({ client, dealId: 42, now: NOW, wait: async () => {} });
+  assert.equal(result._status, 'skipped');
+  assert.equal(calls.some(call => call.method === 'crm.activity.list'), false);
+});
+
 test('собираются все страницы и уникальные сессии, файлы остаются в сыром ответе', async () => {
   const attachment = { id: 7, type: 'audio', extension: 'ogg' };
   const { client, calls } = fixture({

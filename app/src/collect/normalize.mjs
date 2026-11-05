@@ -104,6 +104,11 @@ function knownNonAudio(file) {
     || type.startsWith('video/') || Boolean(ext);
 }
 
+function validBitrixId(value) {
+  return typeof value === 'number' ? Number.isSafeInteger(value) && value > 0
+    : typeof value === 'string' && /^[1-9]\d*$/.test(value);
+}
+
 function callEvent(call) {
   const audioUrl = call.SETTINGS?.RECORD_URL || null;
   const files = fileList(call.FILES).map(file => ({
@@ -172,6 +177,19 @@ export async function normalizeCommunications({ collection, resolveFile, transcr
   for (const key of ['calls', 'comments', 'tasks', 'chats', 'sessions']) {
     if (!Array.isArray(raw[key])) throw new TypeError(`Некорректный источник ${key}`);
   }
+  for (const [items, getId] of [
+    [raw.calls, item => item?.ID], [raw.comments, item => item?.ID],
+    [raw.tasks, item => item?.id ?? item?.ID],
+  ]) {
+    const ids = new Set();
+    for (const item of items) {
+      const id = getId(item);
+      if (!validBitrixId(id)) throw new Error('Источник содержит коммуникацию без устойчивого идентификатора');
+      const normalizedId = String(id);
+      if (ids.has(normalizedId)) throw new Error('Источник содержит повтор идентификатора коммуникации');
+      ids.add(normalizedId);
+    }
+  }
   const chatMeta = new Map(raw.chats.map(chat => {
     const connector = chat.CONNECTOR_ID || 'unknown';
     const title = chat.CONNECTOR_TITLE || connector;
@@ -201,7 +219,12 @@ export async function normalizeCommunications({ collection, resolveFile, transcr
     const byId = new Map(files.filter(file => file && file.id != null).map(file => [String(file.id), file]));
     for (const [key, message] of Object.entries(history.message || {})) {
       if (!message || typeof message !== 'object') throw new Error('Некорректное сообщение открытой линии');
-      const messageId = String(message.id ?? message.ID ?? key);
+      if (message.id == null && message.ID == null && (Array.isArray(history.message) || !/^\d+$/.test(key))) {
+        throw new Error('У сообщения открытой линии нет устойчивого идентификатора');
+      }
+      const rawMessageId = message.id ?? message.ID ?? key;
+      if (!validBitrixId(rawMessageId)) throw new Error('У сообщения открытой линии нет устойчивого идентификатора');
+      const messageId = String(rawMessageId);
       const identity = `${chatId ?? `session_${sessionId}`}:${messageId}`;
       const text = message.text || message.TEXT || '';
       const params = message.params || {};

@@ -38,6 +38,7 @@ test('реальный SQL в изолированной БД PGlite', { skip: !
   try {
     await db.exec(schema);
     await db.exec(migration);
+    await db.exec(readFileSync('supabase/migrations/20261105065551_lost_overwrite_history.sql', 'utf8'));
     const pool = {
       query(text, values) { return db.query(text, values); },
       async connect() {
