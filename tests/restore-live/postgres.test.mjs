@@ -56,12 +56,33 @@ test('входящая очередь и job в изолированном Postg
     assert.equal(jobs[0].trigger_type, 'live');
     assert.equal(jobs[0].silent, false);
   });
+  await t.test('живой дубликат ранее сохранённого backfill не меняет тихий режим и не создаёт второй job', async () => {
+    // Имитируем запись, попавшую в БД в обход новой проверки cutoff. В
+    // штатном API очередь запрещает backfill для дат после включения live.
+    await db.query(`INSERT INTO lost_processing_jobs
+      (id,request_key,deal_id,lose_date,trigger_type,silent,screenshots)
+      VALUES ('00000000-0000-4000-8000-000000000101', $1, 42, $2, 'backfill', true, false)`,
+    ['bitrix24:deal-stage-history:401', '2026-11-04T00:00:00Z']);
+    await inbox.acceptForm(form);
+    const event = await inbox.claim();
+    const bitrix = { async request(method) { return method === 'crm.deal.get' ? { result: { STAGE_ID: 'C23:LOSE' } }
+      : { result: { items: [{ ID: '401', STAGE_ID: 'C23:LOSE', CREATED_TIME: '2026-11-04T00:00:00Z' }] } }; } };
+    assert.deepEqual(await processLiveEvent({ inbox, event, bitrix }), { status: 'queued' });
+    const jobs = (await db.query('SELECT id,trigger_type,silent,screenshots FROM lost_processing_jobs WHERE request_key=$1',
+      ['bitrix24:deal-stage-history:401'])).rows;
+    assert.equal(jobs.length, 1);
+    assert.equal(jobs[0].trigger_type, 'backfill');
+    assert.equal(jobs[0].silent, true);
+    assert.equal(jobs[0].screenshots, false);
+    assert.equal((await db.query('SELECT status FROM lost_bitrix_events WHERE id=$1', [event.id])).rows[0].status, 'done');
+  });
   await t.test('сделка вне отказа завершает событие без job', async () => {
+    const before = (await db.query('SELECT count(*)::int AS count FROM lost_processing_jobs')).rows[0].count;
     await inbox.acceptForm(form);
     const event = await inbox.claim();
     assert.deepEqual(await processLiveEvent({ inbox, event, bitrix: { async request() { return { result: { STAGE_ID: 'C23:NEW' } }; } } }), { status: 'ignored' });
     assert.equal((await db.query('SELECT outcome FROM lost_bitrix_events WHERE id=$1', [event.id])).rows[0].outcome, 'ignored');
-    assert.equal((await db.query('SELECT count(*)::int AS count FROM lost_processing_jobs')).rows[0].count, 1);
+    assert.equal((await db.query('SELECT count(*)::int AS count FROM lost_processing_jobs')).rows[0].count, before);
   });
   await t.test('переход до включения пропускается, равный cutoff и задержанный после него принимаются', async () => {
     for (const [historyId, when, wanted] of [

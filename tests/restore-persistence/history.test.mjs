@@ -24,7 +24,7 @@ const oldCall = {
 };
 const emptyCall = { ...oldCall, _needs_transcription: false, transcript: '', transcript_manager_text: '',
   transcript_client_text: '', transcript_replicas: 0, transcript_engine: null };
-const audioWait = { lose_date: date, first_seen_at: '2026-11-02T00:01:00Z', deadline_at: '2026-11-03T00:01:00Z',
+const audioWait = { origin_stage_history_id: '101', lose_date: date, first_seen_at: '2026-11-02T00:01:00Z', deadline_at: '2026-11-03T00:01:00Z',
   next_check_at: '2026-11-03T00:01:00Z', pending_calls: ['12'], observations: { 12: { activity_id: '12' } } };
 
 test('архив, новая карточка и результат сохраняются атомарно в PGlite', { skip: !existsSync(pglitePath) }, async (t) => {
@@ -33,6 +33,7 @@ test('архив, новая карточка и результат сохран
   try {
     await db.exec(readFileSync('tests/restore-persistence/synthetic-schema.sql', 'utf8'));
     await db.exec(readFileSync('supabase/migrations/20261105052525_lost_processing_jobs.sql', 'utf8'));
+    await db.exec(readFileSync('supabase/migrations/20261106031734_lost_audio_wait_origins.sql', 'utf8'));
     await db.exec(readFileSync('supabase/migrations/20261105065551_lost_overwrite_history.sql', 'utf8'));
     const query = q => typeof q === 'string' ? db.query(q) : db.query(q.text, q.values);
     const pool = { async connect() { return { query, release() {} }; } };
@@ -84,8 +85,8 @@ test('архив, новая карточка и результат сохран
     });
 
     await t.test('истечение аудио архивирует старую карточку и явно оставляет несобранные поля NULL', async () => {
-      await db.query(`INSERT INTO lost_audio_wait (deal_id,lose_date,state,first_seen_at,deadline_at,next_check_at,pending_calls,observations)
-        VALUES (42,$1,'waiting',$2,$3,$4,$5::jsonb,$6::jsonb)`,
+      await db.query(`INSERT INTO lost_audio_wait (deal_id,lose_date,state,first_seen_at,deadline_at,next_check_at,pending_calls,observations,origin_stage_history_id)
+        VALUES (42,$1,'waiting',$2,$3,$4,$5::jsonb,$6::jsonb,'101')`,
       [date, audioWait.first_seen_at, audioWait.deadline_at, audioWait.next_check_at, JSON.stringify(audioWait.pending_calls), JSON.stringify(audioWait.observations)]);
       await db.query("UPDATE lost_deals SET last_ai_probability=75,last_ai_misplaced=true,last_ai_recovery_probability=50,last_ai_reason_class='price',last_ai_maturity='warm',last_ai_route='call',last_ai_closure_correctness='premature',last_ai_closure_reason_class='price',last_ai_recoverable_now='yes_medium',last_ai_recovery_route='contact' WHERE deal_id=42");
       await job(3);

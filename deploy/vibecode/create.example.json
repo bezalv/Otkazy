@@ -1,0 +1,7 @@
+{
+  "provider": "bitrix-cloud-2",
+  "plan": "bc-small",
+  "name": "otkazy",
+  "displayName": "Отказы",
+  "runMode": { "mode": "ALWAYS" }
+}

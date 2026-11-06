@@ -1,8 +1,8 @@
 import { discoverTransitions } from './index.mjs';
 import { inTransaction } from '../persistence/transaction.mjs';
+import { exactMillisTimestamp } from '../time-precision.mjs';
 
 const EVENT_KEY = /^bitrix24:deal-stage-history:[1-9]\d{0,29}$/;
-const ISO_DATE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/i;
 const MAX_EVENTS = 5000;
 
 function validateEvents(events) {
@@ -17,9 +17,9 @@ function validateEvents(events) {
       throw new TypeError('Некорректный или повторный ключ перехода');
     }
     keys.add(event.event_key);
-    if (typeof event.occurred_at !== 'string' || !ISO_DATE.test(event.occurred_at)
-      || !Number.isFinite(Date.parse(event.occurred_at))) throw new TypeError('Некорректная дата перехода');
-    return { event_key: event.event_key, deal_id: Number(rawId), occurred_at: new Date(event.occurred_at).toISOString() };
+    const date = exactMillisTimestamp(event.occurred_at);
+    if (!date) throw new TypeError('Некорректная дата перехода');
+    return { event_key: event.event_key, deal_id: Number(rawId), occurred_at: date.toISOString() };
   });
 }
 

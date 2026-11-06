@@ -1,4 +1,5 @@
 import { readCurrentTransition } from '../live/index.mjs';
+import { exactMillisTimestamp } from '../time-precision.mjs';
 
 const KEY_PREFIX = 'bitrix24:deal-stage-history:';
 const LIMIT = 50;
@@ -9,9 +10,9 @@ function historyId(value) {
   return value;
 }
 function eventDate(value) {
-  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/i.test(value)
-      || !Number.isFinite(Date.parse(value))) throw new Error('Некорректная дата перехода');
-  return new Date(value).toISOString();
+  const date = exactMillisTimestamp(value);
+  if (!date) throw new Error('Некорректная дата перехода');
+  return date.toISOString();
 }
 function reportIndex(report) {
   if (!report || !Array.isArray(report.events) || report.events.length > 5000
@@ -86,5 +87,5 @@ export async function reviewSelectedBackfill({ report, selectedHistoryIds, clien
   }
   return { events, scan_complete: report.scan_complete, coverage_guaranteed: false,
     portal_binding_verified: false, can_enqueue: false,
-    blocked_by: ['source_portal_not_bound', 'history_timestamp_ties_not_resolved', 'non_atomic_outcome_check', 'live_key_parameter_conflict', 'external_consumers_not_fenced'] };
+    blocked_by: ['source_portal_not_bound', 'history_timestamp_ties_not_resolved', 'non_atomic_outcome_check', 'external_consumers_not_fenced'] };
 }

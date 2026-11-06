@@ -4,7 +4,7 @@ import { EventEmitter } from 'node:events';
 import { existsSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { createApplication } from '../../app/src/application.mjs';
+import { createApplication, assertAudioOriginSchema } from '../../app/src/application.mjs';
 
 const flush = () => new Promise(resolve => setImmediate(resolve));
 function deferred() {
@@ -47,6 +47,7 @@ function fixture(overrides = {}) {
   };
   const dependencies = {
     timers,
+    async inspectAudioOriginSchema() {},
     createLiveInbox() { calls.push('inbox'); return inbox; },
     createBitrixClient() { calls.push('bitrix'); return {}; },
     async prepareRuntime() { calls.push('runtime'); return runtime; },
@@ -109,6 +110,32 @@ test('несовпадающий cutoff не запускает STT и не от
   assert.deepEqual(calls, ['inbox']);
   assert.equal(timers.pending.size, 0);
   assert.equal(application.getStatus(), 'failed');
+});
+
+test('отсутствующая схема останавливает active до настройки приёма и запуска runtime', async () => {
+  const { application, calls, timers } = fixture({ dependencies: { async inspectAudioOriginSchema() { throw new Error('schema-secret'); } } });
+  await assert.rejects(application.start(), error => !String(error).includes('schema-secret'));
+  assert.deepEqual(calls, []);
+  assert.equal(timers.pending.size, 0);
+  assert.equal(application.getStatus(), 'failed');
+  const response = new Response();
+  application.handleLive({ resume() {} }, response);
+  assert.equal(response.statusCode, 503);
+});
+
+test('варианты форматирования CHECK допустимы, ослабленное ограничение нет', async () => {
+  const valid = [
+    "CHECK (((origin_stage_history_id IS NULL) OR (origin_stage_history_id ~ '^[1-9][0-9]{0,29}$'::text)))",
+    "CHECK ((origin_stage_history_id IS NULL) OR (origin_stage_history_id ~ '^[1-9][0-9]{0,29}$'))",
+    "CHECK ((origin_stage_history_id IS NULL) OR (origin_stage_history_id ~ '^[1-9][0-9]{0,29}$'::pg_catalog.text))",
+  ];
+  for (const value of valid) await assertAudioOriginSchema({ async query() { return { rows: [{ check_definition: value }] }; } });
+  for (const value of [null, "CHECK (origin_stage_history_id IS NULL OR true)",
+    "CHECK (origin_stage_history_id IS NULL OR origin_stage_history_id ~ '.*'::text)",
+    "CHECK (origin_stage_history_id IS NULL OR origin_stage_history_id ~ '^[1-9] [0-9]{0,29}$'::text)",
+    "CHECK (origin_stage_history_id IS NULL OR origin_stage_history_id ~ '^[1-9]([0-9]){0,29}$'::text)"]) {
+    await assert.rejects(assertAudioOriginSchema({ async query() { return { rows: [{ check_definition: value }] }; } }));
+  }
 });
 
 test('каждый цикл запускается отдельно и не пересекается с самим собой', async () => {
@@ -347,6 +374,28 @@ test('остановка не ждёт зависший только читаю�
 });
 
 const pglitePath = resolve('tmp/pgtest/node_modules/@electric-sql/pglite/dist/index.js');
+test('активный запуск проверяет колонку и валидированный CHECK в локальном PostgreSQL', { skip: !existsSync(pglitePath) }, async t => {
+  const { PGlite } = await import(pathToFileURL(pglitePath).href);
+  const db = new PGlite();
+  t.after(() => db.close());
+  const check = () => assertAudioOriginSchema(db);
+  await assert.rejects(check());
+  await db.exec('CREATE TABLE public.lost_audio_wait (id integer)');
+  await assert.rejects(check());
+  await db.exec('ALTER TABLE public.lost_audio_wait ADD COLUMN origin_stage_history_id text');
+  await assert.rejects(check());
+  await db.exec('ALTER TABLE public.lost_audio_wait ADD CONSTRAINT lost_audio_wait_origin_stage_history_id_check CHECK (origin_stage_history_id IS NULL OR true)');
+  await assert.rejects(check());
+  await db.exec('ALTER TABLE public.lost_audio_wait DROP CONSTRAINT lost_audio_wait_origin_stage_history_id_check');
+  await db.exec("ALTER TABLE public.lost_audio_wait ADD CONSTRAINT lost_audio_wait_origin_stage_history_id_check CHECK (origin_stage_history_id IS NULL OR origin_stage_history_id ~ '^[1-9][0-9]{0,29}$') NOT VALID");
+  await assert.rejects(check());
+  await db.exec('ALTER TABLE public.lost_audio_wait VALIDATE CONSTRAINT lost_audio_wait_origin_stage_history_id_check');
+  await check();
+  const { application } = fixture({ options: { pool: db }, dependencies: { inspectAudioOriginSchema: undefined } });
+  assert.deepEqual(await application.start(), { status: 'running' });
+  await application.stop();
+});
+
 test('готовность читает реальные состояния очередей в изолированной базе', { skip: !existsSync(pglitePath) }, async () => {
   const { PGlite } = await import(pathToFileURL(pglitePath).href);
   const db = new PGlite();

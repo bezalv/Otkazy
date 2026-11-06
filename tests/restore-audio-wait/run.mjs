@@ -74,6 +74,29 @@ test('все ожидаемые записи должны появиться, в
   assert.equal(ready.queue.observations['123'].first_audio_seen_at, iso(now + 1000000));
 });
 
+test('ранее появившаяся запись снова обязательна, если звонок исчез во время ожидания другой', () => {
+  const callB = { ...call, ID: '456' };
+  const fileA = { ...call, FILES: [{ url: 'https://example.test/audio-a' }] };
+  const fileB = { ...callB, FILES: [{ url: 'https://example.test/audio-b' }] };
+  const start = assess([call, callB], null, now);
+  assert.deepEqual(start.queue.pending_calls.sort(), ['123', '456']);
+  const seenA = assess([fileA, callB], { ...start.queue, state: 'waiting' }, now + 5 * 60000);
+  assert.equal(seenA.state, 'waiting');
+  assert.equal(seenA.queue.observations['123'].first_audio_seen_at, iso(now + 5 * 60000));
+  const disappeared = planAudioWait({ ...input, saved: { ...seenA.queue, state: 'waiting' }, calls: [fileB], nowMs: now + 15 * 60000 });
+  assert.equal(disappeared.action, 'waiting');
+  assert.deepEqual(disappeared.queue.pending_calls, ['123']);
+  assert.equal(disappeared.queue.first_seen_at, iso(now));
+  assert.equal(disappeared.queue.deadline_at, iso(now + 86400000));
+  assert.equal(disappeared.queue.observations['123'].first_audio_seen_at, iso(now + 5 * 60000));
+  assert.equal(disappeared.multi_agent_analysis, undefined);
+  const recovered = planAudioWait({ ...input, saved: { ...disappeared.queue, state: 'waiting' }, calls: [fileA, fileB], nowMs: now + 30 * 60000 });
+  assert.equal(recovered.action, 'analyze');
+  const expired = planAudioWait({ ...input, saved: { ...seenA.queue, state: 'waiting' }, calls: [fileB], nowMs: now + 86400000 });
+  assert.equal(expired.action, 'expired');
+  assert.equal(expired.multi_agent_analysis.verdict, 'недостаточно_данных');
+});
+
 test('при достижении суток запись проверяется до решения о нехватке данных', () => {
   const file = { ...call, FILES: [{ url: 'https://example.test/audio' }] };
   assert.equal(assess([call], saved, now + 86400000 - 1).state, 'waiting');

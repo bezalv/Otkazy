@@ -1,3 +1,5 @@
+import { exactMillisTimestamp } from '../time-precision.mjs';
+
 const SOURCE_LABELS = {
   calls: 'звонки',
   openlines: 'открытые линии',
@@ -68,16 +70,34 @@ async function request(client, method, body, wait, onAttempts = () => {}) {
   throw lastError;
 }
 
-async function list(client, method, body, itemsOf, wait, onAttempts) {
+async function list(client, method, body, itemsOf, wait, onAttempts, { strictHistory = false } = {}) {
   const items = [];
   const seen = new Set();
   let start = 0;
+  let historyTotal = null;
   while (true) {
     if (seen.has(String(start))) throw new Error('Повтор курсора Битрикса');
     seen.add(String(start));
     const response = await request(client, method, { ...body, start }, wait, onAttempts);
     const page = itemsOf(response.result);
     if (!Array.isArray(page)) throw new Error('Некорректная страница Битрикса');
+    if (strictHistory) {
+      if (page.length > 50) throw new Error('Некорректная страница истории');
+      if (response.total !== undefined && response.total !== null) {
+        const total = Number(response.total);
+        if (!Number.isSafeInteger(total) || total < 0 || start + page.length > total) throw new Error('Некорректный размер истории');
+        if (historyTotal !== null && historyTotal !== total) throw new Error('Размер истории изменился');
+        historyTotal = total;
+        if ((response.next === undefined || response.next === null || response.next === false) && start + page.length !== total) throw new Error('История стадий неполная');
+        if (response.next !== undefined && response.next !== null && response.next !== false && start + page.length >= total) throw new Error('Пагинация истории противоречит размеру');
+      } else if (page.length === 50 && (response.next === undefined || response.next === null || response.next === false)) {
+        throw new Error('Полнота истории стадий не подтверждена');
+      }
+      if (historyTotal !== null && (response.next === undefined || response.next === null || response.next === false)
+        && start + page.length !== historyTotal) throw new Error('История стадий неполная');
+      if (response.next !== undefined && response.next !== null && response.next !== false
+        && (!page.length || Number(response.next) !== start + page.length)) throw new Error('Некорректный переход страницы истории');
+    }
     items.push(...page);
     if (response.next === undefined || response.next === null || response.next === false) {
       return items;
@@ -87,6 +107,28 @@ async function list(client, method, body, itemsOf, wait, onAttempts) {
     }
     start = Number(response.next);
   }
+}
+
+// История события должна быть полной и отсортированной. ID не используется
+// для разрешения совпадающих дат: Bitrix не гарантирует такой порядок.
+function validateEventHistory(history) {
+  if (!Array.isArray(history) || !history.length) throw new Error('Пустая история стадий');
+  const ids = new Set();
+  let previous = Infinity;
+  let latest = null;
+  for (const [index, event] of history.entries()) {
+    const id = String(event?.ID ?? '');
+    const parsed = exactMillisTimestamp(event?.CREATED_TIME);
+    if (!/^[1-9]\d{0,29}$/.test(id) || ids.has(id) || typeof event?.STAGE_ID !== 'string' || !event.STAGE_ID || !parsed) {
+      throw new Error('Некорректная запись истории стадий');
+    }
+    const time = parsed.getTime();
+    if (!Number.isFinite(time) || time > previous || (index === 1 && time === latest)) throw new Error('Неоднозначный порядок истории стадий');
+    ids.add(id);
+    if (index === 0) latest = time;
+    previous = time;
+  }
+  if (history[0].STAGE_ID !== 'C23:LOSE') throw new Error('История стадий ещё не подтверждает текущий отказ');
 }
 
 function skipReason(id, text) {
@@ -158,10 +200,11 @@ function mapDeal(deal, reasons, history, now) {
 }
 
 /** Собирает первичные данные. Нормализация чатов и распознавание выполняются отдельно. */
-export async function collectDeal({ client, dealId, silent = false, now = Date.now(), wait = defaultWait }) {
+export async function collectDeal({ client, dealId, silent = false, now = Date.now(), wait = defaultWait, expectedHistoryId = null, expectedLoseDate = null, requireCurrentHistory = false }) {
   if (!client || typeof client.request !== 'function') throw new TypeError('Нужен client.request');
   const id = Number(dealId);
   if (!Number.isSafeInteger(id) || id <= 0) throw new TypeError('Некорректный ID сделки');
+  if (expectedHistoryId !== null && (typeof expectedHistoryId !== 'string' || !/^[1-9]\d{0,29}$/.test(expectedHistoryId))) throw new TypeError('Некорректный ID перехода');
   const sources = Object.fromEntries(Object.entries(SOURCE_LABELS).map(([key, label]) => [
     key, { label, complete: false, error: null, attempts: 0 },
   ]));
@@ -195,12 +238,20 @@ export async function collectDeal({ client, dealId, silent = false, now = Date.n
       filter: { OWNER_ID: id },
       order: { CREATED_TIME: 'DESC' },
       select: ['ID', 'STAGE_ID', 'CREATED_TIME', 'CATEGORY_ID'],
-    }, page => Array.isArray(page) ? page : page?.items, wait);
+    }, page => Array.isArray(page) ? page : page?.items, wait, undefined, { strictHistory: requireCurrentHistory || expectedHistoryId !== null });
     // Карточка и история могут обновляться не одновременно. Старый отказ в
     // истории не доказывает, что новый переход уже записан.
     if (!history.length || history[0]?.STAGE_ID !== 'C23:LOSE' || !history[0]?.CREATED_TIME
       || !Number.isFinite(new Date(history[0].CREATED_TIME).getTime())) {
       throw new Error('История стадий ещё не подтверждает текущий отказ');
+    }
+    if (requireCurrentHistory || expectedHistoryId !== null) validateEventHistory(history);
+    if (expectedHistoryId !== null) {
+      const expectedMs = new Date(expectedLoseDate).getTime();
+      const actualMs = Date.parse(history[0].CREATED_TIME);
+      if (!expectedLoseDate || !Number.isFinite(expectedMs)) throw new Error('Неизвестна дата перехода');
+      if (actualMs > expectedMs) return { ...result, _status: 'obsolete_transition' };
+      if (actualMs < expectedMs || String(history[0].ID) !== expectedHistoryId) throw new Error('История не подтверждает ожидаемый переход');
     }
   } catch (error) {
     return { ...result, _status: 'error', _step: 'deal_or_history', _error: safeError(error) };
@@ -235,16 +286,27 @@ export async function collectDeal({ client, dealId, silent = false, now = Date.n
       if (current.result.STAGE_ID !== 'C23:LOSE') {
         return { ...result, _status: 'skipped', _reason: 'not_in_lost_stage' };
       }
-      const refreshed = await request(client, 'crm.stagehistory.list', {
-        entityTypeId: 2, filter: { OWNER_ID: id }, order: { CREATED_TIME: 'DESC' },
-        select: ['ID', 'STAGE_ID', 'CREATED_TIME', 'CATEGORY_ID'], start: 0,
-      }, wait);
-      const latest = (Array.isArray(refreshed.result) ? refreshed.result : refreshed.result?.items)?.[0];
+      let latest;
+      if (requireCurrentHistory || expectedHistoryId !== null) {
+        const refreshed = await list(client, 'crm.stagehistory.list', {
+          entityTypeId: 2, filter: { OWNER_ID: id }, order: { CREATED_TIME: 'DESC' },
+          select: ['ID', 'STAGE_ID', 'CREATED_TIME', 'CATEGORY_ID'],
+        }, page => Array.isArray(page) ? page : page?.items, wait, undefined, { strictHistory: true });
+        validateEventHistory(refreshed);
+        latest = refreshed[0];
+      } else {
+        const refreshed = await request(client, 'crm.stagehistory.list', {
+          entityTypeId: 2, filter: { OWNER_ID: id }, order: { CREATED_TIME: 'DESC' },
+          select: ['ID', 'STAGE_ID', 'CREATED_TIME', 'CATEGORY_ID'], start: 0,
+        }, wait);
+        latest = (Array.isArray(refreshed.result) ? refreshed.result : refreshed.result?.items)?.[0];
+      }
       const latestMs = latest?.CREATED_TIME ? new Date(latest.CREATED_TIME).getTime() : NaN;
       if (latest?.STAGE_ID !== 'C23:LOSE' || !Number.isFinite(latestMs) || latestMs < loseMs) {
         throw new Error('История стадий ещё не подтверждает текущий отказ');
       }
       if (latestMs > loseMs) return { ...result, _status: 'obsolete_transition' };
+      if ((requireCurrentHistory || expectedHistoryId !== null) && String(latest.ID) !== String(history[0].ID)) throw new Error('История не подтверждает ожидаемый переход');
     } catch (error) {
       return { ...result, _status: 'error', _step: 'fresh_deal_wait', _error: safeError(error) };
     }

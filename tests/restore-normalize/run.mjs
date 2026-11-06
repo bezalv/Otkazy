@@ -53,7 +53,7 @@ test('сбор и нормализация голосовых, дублей се
       switch (method) {
         case 'crm.deal.userfield.list': return { result: [{ LIST: [{ ID: 4, VALUE: 'Другая причина' }] }] };
         case 'crm.deal.get': return { result: { ID: '42', STAGE_ID: 'C23:LOSE', ASSIGNED_BY_ID: 65, UF_CRM_1584703948317: 4 } };
-        case 'crm.stagehistory.list': return { result: { items: [{ STAGE_ID: 'C23:LOSE', CREATED_TIME: '2026-11-01T00:00:00Z' }] } };
+        case 'crm.stagehistory.list': return { result: { items: [{ ID: '101', STAGE_ID: 'C23:LOSE', CREATED_TIME: '2026-11-01T00:00:00Z' }] } };
         case 'crm.activity.list':
           if (body.filter.TYPE_ID) return { result: [{ ID: 1, DIRECTION: '2', CREATED: '2026-11-01T00:00:00Z', START_TIME: '2026-11-01T00:20:00Z', END_TIME: '2026-11-01T00:21:00Z', SETTINGS: { RECORD_URL: 'https://example.test/call' } }] };
           return { result: [{ ASSOCIATED_ENTITY_ID: 80 }, { ASSOCIATED_ENTITY_ID: 81 }] };
@@ -335,7 +335,7 @@ test('processDeal блокирует OGG без имени файла и нек�
     const bitrix = { async request(method, body) {
       if (method === 'crm.deal.userfield.list') return { result: [{ LIST: [{ ID: 4, VALUE: 'Другая' }] }] };
       if (method === 'crm.deal.get') return { result: { ID: '42', STAGE_ID: 'C23:LOSE', ASSIGNED_BY_ID: '65', UF_CRM_1584703948317: 4 } };
-      if (method === 'crm.stagehistory.list') return { result: { items: [{ STAGE_ID: 'C23:LOSE', CREATED_TIME: '2026-11-04T00:00:00Z' }] } };
+      if (method === 'crm.stagehistory.list') return { result: { items: [{ ID: '101', STAGE_ID: 'C23:LOSE', CREATED_TIME: '2026-11-04T00:00:00Z' }] } };
       if (method === 'crm.activity.list') return { result: body.filter.TYPE_ID ? [] : [{ ASSOCIATED_ENTITY_ID: '80' }] };
       if (method === 'crm.timeline.comment.list') return { result: [] };
       if (method === 'imopenlines.crm.chat.get') return { result: [{ CHAT_ID: 100 }] };

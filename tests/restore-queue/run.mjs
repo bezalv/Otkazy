@@ -3,7 +3,7 @@ import { test } from 'node:test';
 import { createJobQueue } from '../../app/src/queue/index.mjs';
 
 const uuid = '123e4567-e89b-42d3-a456-426614174000';
-const request = { requestKey: 'deal:42:transition:1', dealId: 42, loseDate: '2026-11-01T00:00:00Z', triggerType: 'live' };
+const request = { requestKey: 'bitrix24:deal-stage-history:1', dealId: 42, loseDate: '2026-11-01T00:00:00Z', triggerType: 'live' };
 
 test('постановка использует параметры и сохраняет безопасные настройки', async () => {
   let query;
@@ -18,7 +18,7 @@ test('дубликат с теми же параметрами не создаё
   let calls = 0;
   const queue = createJobQueue({ async query() {
     calls++;
-    return { rows: calls === 1 ? [] : [{ id: uuid, deal_id: 42, lose_date: request.loseDate, trigger_type: 'live', silent: false, screenshots: true }] };
+    return { rows: calls === 1 ? [] : [{ id: uuid, deal_id: 42, lose_date: request.loseDate, date_matches: true, trigger_type: 'live', silent: false, screenshots: true }] };
   } }, { uuid: () => uuid });
   assert.equal((await queue.enqueue(request)).created, false);
   assert.equal(calls, 2);

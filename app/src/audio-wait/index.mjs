@@ -45,9 +45,10 @@ export function awAssess(calls, loseDate, enabledAt, saved, nowMs) {
       tracked.first_audio_seen_at = new Date(nowMs).toISOString();
     }
   }
-  // Если ранее виденный звонок исчез из ответа, это не доказательство готовности.
+  // Все отслеженные звонки должны присутствовать в текущем полном ответе.
+  // Факт, что запись когда-то появлялась, не гарантирует её доступности сейчас.
   Object.keys(observations).forEach(function (id) {
-    if (!(calls || []).some(function (c) { return String(c.ID) === id; }) && !observations[id].first_audio_seen_at) pending.push(id);
+    if (!(calls || []).some(function (c) { return String(c.ID) === id; })) pending.push(id);
   });
   if (!pending.length && !q) return { state: 'ready' };
   var next = deadline;

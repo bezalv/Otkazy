@@ -55,9 +55,10 @@ test('неизвестное состояние не становится усп
 
 test('только ручной и ночной повтор переоценивают завершённую очередь, не меняя её', async () => {
   for (const trigger of ['manual', 'nightly', 'live', 'audio_wait']) {
-    const terminal = { state: 'expired', lose_date: job.lose_date };
+    const terminal = { state: 'expired', lose_date: job.lose_date, origin_stage_history_id: '101' };
     let processed = false;
-    const localJob = { ...job, trigger_type: trigger };
+    const localJob = { ...job, trigger_type: trigger,
+      ...(trigger === 'live' ? { request_key: 'bitrix24:deal-stage-history:101' } : {}) };
     const { calls, args } = deps({ job: localJob, loadAudioWait: async () => terminal,
       queue: { async renew() { return true; }, async finishObsoleteNightly() { return false; },
         async finishObsoleteAudioCheck() { return true; } },
@@ -87,4 +88,26 @@ test('устаревший переход завершается без техн
   assert.equal((await runJob(args)).status, 'obsolete');
   assert.equal(finished, true);
   assert.equal(calls.length, 0);
+});
+
+test('идентификатор события передаётся обработчику, ручные задания сохраняют прежний контракт', async () => {
+  for (const [request_key, trigger_type, expected] of [
+    ['bitrix24:deal-stage-history:101', 'live', '101'],
+    ['bitrix24:deal-stage-history:101', 'backfill', '101'],
+    ['manual:42:1', 'manual', null],
+  ]) {
+    let seen;
+    const { args } = deps({ job: { ...job, request_key, trigger_type }, process: async options => { seen = options.expectedHistoryId; return { status: 'skipped' }; } });
+    await runJob(args);
+    assert.equal(seen, expected);
+  }
+});
+
+test('повреждённый ключ живого события не запускает анализ', async () => {
+  let called = false;
+  const { args, calls } = deps({ job: { ...job, request_key: 'bitrix24:deal-stage-history:no', trigger_type: 'live' },
+    process: async () => { called = true; } });
+  assert.equal((await runJob(args)).status, 'error');
+  assert.equal(called, false);
+  assert.equal(calls[0]._status, 'error');
 });

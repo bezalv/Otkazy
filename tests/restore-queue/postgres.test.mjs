@@ -15,11 +15,11 @@ test('миграция и очередь на локальном движке Po
   await db.exec('create role anon; create role authenticated; create table public.lost_deal_analyses (id bigint primary key);');
   await db.exec(readFileSync(migrationPath, 'utf8'));
   const queue = createJobQueue(db);
-  const request = { requestKey: 'test:1', dealId: 42, loseDate: '2026-11-01T00:00:00Z', triggerType: 'live' };
+  const request = { requestKey: 'bitrix24:deal-stage-history:1', dealId: 42, loseDate: '2026-11-01T00:00:00Z', triggerType: 'live' };
   const first = await queue.enqueue(request);
   assert.equal(first.created, true);
   assert.equal((await queue.enqueue(request)).created, false);
-  await queue.enqueue({ ...request, requestKey: 'test:2' });
+  await queue.enqueue({ ...request, requestKey: 'bitrix24:deal-stage-history:2' });
   const claimed = await queue.claim();
   assert.equal(claimed.status, 'processing');
   assert.equal(Number(claimed.deal_id), 42);
@@ -36,7 +36,7 @@ test('миграция и очередь на локальном движке Po
 
   await db.query("update public.lost_processing_jobs set status='needs_review', lease_token=null, lease_until=null where id=$1", [recovered.id]);
   assert.equal(await queue.claim(), null, 'нельзя повторно разбирать сделку до сверки доставки');
-  await queue.enqueue({ ...request, dealId: 43, requestKey: 'test:other' });
+  await queue.enqueue({ ...request, dealId: 43, requestKey: 'bitrix24:deal-stage-history:3' });
   assert.equal(Number((await queue.claim()).deal_id), 43, 'другая сделка не блокируется');
 
   await db.query("insert into public.lost_deal_analyses (id, pipeline_operation_id) values (1, $1)", [claimed.id]);

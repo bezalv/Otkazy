@@ -84,3 +84,11 @@ test('подмена или противоречие в отчёте и свер
     compareOutcomes: async () => { throw new Error('SECRET'); } }), /^Error: Не удалось повторно сверить исходы$/);
   assert.deepEqual(client.calls, []);
 });
+
+test('отчёт с микросекундами не превращается в переход с другой датой', async () => {
+  const input = report([{ ...event(11, 100), occurred_at: '2026-11-01T02:00:00.000700Z' }]);
+  assert.throws(() => listUnprocessedHistoryIds(input), /дата/);
+  const client = fakeClient({ 100: { id: '11' } });
+  await assert.rejects(reviewSelectedBackfill({ report: input, selectedHistoryIds: ['11'], client, compareOutcomes: unchanged }), /дата/);
+  assert.deepEqual(client.calls, []);
+});

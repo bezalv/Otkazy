@@ -14,7 +14,7 @@ import { runAgents } from './agents/index.mjs';
 export async function processDeal({
   dealId, bitrix, llm, resolveFile, downloadFile, transcribe,
   judgeSystemPrompt, writerSystemPrompt, audioWaitEnabledAt, savedAudioWait = null,
-  silent = false, screenshots = true, nowMs = null, clock = Date.now, expectedLoseDate = null, wait,
+  silent = false, screenshots = true, nowMs = null, clock = Date.now, expectedLoseDate = null, expectedHistoryId = null, wait,
 }) {
   if (typeof judgeSystemPrompt !== 'string' || !judgeSystemPrompt.trim()) {
     throw new Error('Не задан промпт судьи');
@@ -22,7 +22,7 @@ export async function processDeal({
   if (typeof clock !== 'function') throw new TypeError('Не заданы часы обработки');
   const startedAt = nowMs ?? clock();
   if (!Number.isFinite(startedAt)) throw new TypeError('Некорректное время обработки');
-  const collected = await collectDeal({ client: bitrix, dealId, silent, now: startedAt, wait });
+  const collected = await collectDeal({ client: bitrix, dealId, silent, now: startedAt, wait, expectedLoseDate, expectedHistoryId, requireCurrentHistory: true });
   if (collected.deal_data && expectedLoseDate != null) {
     const expected = new Date(expectedLoseDate).getTime();
     const actual = new Date(collected.deal_data.lose_date).getTime();
@@ -47,6 +47,9 @@ export async function processDeal({
     saved: savedAudioWait,
     nowMs: evaluatedAt, silent, screenshots,
   });
+  // Идентификатор кладётся в отдельную колонку вместе с очередью и переживает
+  // перезапуск процесса; timestamp не является идентификатором перехода.
+  if (audioWait.queue) audioWait.queue.origin_stage_history_id = String(collected.stage_history[0].ID);
   if (audioWait.action !== 'analyze') return { status: audioWait.action, collection: collected, audioWait };
 
   const normalized = await normalizeCommunications({

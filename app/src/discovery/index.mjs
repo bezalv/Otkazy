@@ -1,3 +1,5 @@
+import { exactMillisTimestamp } from '../time-precision.mjs';
+
 const HISTORY_METHOD = 'crm.stagehistory.list';
 const HISTORY_FIELDS = ['ID', 'OWNER_ID', 'STAGE_ID', 'CREATED_TIME', 'CATEGORY_ID'];
 const HANDLED = new Set(['processed', 'skipped_by_reason']);
@@ -5,12 +7,9 @@ const KNOWN = new Set([...HANDLED, 'waiting_audio', 'pipeline_error', 'not_found
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 function timestamp(value, field) {
-  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/i.test(value)) {
-    throw new Error(`Некорректная дата ${field}`);
-  }
-  const time = Date.parse(value);
-  if (!Number.isFinite(time)) throw new Error(`Некорректная дата ${field}`);
-  return time;
+  const date = exactMillisTimestamp(value);
+  if (!date) throw new Error(`Некорректная дата ${field}`);
+  return date.getTime();
 }
 
 function id(value, field, requireSafe = false) {

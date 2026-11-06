@@ -37,15 +37,16 @@ export async function reviewSummary(pool) {
         throw new Error('Не подтверждена видимость очереди');
       }
       const result = await db.query(`SELECT count(*)::text AS total,
-        count(*) FILTER (WHERE comment_state='unknown' AND notify_state='unknown')::text AS both_unknown,
-        count(*) FILTER (WHERE comment_state='unknown' AND notify_state<>'unknown')::text AS comment_unknown,
-        count(*) FILTER (WHERE comment_state<>'unknown' AND notify_state='unknown')::text AS notification_unknown,
-        count(*) FILTER (WHERE comment_state<>'unknown' AND notify_state<>'unknown')::text AS other
+        count(*) FILTER (WHERE last_error IN ('audio_origin_missing','audio_origin_mismatch'))::text AS audio_origin,
+        count(*) FILTER (WHERE COALESCE(last_error,'') NOT IN ('audio_origin_missing','audio_origin_mismatch') AND comment_state='unknown' AND notify_state='unknown')::text AS both_unknown,
+        count(*) FILTER (WHERE COALESCE(last_error,'') NOT IN ('audio_origin_missing','audio_origin_mismatch') AND comment_state='unknown' AND notify_state<>'unknown')::text AS comment_unknown,
+        count(*) FILTER (WHERE COALESCE(last_error,'') NOT IN ('audio_origin_missing','audio_origin_mismatch') AND comment_state<>'unknown' AND notify_state='unknown')::text AS notification_unknown,
+        count(*) FILTER (WHERE COALESCE(last_error,'') NOT IN ('audio_origin_missing','audio_origin_mismatch') AND comment_state<>'unknown' AND notify_state<>'unknown')::text AS other
         FROM public.lost_processing_jobs WHERE status='needs_review'`);
       if (result.rows?.length !== 1) throw new Error('Неполный результат');
-      const { total, both_unknown, comment_unknown, notification_unknown, other } = result.rows[0];
-      const counts = { total: count(total), comment_unknown: count(comment_unknown), notification_unknown: count(notification_unknown), both_unknown: count(both_unknown), other: count(other) };
-      if (counts.total !== counts.comment_unknown + counts.notification_unknown + counts.both_unknown + counts.other) throw new Error('Несогласованный результат');
+      const { total, both_unknown, comment_unknown, notification_unknown, other, audio_origin } = result.rows[0];
+      const counts = { total: count(total), comment_unknown: count(comment_unknown), notification_unknown: count(notification_unknown), both_unknown: count(both_unknown), other: count(other), audio_origin: count(audio_origin) };
+      if (counts.total !== counts.comment_unknown + counts.notification_unknown + counts.both_unknown + counts.other + counts.audio_origin) throw new Error('Несогласованный результат');
       return counts;
     });
   } catch { throw new Error('Не удалось получить отчёт о доставке'); }

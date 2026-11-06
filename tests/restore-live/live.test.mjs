@@ -50,6 +50,33 @@ test('история возвращает ID конкретного послед
   } }, 42), /история/i);
 });
 
+test('одинаковые даты, сбитый порядок и неполная история не назначают ID текущему отказу', async () => {
+  const first = { ID: '123', STAGE_ID: 'C23:LOSE', CREATED_TIME: '2026-11-04T07:00:00+07:00' };
+  const previous = { ID: '122', STAGE_ID: 'C23:NEW', CREATED_TIME: '2026-11-03T23:59:59Z' };
+  const api = page => ({ async request(method) { return method === 'crm.deal.get'
+    ? { result: { STAGE_ID: 'C23:LOSE' } } : page; } });
+  assert.deepEqual(await readCurrentTransition(api({ result: { items: [first, previous] } }), 42),
+    { historyId: '123', loseDate: '2026-11-04T00:00:00.000Z' });
+  for (const page of [
+    { result: { items: [{ ...first, CREATED_TIME: '2026-11-04T00:00:00.000700Z' }] } },
+    { result: { items: [first, { ...previous, CREATED_TIME: '2026-11-03T23:59:59.999500Z' }] } },
+    { result: { items: [first, { ...previous, CREATED_TIME: '2026-11-04T00:00:00Z' }] } },
+    { result: { items: [first, { ...previous, CREATED_TIME: '2026-11-04T00:00:01Z' }] } },
+    { result: { items: [first, { ...previous, CREATED_TIME: 'не дата' }] } },
+    { result: { items: [first, { ...previous, ID: 'bad' }] } },
+    { result: { items: [first] }, next: 1 },
+    { result: { items: [first] }, total: 2 },
+    { result: { items: [first, previous] }, total: 1 },
+    { result: { items: [first, previous] }, next: 'incorrect' },
+    { result: { items: [] } },
+  ]) await assert.rejects(readCurrentTransition(api(page), 42));
+  let retries = 0;
+  const inbox = { async assertConfig() {}, async retry() { retries++; return true; }, async finish() { assert.fail('нельзя сохранять неоднозначный ID'); } };
+  const bitrix = api({ result: { items: [first, { ...previous, CREATED_TIME: '2026-11-04T00:00:00Z' }] } });
+  assert.deepEqual(await processLiveEvent({ inbox, bitrix, event: { id: 'e', lease_token: 'l', deal_id: 42 } }), { status: 'retry' });
+  assert.equal(retries, 1);
+});
+
 test('карточка уже LOSE, но первая запись истории ещё NEW: событие остаётся на повтор', async () => {
   let retries = 0;
   const inbox = { async assertConfig() {}, async retry() { retries++; return true; }, async finish() { assert.fail('нельзя фиксировать старый LOSE'); } };
@@ -64,7 +91,7 @@ test('карточка уже LOSE, но первая запись истори�
 
 test('отсутствующая или неоднозначная дата включения блокирует настройку', () => {
   const pool = { async query() {}, connect() {} };
-  for (const value of [undefined, '', '2026-11-01', '2026-11-01T00:00:00', 'wrong']) {
+  for (const value of [undefined, '', '2026-11-01', '2026-11-01T00:00:00', '2026-11-01T00:00:00.000500Z', 'wrong']) {
     assert.throws(() => createLiveInbox(pool, { ...expected, liveEnabledAt: value }), /включения/);
   }
 });

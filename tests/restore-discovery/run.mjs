@@ -23,6 +23,11 @@ function clientOf(pages) {
   };
 }
 
+test('исходная дата с микросекундами не обрезается в отчёте восстановления', async () => {
+  const client = clientOf({ 0: { result: { items: [{ ...first, CREATED_TIME: '2026-11-02T03:00:00.000700Z' }] }, total: 1 } });
+  await assert.rejects(discoverTransitions({ client, compareOutcomes: missing, from, to, wait: async () => {} }), /дата/);
+});
+
 test('пагинация и повторный отказ создают разные устойчивые event_key', async () => {
   const client = clientOf({
     0: { result: { items: [first, second] }, next: 2, total: 4 },

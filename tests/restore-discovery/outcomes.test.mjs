@@ -21,6 +21,13 @@ function poolFor(db) {
   }; } };
 }
 
+test('сверка не обрезает микросекунды до доступа к БД', async () => {
+  let connected = false;
+  const pool = { async connect() { connected = true; throw new Error('не должен подключаться'); } };
+  await assert.rejects(createOutcomeComparator(pool)([event(1, 42, '2026-11-04T00:00:00.000700Z')]), /дата/);
+  assert.equal(connected, false);
+});
+
 test('до установки новых миграций чистая сделка проверяется по старой схеме', { skip: !existsSync(pglitePath) }, async () => {
   const { PGlite } = await import(pathToFileURL(pglitePath).href);
   const db = new PGlite();

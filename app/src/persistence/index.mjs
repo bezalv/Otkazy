@@ -162,24 +162,27 @@ function requireDeal(result, id) {
 async function saveWaiting(connection, result, id) {
   const queue = result.audio_wait;
   if (!queue || !queue.lose_date || !queue.first_seen_at || !queue.deadline_at || !queue.next_check_at
-    || !Array.isArray(queue.pending_calls) || !queue.observations || typeof queue.observations !== 'object') {
+    || !Array.isArray(queue.pending_calls) || !queue.observations || typeof queue.observations !== 'object'
+    || typeof queue.origin_stage_history_id !== 'string' || !/^[1-9]\d{0,29}$/.test(queue.origin_stage_history_id)) {
     throw new TypeError('Некорректное состояние ожидания записи');
   }
   const response = await connection.query({
     text: `INSERT INTO public.lost_audio_wait
-      (deal_id, lose_date, state, first_seen_at, deadline_at, next_check_at, pending_calls, observations, silent, screenshots, checks, updated_at)
-      VALUES ($1, $2, 'waiting', $3, $4, $5, $6::jsonb, $7::jsonb, $8, $9, 1, NOW())
+      (deal_id, lose_date, state, first_seen_at, deadline_at, next_check_at, pending_calls, observations, silent, screenshots, origin_stage_history_id, checks, updated_at)
+      VALUES ($1, $2, 'waiting', $3, $4, $5, $6::jsonb, $7::jsonb, $8, $9, $10, 1, NOW())
       ON CONFLICT (deal_id) DO UPDATE SET
         lose_date=EXCLUDED.lose_date, state='waiting', first_seen_at=EXCLUDED.first_seen_at,
         deadline_at=EXCLUDED.deadline_at, next_check_at=EXCLUDED.next_check_at,
         pending_calls=EXCLUDED.pending_calls, observations=EXCLUDED.observations,
-        silent=EXCLUDED.silent, screenshots=EXCLUDED.screenshots,
+        silent=EXCLUDED.silent, screenshots=EXCLUDED.screenshots, origin_stage_history_id=EXCLUDED.origin_stage_history_id,
         checks=lost_audio_wait.checks+1, lease_until=NULL, updated_at=NOW()
-      WHERE (lost_audio_wait.state='waiting' AND lost_audio_wait.lose_date=EXCLUDED.lose_date)
-         OR lost_audio_wait.lose_date < EXCLUDED.lose_date
+      WHERE (lost_audio_wait.state='waiting' AND lost_audio_wait.lose_date=EXCLUDED.lose_date
+        AND lost_audio_wait.origin_stage_history_id=EXCLUDED.origin_stage_history_id)
+         OR (lost_audio_wait.lose_date < EXCLUDED.lose_date
+           AND NOT (lost_audio_wait.state='waiting' AND lost_audio_wait.origin_stage_history_id IS NULL))
       RETURNING deal_id`,
     values: [id, queue.lose_date, queue.first_seen_at, queue.deadline_at, queue.next_check_at,
-      JSON.stringify(queue.pending_calls), JSON.stringify(queue.observations), result.silent === true, result.audio_wait_screenshots === true],
+      JSON.stringify(queue.pending_calls), JSON.stringify(queue.observations), result.silent === true, result.audio_wait_screenshots === true, queue.origin_stage_history_id],
   });
   if (response.rowCount !== 1) throw new Error('Состояние очереди аудио изменилось');
 }
@@ -188,7 +191,8 @@ async function finishWaiting(connection, result, id) {
   if (!result.audio_wait) return;
   const queue = result.audio_wait;
   if (!queue.lose_date || !queue.first_seen_at || !queue.deadline_at || !queue.next_check_at
-    || !Array.isArray(queue.pending_calls) || !queue.observations || typeof queue.observations !== 'object') {
+    || !Array.isArray(queue.pending_calls) || !queue.observations || typeof queue.observations !== 'object'
+    || typeof queue.origin_stage_history_id !== 'string' || !/^[1-9]\d{0,29}$/.test(queue.origin_stage_history_id)) {
     throw new TypeError('Некорректное состояние очереди аудио');
   }
   const state = result.audio_wait_expired === true ? 'expired' : 'done';
@@ -196,17 +200,19 @@ async function finishWaiting(connection, result, id) {
     text: `UPDATE public.lost_audio_wait SET state=$1, first_seen_at=$4, deadline_at=$5, next_check_at=$6,
         pending_calls=$7::jsonb, observations=$8::jsonb, silent=$9, screenshots=$10,
         checks=checks+1, lease_until=NULL, updated_at=NOW()
-      WHERE deal_id=$2 AND lose_date=$3 AND state='waiting' RETURNING deal_id`,
+      WHERE deal_id=$2 AND lose_date=$3 AND state='waiting' AND origin_stage_history_id=$11 RETURNING deal_id`,
     values: [state, id, queue.lose_date, queue.first_seen_at, queue.deadline_at, queue.next_check_at,
-      JSON.stringify(queue.pending_calls), JSON.stringify(queue.observations), result.silent === true, result.audio_wait_screenshots === true],
+      JSON.stringify(queue.pending_calls), JSON.stringify(queue.observations), result.silent === true, result.audio_wait_screenshots === true, queue.origin_stage_history_id],
   });
   if (response.rowCount !== 1) throw new Error('Не удалось завершить ожидающую запись');
 }
 
-async function cancelWaiting(connection, id, loseDate) {
+async function cancelWaiting(connection, id, loseDate, historyId) {
+  if (historyId == null) return;
+  if (typeof historyId !== 'string' || !/^[1-9]\d{0,29}$/.test(historyId)) throw new TypeError('Некорректный ID ожидания аудио');
   await connection.query({
-    text: "UPDATE public.lost_audio_wait SET state='cancelled', lease_until=NULL, updated_at=NOW() WHERE deal_id=$1 AND lose_date=$2 AND state='waiting'",
-    values: [id, loseDate],
+    text: "UPDATE public.lost_audio_wait SET state='cancelled', lease_until=NULL, updated_at=NOW() WHERE deal_id=$1 AND lose_date=$2 AND state='waiting' AND origin_stage_history_id=$3",
+    values: [id, loseDate, historyId],
   });
 }
 
@@ -359,14 +365,14 @@ export async function persistResult(pool, result) {
       return { status, dealId: id };
     }
     if (status === 'skipped') {
-      await cancelWaiting(connection, id, job.lose_date);
+      await cancelWaiting(connection, id, job.lose_date, result.audio_origin_stage_history_id);
       return { status, dealId: id };
     }
     if (status === 'skipped_by_reason') {
       await connection.query(insertStatement('lost_deals', { ...baseDealRow(deal), analysis_count: 0 }, {
         timestamps: ['updated_at'], conflict: dealConflict(false),
       }));
-      await cancelWaiting(connection, id, job.lose_date);
+      await cancelWaiting(connection, id, job.lose_date, result.audio_origin_stage_history_id);
       return { status, dealId: id };
     }
     const rows = processedRows(result, deal, comms);

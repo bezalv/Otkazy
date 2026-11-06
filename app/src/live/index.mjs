@@ -1,5 +1,6 @@
 import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 import { createJobQueue } from '../queue/index.mjs';
+import { exactMillisTimestamp } from '../time-precision.mjs';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const FIELDS = ['event', 'data[FIELDS][ID]', 'auth[domain]', 'auth[member_id]', 'auth[application_token]'];
@@ -42,10 +43,8 @@ function decodeBody(body) {
 /** Проверяет существующий cutoff только чтением, не создавая запись в БД. */
 export async function validateLiveConfig(pool, liveEnabledAt) {
   if (!pool || typeof pool.query !== 'function') throw new TypeError('Нужен пул PostgreSQL');
-  if (typeof liveEnabledAt !== 'string'
-      || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/i.test(liveEnabledAt)
-      || !Number.isFinite(Date.parse(liveEnabledAt))) throw new LiveConfigError('Не задано время включения лайв-триггера');
-  const result = await pool.query('SELECT enabled_at=$1::timestamptz AS matches FROM public.lost_live_config WHERE id=true', [liveEnabledAt]);
+  if (!exactMillisTimestamp(liveEnabledAt)) throw new LiveConfigError('Не задано время включения лайв-триггера');
+  const result = await pool.query("SELECT enabled_at=$1::timestamptz AND enabled_at=date_trunc('milliseconds',enabled_at) AS matches FROM public.lost_live_config WHERE id=true", [liveEnabledAt]);
   if (result.rows.length !== 1 || result.rows[0].matches !== true) throw new LiveConfigError('Конфигурация лайв-триггера отсутствует или отличается от сохранённой');
 }
 
@@ -57,9 +56,7 @@ export function createLiveInbox(pool, { applicationToken, domain, memberId, live
   if (!pool || typeof pool.query !== 'function' || typeof pool.connect !== 'function') throw new TypeError('Нужен пул PostgreSQL');
   if (typeof applicationToken !== 'string' || !applicationToken || typeof memberId !== 'string' || !memberId
       || typeof domain !== 'string' || !/^[a-z0-9.-]+$/i.test(domain)) throw new TypeError('Не настроена проверка события Битрикса');
-  if (typeof liveEnabledAt !== 'string'
-      || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/i.test(liveEnabledAt)
-      || !Number.isFinite(Date.parse(liveEnabledAt))) throw new TypeError('Не задано время включения лайв-триггера');
+  if (!exactMillisTimestamp(liveEnabledAt)) throw new TypeError('Не задано время включения лайв-триггера');
   if (!Number.isInteger(leaseSeconds) || leaseSeconds < 60 || leaseSeconds > 86400
       || !Number.isInteger(retrySeconds) || retrySeconds < 1 || retrySeconds > 86400) throw new TypeError('Некорректные интервалы очереди');
   const expectedHash = digest(applicationToken);
@@ -141,8 +138,8 @@ export function createLiveInbox(pool, { applicationToken, domain, memberId, live
           const dealId = Number(locked.rows[0].deal_id);
           if (transition) {
             const historyId = positiveId(transition.historyId, 10n ** 30n - 1n);
-            const date = new Date(transition.loseDate);
-            if (!transition.loseDate || !Number.isFinite(date.getTime())) throw new Error('Некорректная дата отказа');
+            const date = exactMillisTimestamp(transition.loseDate);
+            if (!date) throw new Error('Некорректная дата отказа');
             // Текущая LOSE-сделка могла закрыться ещё до подключения нового
             // триггера; её редактирование не должно создавать живой повтор.
             if (date.getTime() >= enabledAtMs) {
@@ -183,13 +180,35 @@ export async function readCurrentTransition(bitrix, dealId) {
   });
   const items = Array.isArray(response?.result) ? response.result : response?.result?.items;
   if (!Array.isArray(items) || !items[0] || typeof items[0].STAGE_ID !== 'string') throw new Error('Некорректная история стадий');
+  const hasNext = response.next !== undefined && response.next !== null;
+  const hasTotal = response.total !== undefined && response.total !== null;
+  const total = Number(response.total), nextOffset = Number(response.next);
+  if (items.length > 50 || (hasTotal && (!Number.isSafeInteger(total) || total < items.length))
+      || (hasNext && (!Number.isSafeInteger(nextOffset) || nextOffset !== items.length || (hasTotal && nextOffset >= total)))
+      || (!hasNext && ((hasTotal && total > items.length) || (!hasTotal && items.length === 50)))) {
+    throw new Error('Неполная страница истории стадий');
+  }
   // Карточка может обновиться раньше истории; искать прежний LOSE дальше
   // нельзя: это потеряет событие текущего перехода из-за дедупликации.
   const event = items[0];
   if (event.STAGE_ID !== 'C23:LOSE') throw new Error('История ещё не подтверждает текущую стадию');
   const historyId = positiveId(event.ID, 10n ** 30n - 1n);
-  const date = new Date(event.CREATED_TIME);
-  if (!event.CREATED_TIME || !Number.isFinite(date.getTime())) throw new Error('Некорректная дата перехода');
+  const date = exactMillisTimestamp(event.CREATED_TIME);
+  if (!date) throw new Error('Некорректная дата перехода');
+  // При одинаковых timestamps Битрикс не гарантирует, какой переход первый.
+  // Нельзя приписывать текущему отказу произвольный ID и потерять событие.
+  // Одной строки недостаточно и тогда, когда API сообщает о следующей странице.
+  if (items.length < 2) {
+    if (hasNext) throw new Error('Неполная первая страница истории');
+  } else {
+    const next = items[1];
+    if (!next || typeof next.STAGE_ID !== 'string' || !next.STAGE_ID) throw new Error('Некорректная история стадий');
+    positiveId(next.ID, 10n ** 30n - 1n);
+    const nextDate = exactMillisTimestamp(next.CREATED_TIME);
+    if (!nextDate || nextDate.getTime() >= date.getTime()) {
+      throw new Error('Порядок истории стадий неоднозначен');
+    }
+  }
   return { historyId, loseDate: date.toISOString() };
 }
 

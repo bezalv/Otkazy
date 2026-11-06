@@ -31,6 +31,7 @@ function mockPool({ failAt, emptyQueue = false, invalidLease = false, expiredAtF
 }
 
 const audioWait = {
+  origin_stage_history_id: '101',
   lose_date: '2026-11-02T00:00:00Z', first_seen_at: '2026-11-02T00:01:00Z',
   deadline_at: '2026-11-03T00:01:00Z', next_check_at: '2026-11-02T00:06:00Z',
   pending_calls: ['12'], observations: { 12: { activity_id: '12' } },
@@ -171,10 +172,16 @@ test('потеря очереди аудио откатывает всю тра�
 
 test('дубли сохраняют карточку без анализа и отменяют ожидание', async () => {
   const mock = mockPool();
-  await persistResult(mock.pool, { ...lease, deal_id: 42, deal_data: deal, _status: 'skipped_by_reason' });
+  await persistResult(mock.pool, { ...lease, deal_id: 42, deal_data: deal, _status: 'skipped_by_reason', audio_origin_stage_history_id: '101' });
   assert.equal(texts(mock.calls).some((text) => text.includes('INSERT INTO public.lost_deals')), true);
   assert.equal(texts(mock.calls).some((text) => text.includes('INSERT INTO public.lost_deal_analyses')), false);
   assert.equal(texts(mock.calls).some((text) => text.includes("state='cancelled'")), true);
+});
+
+test('без подтверждённого ID отмена очереди по одной дате не выполняется', async () => {
+  const mock = mockPool();
+  await persistResult(mock.pool, { ...lease, deal_id: 42, deal_data: deal, _status: 'skipped_by_reason' });
+  assert.equal(texts(mock.calls).some(text => text.includes("state='cancelled'")), false);
 });
 
 test('ошибка сохраняется без вердикта и с очисткой секрета', async () => {

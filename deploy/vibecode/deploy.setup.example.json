@@ -1,0 +1,9 @@
+{
+  "source": { "content": "<BASE64_TAR_GZ_APP_CONTENTS>" },
+  "runtime": "node24",
+  "install": "npm ci",
+  "start": "node src/main.mjs",
+  "port": 3000,
+  "healthPath": "/health",
+  "env": { "OTKAZY_MODE": "setup", "TZ": "UTC" }
+}

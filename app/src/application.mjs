@@ -6,6 +6,35 @@ import { createLiveInbox, processLiveEvent } from './live/index.mjs';
 import { createLiveHttpHandler } from './live/http.mjs';
 
 const DEFAULT_INTERVALS = { inbox: 3000, worker: 5000, nightly: 60000, database: 30000 };
+const AUDIO_ORIGIN_CHECK = "CHECKorigin_stage_history_idISNULLORorigin_stage_history_id~'^[1-9][0-9]{0,29}$'";
+
+function normalizeConstraint(value) {
+  if (typeof value !== 'string') return null;
+  // PostgreSQL в разных версиях может добавлять скобки и явное приведение
+  // строкового литерала к text. Других операторов и литералов не допускаем.
+  // Содержимое строкового литерала сохраняем полностью: пробел или скобка
+  // внутри регулярного выражения меняют условие, а не форматирование SQL.
+  return value.split(/('(?:''|[^'])*')/g).map((part, index) => index % 2 ? part
+    : part.replace(/::(?:pg_catalog\.)?text/g, '').replace(/[\s()]/g, '')).join('');
+}
+
+/** Проверяет миграцию ожидания аудио до запуска потребителей и HTTP-приёма. */
+export async function assertAudioOriginSchema(pool) {
+  if (!pool || typeof pool.query !== 'function') throw new Error('Недоступна проверка схемы');
+  const result = await pool.query(`SELECT pg_catalog.pg_get_constraintdef(c.oid) AS check_definition
+    FROM pg_catalog.pg_class r
+    JOIN pg_catalog.pg_namespace n ON n.oid=r.relnamespace
+    JOIN pg_catalog.pg_attribute a ON a.attrelid=r.oid
+    JOIN pg_catalog.pg_constraint c ON c.conrelid=r.oid
+    WHERE n.nspname='public' AND r.relname='lost_audio_wait' AND r.relkind IN ('r','p')
+      AND a.attname='origin_stage_history_id' AND a.attnum>0 AND NOT a.attisdropped
+      AND a.atttypid='text'::regtype AND NOT a.attnotnull
+      AND c.conname='lost_audio_wait_origin_stage_history_id_check' AND c.contype='c' AND c.convalidated
+      AND c.conkey=ARRAY[a.attnum]::smallint[]`);
+  if (result?.rows?.length !== 1 || normalizeConstraint(result.rows[0].check_definition) !== AUDIO_ORIGIN_CHECK) {
+    throw new Error('Схема ожидания аудио не подтверждена');
+  }
+}
 
 /**
  * Явно управляемая композиция. Конструирование не создаёт таймеры,
@@ -26,6 +55,7 @@ export function createApplication({ pool, bitrixBaseUrl, polzaKey, applicationTo
   const makeBitrix = dependencies.createBitrixClient || createBitrixClient;
   const bitrixLimiter = (dependencies.createBitrixLimiter || createBitrixLimiter)();
   const processEvent = dependencies.processLiveEvent || processLiveEvent;
+  const inspectAudioOriginSchema = dependencies.inspectAudioOriginSchema || assertAudioOriginSchema;
   // Даже пустой claim не говорит, что отложенные события уже обработаны.
   const inspectInbox = dependencies.inspectInbox || (async database => {
     const result = await database.query(`SELECT EXISTS (
@@ -214,6 +244,8 @@ export function createApplication({ pool, bitrixBaseUrl, polzaKey, applicationTo
     state = 'starting';
     startPromise = (async () => {
       try {
+        await inspectAudioOriginSchema(pool);
+        if (state !== 'starting') return { status: 'stopping' };
         inbox = makeInbox(pool, { applicationToken, domain, memberId, liveEnabledAt });
         await inbox.assertConfig();
         if (state !== 'starting') return { status: 'stopping' };

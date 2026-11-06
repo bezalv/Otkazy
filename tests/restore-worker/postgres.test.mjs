@@ -23,7 +23,7 @@ test('тихий разбор проходит конвейер и сохран�
     const bitrix = { async request(method, body) {
       if (method === 'crm.deal.userfield.list') return { result: [{ LIST: [{ ID: '1', VALUE: 'Другая' }] }] };
       if (method === 'crm.deal.get') return { result: { ID: '42', TITLE: 'Тест', STAGE_ID: 'C23:LOSE', ASSIGNED_BY_ID: '65', UF_CRM_1584703948317: '1' } };
-      if (method === 'crm.stagehistory.list') return { result: { items: [{ STAGE_ID: 'C23:LOSE', CREATED_TIME: '2026-11-04T00:00:00Z' }] } };
+      if (method === 'crm.stagehistory.list') return { result: { items: [{ ID: '101', STAGE_ID: 'C23:LOSE', CREATED_TIME: '2026-11-04T00:00:00Z' }] } };
       if (method === 'crm.activity.list' || method === 'imopenlines.crm.chat.get' || method === 'crm.timeline.comment.list') return { result: [] };
       if (method === 'tasks.task.list') return { result: { tasks: [] } };
       throw new Error('unexpected method');

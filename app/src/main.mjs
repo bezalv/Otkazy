@@ -7,6 +7,7 @@ import { X509Certificate } from 'node:crypto';
 import { getCACertificates } from 'node:tls';
 import { createApplication } from './application.mjs';
 import { createDeadlinePool } from './db/deadline-pool.mjs';
+import { exactMillisTimestamp } from './time-precision.mjs';
 
 function required(env, name) {
   const value = env[name];
@@ -54,8 +55,7 @@ export function readMainConfig(env) {
     throw new Error('Некорректный BITRIX_REST_BASE');
   }
   const liveEnabledAt = required(env, 'LIVE_ENABLED_AT');
-  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/i.test(liveEnabledAt)
-      || !Number.isFinite(Date.parse(liveEnabledAt))) throw new Error('Некорректный LIVE_ENABLED_AT');
+  if (!exactMillisTimestamp(liveEnabledAt)) throw new Error('Некорректный LIVE_ENABLED_AT');
   return {
     mode, port, host, databaseUrl: database.toString(), bitrixBaseUrl,
     polzaKey: required(env, 'POLZA_API_KEY'), applicationToken: required(env, 'BITRIX_EVENT_TOKEN'),

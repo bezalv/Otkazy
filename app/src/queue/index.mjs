@@ -1,7 +1,10 @@
 import { randomUUID } from 'node:crypto';
 import { NIGHTLY_MAX_DEALS } from '../rules/nightly-retry.mjs';
+import { exactMillisTimestamp } from '../time-precision.mjs';
 
 const DEFAULT_LEASE_SECONDS = 70 * 60;
+const EVENT_KEY = /^bitrix24:deal-stage-history:[1-9]\d{0,29}$/;
+const EVENT_PREFIX = 'bitrix24:deal-stage-history:';
 
 function validId(value) {
   return typeof value === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
@@ -23,6 +26,21 @@ export function createJobQueue(pool, { uuid = randomUUID, lease = DEFAULT_LEASE_
       const date = new Date(loseDate);
       if (!loseDate || !Number.isFinite(date.getTime())) throw new TypeError('Некорректная дата отказа');
       if (typeof triggerType !== 'string' || !triggerType.trim()) throw new TypeError('Не задан тип запуска');
+      const eventChannel = triggerType === 'live' || triggerType === 'backfill';
+      if ((eventChannel && !EVENT_KEY.test(requestKey)) || (!eventChannel && requestKey.startsWith(EVENT_PREFIX))) {
+        throw new TypeError('Ключ перехода не соответствует типу запуска');
+      }
+      if (eventChannel && !exactMillisTimestamp(loseDate)) throw new TypeError('Некорректная точность даты перехода');
+      if (triggerType === 'backfill') {
+        // Граница неизменяема в БД. Исторический тихий прогон не должен
+        // перехватить живое событие и тем самым погасить уведомления.
+        const cutoff = await connection.query(`SELECT $1::timestamptz < enabled_at
+          AND date_trunc('milliseconds',enabled_at)=enabled_at AS allowed
+          FROM public.lost_live_config WHERE id=true`, [date.toISOString()]);
+        if (cutoff.rows.length !== 1 || cutoff.rows[0].allowed !== true) {
+          throw new Error('Восстановление возможно только до включения живого канала');
+        }
+      }
       const id = uuid();
       if (!validId(id)) throw new TypeError('Некорректный UUID задания');
       const params = [id, requestKey, Number(dealId), date.toISOString(), triggerType, silent === true, screenshots === true];
@@ -35,11 +53,20 @@ export function createJobQueue(pool, { uuid = randomUUID, lease = DEFAULT_LEASE_
         returning id, request_key, deal_id, lose_date, trigger_type, silent, screenshots, status`, params);
       if (inserted.rows.length) return { created: true, job: inserted.rows[0] };
       const existing = await connection.query(`
-        select id, request_key, deal_id, lose_date, trigger_type, silent, screenshots, status
-        from public.lost_processing_jobs where request_key = $1`, [requestKey]);
+        select id, request_key, deal_id, lose_date, trigger_type, silent, screenshots, status,
+          lose_date=$2::timestamptz as date_matches
+        from public.lost_processing_jobs where request_key = $1`, [requestKey, date.toISOString()]);
       const job = existing.rows[0];
-      if (!job || Number(job.deal_id) !== params[2] || new Date(job.lose_date).getTime() !== date.getTime()
-          || job.trigger_type !== triggerType || job.silent !== params[5] || job.screenshots !== params[6]) {
+      // Один и тот же переход иногда обнаруживают оба канала. Сохраняем
+      // параметры первого задания без изменений: повтор не создаёт новую
+      // отправку и не меняет уже выбранный тихий режим. Это исключение
+      // относится только к каноническому ключу и паре live/backfill.
+      const sameEventDifferentChannel = EVENT_KEY.test(requestKey)
+        && ((job?.trigger_type === 'live' && triggerType === 'backfill')
+          || (job?.trigger_type === 'backfill' && triggerType === 'live'));
+      if (!job || Number(job.deal_id) !== params[2] || job.date_matches !== true
+          || (!sameEventDifferentChannel && (job.trigger_type !== triggerType
+            || job.silent !== params[5] || job.screenshots !== params[6]))) {
         throw new Error('Ключ задания уже используется с другими параметрами');
       }
       return { created: false, job };
@@ -143,6 +170,18 @@ export function createJobQueue(pool, { uuid = randomUUID, lease = DEFAULT_LEASE_
       return result.rows.length === 1;
     },
 
+    // Происхождение старого ожидания не угадывается по дате. Останавливаем
+    // только задание: исходную очередь аудио оператор сверит отдельно.
+    async markAudioOriginNeedsReview(id, token, reason) {
+      if (!validId(id) || !validId(token)) throw new TypeError('Некорректный идентификатор аренды');
+      if (!['audio_origin_missing', 'audio_origin_mismatch'].includes(reason)) throw new TypeError('Некорректная причина сверки');
+      const result = await pool.query(`UPDATE public.lost_processing_jobs
+        SET status='needs_review', lease_token=NULL, lease_until=NULL, last_error=$3, updated_at=now()
+        WHERE id=$1 AND lease_token=$2 AND status='processing' AND lease_until>clock_timestamp() RETURNING id`,
+      [id, token, reason]);
+      return result.rows.length === 1;
+    },
+
     // Устаревшая проверка аудио завершается, не изменяя актуальную очередь аудио.
     async finishObsoleteAudioCheck(id, token) {
       if (!validId(id) || !validId(token)) throw new TypeError('Некорректный идентификатор аренды');
@@ -178,8 +217,9 @@ export function createJobQueue(pool, { uuid = randomUUID, lease = DEFAULT_LEASE_
     },
 
     // Обработчик подтвердил по истории Битрикса уже другой переход в отказ.
-    async finishObsoleteTransition(id, token) {
+    async finishObsoleteTransition(id, token, audioHistoryId = null) {
       if (!validId(id) || !validId(token)) throw new TypeError('Некорректный идентификатор аренды');
+      if (audioHistoryId !== null && (typeof audioHistoryId !== 'string' || !/^[1-9]\d{0,29}$/.test(audioHistoryId))) throw new TypeError('Некорректный ID ожидания');
       const result = await pool.query(`
         WITH obsolete AS (
           UPDATE public.lost_processing_jobs
@@ -189,13 +229,13 @@ export function createJobQueue(pool, { uuid = randomUUID, lease = DEFAULT_LEASE_
         ), cancelled AS (
           UPDATE public.lost_audio_wait w SET state='cancelled', lease_until=NULL, updated_at=now()
           FROM obsolete o
-          WHERE o.trigger_type='audio_wait' AND w.deal_id=o.deal_id AND w.lose_date=o.lose_date
+          WHERE o.trigger_type='audio_wait' AND w.deal_id=o.deal_id AND w.lose_date=o.lose_date AND w.origin_stage_history_id=$3
             AND w.state='waiting' AND o.request_key = 'audio-wait:' || w.deal_id::text || ':' ||
               (extract(epoch from w.lose_date) * 1000000)::bigint::text || ':' ||
               (extract(epoch from w.next_check_at) * 1000000)::bigint::text
           RETURNING w.deal_id
         )
-        SELECT id FROM obsolete`, [id, token]);
+        SELECT id FROM obsolete`, [id, token, audioHistoryId]);
       return result.rows.length === 1;
     },
   };

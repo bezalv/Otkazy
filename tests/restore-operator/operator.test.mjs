@@ -8,7 +8,7 @@ import { resolve } from 'node:path';
 import { reviewSummary, summarizeDiscovery } from '../../app/src/operator/report.mjs';
 import { databaseConfig, runTriage } from '../../app/src/operator/triage.mjs';
 
-function poolFor({ visible = true, row = { total: '3', both_unknown: '0', comment_unknown: '1', notification_unknown: '2', other: '0' } } = {}) {
+function poolFor({ visible = true, row = { total: '3', both_unknown: '0', comment_unknown: '1', notification_unknown: '2', other: '0', audio_origin: '0' } } = {}) {
   const queries = [];
   let released = false;
   return { queries, get released() { return released; }, async connect() { return {
@@ -24,7 +24,7 @@ function poolFor({ visible = true, row = { total: '3', both_unknown: '0', commen
 test('агрегат needs_review из проверенной видимой таблицы, транзакция только на чтение', async () => {
   const pool = poolFor();
   const result = await reviewSummary(pool);
-  assert.deepEqual(result, { total: 3, comment_unknown: 1, notification_unknown: 2, both_unknown: 0, other: 0 });
+  assert.deepEqual(result, { total: 3, comment_unknown: 1, notification_unknown: 2, both_unknown: 0, other: 0, audio_origin: 0 });
   assert.match(pool.queries[1], /REPEATABLE READ READ ONLY/);
   assert.equal(pool.queries.at(-1), 'COMMIT');
   assert.equal(pool.released, true);
@@ -36,18 +36,19 @@ test('SQL агрегата исполняется на изолированно�
   const { PGlite } = await import(pathToFileURL(pglite).href);
   const db = new PGlite();
   t.after(() => db.close());
-  await db.exec(`CREATE TABLE public.lost_processing_jobs (status text, comment_state text, notify_state text);
+  await db.exec(`CREATE TABLE public.lost_processing_jobs (status text, comment_state text, notify_state text, last_error text);
     INSERT INTO public.lost_processing_jobs VALUES
-      ('needs_review', 'unknown', 'pending'), ('needs_review', 'ok', 'unknown'),
-      ('needs_review', 'unknown', 'unknown'), ('needs_review', 'ok', 'ok'),
-      ('done', 'unknown', 'unknown');`);
+      ('needs_review', 'unknown', 'pending', null), ('needs_review', 'ok', 'unknown', null),
+      ('needs_review', 'unknown', 'unknown', null), ('needs_review', 'ok', 'ok', null),
+      ('needs_review', 'pending', 'pending', 'audio_origin_missing'),
+      ('done', 'unknown', 'unknown', null);`);
   const pool = { async connect() { return { query: (sql, args) => db.query(sql, args), release() {} }; } };
-  assert.deepEqual(await reviewSummary(pool), { total: 4, comment_unknown: 1, notification_unknown: 1, both_unknown: 1, other: 1 });
-  assert.equal((await db.query('SELECT count(*)::integer AS n FROM public.lost_processing_jobs')).rows[0].n, 5);
+  assert.deepEqual(await reviewSummary(pool), { total: 5, comment_unknown: 1, notification_unknown: 1, both_unknown: 1, other: 1, audio_origin: 1 });
+  assert.equal((await db.query('SELECT count(*)::integer AS n FROM public.lost_processing_jobs')).rows[0].n, 6);
 });
 
 test('RLS, отсутствующая таблица и некорректные агрегаты не становятся нулевым отчётом', async () => {
-  for (const pool of [poolFor({ visible: false }), poolFor({ row: { total: '9', both_unknown: '0', comment_unknown: '1', notification_unknown: '2', other: '0' } })]) {
+  for (const pool of [poolFor({ visible: false }), poolFor({ row: { total: '9', both_unknown: '0', comment_unknown: '1', notification_unknown: '2', other: '0', audio_origin: '0' } })]) {
     await assert.rejects(reviewSummary(pool), /^Error: Не удалось получить отчёт о доставке$/);
     assert.equal(pool.queries.at(-1), 'ROLLBACK');
     assert.equal(pool.released, true);

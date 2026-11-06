@@ -27,6 +27,7 @@ const result = {
   comm_analytics: { calls_total: 1 }, screenshot_stats: {}, silent: true,
 };
 const audioWait = {
+  origin_stage_history_id: '101',
   lose_date: '2026-11-02T00:00:00Z', first_seen_at: '2026-11-02T00:01:00Z',
   deadline_at: '2026-11-03T00:01:00Z', next_check_at: '2026-11-02T00:06:00Z',
   pending_calls: ['12'], observations: { 12: { activity_id: '12' } },
@@ -38,6 +39,7 @@ test('реальный SQL в изолированной БД PGlite', { skip: !
   try {
     await db.exec(schema);
     await db.exec(migration);
+    await db.exec(readFileSync('supabase/migrations/20261106031734_lost_audio_wait_origins.sql', 'utf8'));
     await db.exec(readFileSync('supabase/migrations/20261105065551_lost_overwrite_history.sql', 'utf8'));
     const pool = {
       query(text, values) { return db.query(text, values); },

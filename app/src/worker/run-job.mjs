@@ -2,8 +2,9 @@ import { processDeal } from '../process-deal.mjs';
 
 // Входом служит только уже захваченное задание. Ошибки сохранения или потери
 // аренды не превращаются в результат сделки и оставляются очереди на восстановление.
-export function toPersistenceResult(job, outcome) {
-  const base = { deal_id: Number(job.deal_id), operation_id: job.id, lease_token: job.lease_token, silent: job.silent === true };
+export function toPersistenceResult(job, outcome, audioOriginHistoryId = null) {
+  const base = { deal_id: Number(job.deal_id), operation_id: job.id, lease_token: job.lease_token, silent: job.silent === true,
+    audio_origin_stage_history_id: audioOriginHistoryId };
   const collection = outcome?.collection || {};
   if (outcome?.status === 'processed') return {
     ...base, ...outcome.analysis, _status: 'processed', deal_data: outcome.dealData,
@@ -71,14 +72,42 @@ export async function runJob({ job, queue, store, loadAudioWait, delivery, proce
       }
       return { status: 'obsolete' };
     }
+    const eventKey = typeof job.request_key === 'string' && /^bitrix24:deal-stage-history:([1-9]\d{0,29})$/.exec(job.request_key);
+    const audioSameDate = audioWait && audioWait.lose_date != null
+      && new Date(audioWait.lose_date).getTime() === new Date(job.lose_date).getTime();
+    let audioHistoryId = null;
+    // Даже новый отказ позже старого не даёт права затереть незавершённое
+    // историческое ожидание, у которого неизвестен исходный переход.
+    if (audioWait?.state === 'waiting' && (typeof audioWait.origin_stage_history_id !== 'string'
+      || !/^[1-9]\d{0,29}$/.test(audioWait.origin_stage_history_id))) {
+      await checkLease();
+      if (typeof queue.markAudioOriginNeedsReview !== 'function'
+        || !await queue.markAudioOriginNeedsReview(job.id, job.lease_token, 'audio_origin_missing')) throw new Error('Не удалось отметить необходимость сверки аудио');
+      return { status: 'needs_review', reason: 'audio_origin_missing' };
+    }
+    if (audioSameDate && ['waiting', 'done', 'expired', 'cancelled'].includes(audioWait.state)) {
+      const id = audioWait.origin_stage_history_id;
+      const reason = typeof id !== 'string' || !/^[1-9]\d{0,29}$/.test(id) ? 'audio_origin_missing'
+        : eventKey && eventKey[1] !== id ? 'audio_origin_mismatch' : null;
+      if (reason) {
+        await checkLease();
+        if (typeof queue.markAudioOriginNeedsReview !== 'function'
+          || !await queue.markAudioOriginNeedsReview(job.id, job.lease_token, reason)) throw new Error('Не удалось отметить необходимость сверки аудио');
+        return { status: 'needs_review', reason };
+      }
+      audioHistoryId = id;
+    }
     let outcome;
     try {
+      if ((['live', 'backfill'].includes(job.trigger_type) || String(job.request_key || '').startsWith('bitrix24:deal-stage-history:')) && !eventKey) {
+        throw new Error('Некорректный ключ перехода');
+      }
       // Ручной и ночной повторы должны видеть поздно появившиеся записи,
       // даже если предыдущий цикл ожидания уже завершён. Старую очередь при
       // этом не открываем повторно и её прежний срок не продлеваем.
       const recheckTerminalAudio = ['manual', 'nightly'].includes(job.trigger_type)
         && audioWait && ['done', 'expired', 'cancelled'].includes(audioWait.state);
-      outcome = await process({ ...processOptions, dealId: Number(job.deal_id), expectedLoseDate: job.lose_date,
+      outcome = await process({ ...processOptions, dealId: Number(job.deal_id), expectedLoseDate: job.lose_date, expectedHistoryId: eventKey ? eventKey[1] : audioHistoryId,
         silent: job.silent === true, screenshots: job.screenshots === true,
         savedAudioWait: recheckTerminalAudio ? { ...audioWait, _recheck_terminal: true } : audioWait });
     } catch {
@@ -88,12 +117,12 @@ export async function runJob({ job, queue, store, loadAudioWait, delivery, proce
     await checkLease();
     if (outcome?.status === 'obsolete_transition') {
       if (typeof queue.finishObsoleteTransition !== 'function'
-        || !await queue.finishObsoleteTransition(job.id, job.lease_token)) {
+        || !await queue.finishObsoleteTransition(job.id, job.lease_token, audioHistoryId)) {
         throw new Error('Не удалось завершить устаревший переход');
       }
       return { status: 'obsolete' };
     }
-    const result = toPersistenceResult(job, outcome);
+    const result = toPersistenceResult(job, outcome, audioHistoryId);
     const stored = await store.persistResult(result);
     if (!stored.needsExternalActions) return { status: stored.status, analysisId: stored.analysisId || null,
       ...(outcome?.audioWait?.reason === 'audio_wait_terminal_recordings_missing'

@@ -60,6 +60,8 @@ test('ошибочная конфигурация не создаёт пул, с
   }), error => /BITRIX_EVENT_TOKEN/.test(error.message) && !error.message.includes('fixture-polza'));
   assert.equal(resources, 0);
   assert.throws(() => readMainConfig({ ...valid, TZ: 'Asia/Novosibirsk' }), /TZ/);
+  assert.throws(() => readMainConfig({ ...valid, LIVE_ENABLED_AT: '2026-11-05T00:00:00.000500Z' }), /LIVE_ENABLED_AT/);
+  assert.doesNotThrow(() => readMainConfig({ ...valid, LIVE_ENABLED_AT: '2026-11-05T00:00:00.000000Z' }));
   assert.throws(() => readMainConfig({ ...valid, DATABASE_URL: valid.DATABASE_URL.replace('sslmode=require', 'sslmode=disable') }), /DATABASE_URL/);
   assert.throws(() => readMainConfig({ ...valid, BITRIX_DOMAIN: 'other.bitrix24.ru' }), /BITRIX_REST_BASE/);
   assert.throws(() => readMainConfig({ ...valid, DATABASE_URL: 'postgresql://user:password@aws-0-us.pooler.supabase.com:6543/db' }), /5432/);
