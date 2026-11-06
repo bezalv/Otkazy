@@ -58,6 +58,24 @@ test('ошибка или неизвестное происхождение ос
   assert.equal(JSON.stringify(result).includes('PRIVATE-CONTENT'), false);
 });
 
+test('исключение анализа даёт закрытый корректный агрегат без текста исключения', async () => {
+  const result = await runPilotCommand({ ids: ['1'], env,
+    async makePool() { return { on() {}, async connect() {}, async end() {} }; },
+    async readBaselines() { return { audio_wait_enabled_at: '2026-01-01T00:00:00Z', baselines: [{ deal_id: 1 }] }; },
+    async readPrompts() { return {}; }, async startService() { return { async close() {} }; },
+    makeDependencies() { return { close() {} }; },
+    makeRunner() { return { async run() { throw new Error('PRIVATE-EXCEPTION'); } }; },
+  });
+  assert.equal(result.statuses.error, 1);
+  assert.equal(result.attempted, 1);
+  assert.equal(result.verdict.unavailable, 1);
+  assert.equal(result.reason_class.unavailable, 1);
+  assert.equal(result.exact_facts.unavailable, 1);
+  assert.equal(result.diagnostics.categories.processing_exception, 1);
+  assert.equal(result.service_closed, true);
+  assert.equal(JSON.stringify(result).includes('PRIVATE'), false);
+});
+
 test('ресурс STT закрывается, даже если закрытие адаптеров завершилось ошибкой', async () => {
   let stopped = false;
   await assert.rejects(runPilotCommand({ ids: ['1'], env,
@@ -69,6 +87,77 @@ test('ресурс STT закрывается, даже если закрыти�
     makeRunner() { return { async run() { return { status: 'processed' }; } }; },
   }), /закрытия/);
   assert.equal(stopped, true);
+});
+
+test('дедлайн отменяет зависшую обработку и подтверждает закрытие STT только после close', async () => {
+  const events = [];
+  const output = await runPilotCommand({ ids: ['1'], env, deadlineMs: 35, closeGraceMs: 200,
+    async makePool() { return { on() {}, async connect() {}, async end() { events.push('db_closed'); } }; },
+    async readBaselines() { return { audio_wait_enabled_at: '2026-01-01T00:00:00Z', baselines: [{ deal_id: 1 }] }; },
+    async readPrompts() { return {}; },
+    async startService({ signal }) { assert.equal(signal.aborted, false); return { async close() { events.push('stt_closed'); } }; },
+    makeDependencies({ signal }) { assert.equal(signal.aborted, false); return { close() { events.push('deps_closed'); } }; },
+    makeRunner({ signal }) { return { run() { return new Promise((_, reject) => {
+      signal.addEventListener('abort', () => { events.push('network_aborted'); reject(new Error('aborted')); }, { once: true });
+    }); } }; },
+  });
+  assert.equal(output.status, 'deadline');
+  assert.equal(output.service_closed, true);
+  assert.deepEqual(events, ['db_closed', 'network_aborted', 'deps_closed', 'stt_closed']);
+});
+
+test('дедлайн включает чтение эталонов и не запускает STT после отмены', async () => {
+  let sttStarted = false, poolClosed = false;
+  const output = await runPilotCommand({ ids: ['1'], env, deadlineMs: 25, closeGraceMs: 200,
+    async makePool() { return { on() {}, async connect() {}, async end() { poolClosed = true; } }; },
+    async readBaselines() { return new Promise(() => {}); },
+    async startService() { sttStarted = true; throw new Error('не должен запускаться'); },
+  });
+  assert.equal(output.status, 'deadline');
+  assert.equal(output.service_state, 'not_started');
+  assert.equal(Object.hasOwn(output, 'service_closed'), false);
+  assert.equal(sttStarted, false);
+  assert.equal(poolClosed, true);
+});
+
+test('отмена во время запуска STT не выдаёт неподтверждённый маркер', async () => {
+  let aborted = false;
+  const output = await runPilotCommand({ ids: ['1'], env, deadlineMs: 30, closeGraceMs: 200,
+    async makePool() { return { on() {}, async connect() {}, async end() {} }; },
+    async readBaselines() { return { audio_wait_enabled_at: '2026-01-01T00:00:00Z', baselines: [{ deal_id: 1 }] }; },
+    async readPrompts() { return {}; },
+    async startService({ signal }) { return new Promise((_, reject) => signal.addEventListener('abort', () => {
+      aborted = true; reject(new Error('aborted'));
+    }, { once: true })); },
+  });
+  assert.equal(aborted, true);
+  assert.equal(output.status, 'deadline');
+  assert.equal(output.service_state, 'startup_not_confirmed');
+  assert.equal(Object.hasOwn(output, 'service_closed'), false);
+});
+
+test('ошибка или зависание close не дают ложного маркера закрытого STT', async () => {
+  for (const close of [async () => { throw new Error('группа ffmpeg ещё работает'); }, async () => new Promise(() => {})]) {
+    await assert.rejects(runPilotCommand({ ids: ['1'], env, deadlineMs: 100, closeGraceMs: 25,
+      async makePool() { return { on() {}, async connect() {}, async end() {} }; },
+      async readBaselines() { return { audio_wait_enabled_at: '2026-01-01T00:00:00Z', baselines: [{ deal_id: 1 }] }; },
+      async readPrompts() { return {}; }, async startService() { return { close }; },
+      makeDependencies() { return { close() {} }; },
+      makeRunner() { return { async run() { return { status: 'processed' }; } }; },
+    }), error => error.code === 'PILOT_CLEANUP_UNKNOWN');
+  }
+});
+
+test('непрекратившийся анализ не объявляется безопасно завершённым даже после закрытия STT', async () => {
+  let closed = false;
+  await assert.rejects(runPilotCommand({ ids: ['1'], env, deadlineMs: 30, closeGraceMs: 25,
+    async makePool() { return { on() {}, async connect() {}, async end() {} }; },
+    async readBaselines() { return { audio_wait_enabled_at: '2026-01-01T00:00:00Z', baselines: [{ deal_id: 1 }] }; },
+    async readPrompts() { return {}; }, async startService() { return { async close() { closed = true; } }; },
+    makeDependencies() { return { close() {} }; },
+    makeRunner() { return { async run() { return new Promise(() => {}); } }; },
+  }), error => error.code === 'PILOT_CLEANUP_UNKNOWN');
+  assert.equal(closed, true);
 });
 
 test('агрегатор отвергает подставленные строки и допускает только безопасную диагностику', async () => {

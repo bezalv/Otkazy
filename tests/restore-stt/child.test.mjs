@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, rmdir, unlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, relative } from 'node:path';
 import { buildSttEnv, cleanupStaleAudio, startSttService } from '../../app/src/stt/child.mjs';
@@ -32,6 +32,77 @@ test('локальный резервный сервис стартует с о�
   assert.equal(await service.healthy(), false);
   await assert.rejects(fetch(`${service.address}/health`));
   await assert.rejects(readFile(join(service.tempRoot, 'recording')), { code: 'ENOENT' });
+});
+
+test('уже отменённый сигнал не запускает STT', async () => {
+  const controller = new AbortController();
+  controller.abort();
+  await assert.rejects(startSttService({ polzaKey: 'test-only', signal: controller.signal }), { name: 'AbortError' });
+});
+
+test('отмена во время старта останавливает процесс до возврата ошибки', async () => {
+  const controller = new AbortController();
+  const originalFetch = globalThis.fetch;
+  let onRequest;
+  const requestSeen = new Promise(resolve => { onRequest = resolve; });
+  let address;
+  globalThis.fetch = (url, { signal } = {}) => new Promise((_, reject) => {
+    address = String(url);
+    onRequest();
+    const stop = () => reject(Object.assign(new Error('aborted'), { name: 'AbortError' }));
+    if (signal?.aborted) stop(); else signal?.addEventListener('abort', stop, { once: true });
+  });
+  try {
+    const startup = startSttService({ polzaKey: 'test-only', signal: controller.signal });
+    startup.catch(() => {});
+    await requestSeen;
+    controller.abort();
+    await assert.rejects(startup, { name: 'AbortError' });
+  } finally { globalThis.fetch = originalFetch; }
+  assert.match(address, /^http:\/\/127\.0\.0\.1:\d+\/health$/);
+  await assert.rejects(fetch(address));
+});
+
+test('отмена после старта разделяет один результат подтверждённого закрытия', async () => {
+  const controller = new AbortController();
+  const service = await startSttService({ polzaKey: 'test-only', signal: controller.signal });
+  controller.abort();
+  await Promise.all([service.close(), service.close()]);
+  assert.equal(await service.healthy(), false);
+  await assert.rejects(fetch(`${service.address}/health`));
+});
+
+test('на Linux закрытие проверяет отсутствие всей группы, а не только лидера', { skip: process.platform !== 'linux' }, async () => {
+  const service = await startSttService({ polzaKey: 'test-only' });
+  const run = join(service.tempRoot, '..');
+  const marker = JSON.parse(await readFile(join(run, '.owner.json'), 'utf8'));
+  const originalKill = process.kill;
+  let checked = false;
+  process.kill = function (pid, signal) {
+    if (pid === -marker.childPid && signal === 0) checked = true;
+    return originalKill.call(process, pid, signal);
+  };
+  try { await service.close(); } finally { process.kill = originalKill; }
+  assert.equal(checked, true);
+  assert.throws(() => process.kill(-marker.childPid, 0), error => error.code === 'ESRCH');
+});
+
+test('на Linux отсутствие подтверждения группы не выдаётся за успешное закрытие', { skip: process.platform !== 'linux' }, async () => {
+  const service = await startSttService({ polzaKey: 'test-only' });
+  const run = join(service.tempRoot, '..');
+  const marker = JSON.parse(await readFile(join(run, '.owner.json'), 'utf8'));
+  const originalKill = process.kill;
+  process.kill = function (pid, signal) {
+    if (pid === -marker.childPid && signal === 0) throw Object.assign(new Error('нельзя проверить'), { code: 'EPERM' });
+    return originalKill.call(process, pid, signal);
+  };
+  try { await assert.rejects(service.close(), /ещё работают/); } finally { process.kill = originalKill; }
+  // Тест сам удаляет пустой каталог только после настоящего подтверждения ESRCH.
+  assert.throws(() => process.kill(-marker.childPid, 0), error => error.code === 'ESRCH');
+  await rmdir(service.tempRoot);
+  await rmdir(join(run, 'service'));
+  await unlink(join(run, '.owner.json'));
+  await rmdir(run);
 });
 
 test('удаляются только старые каталоги без живого родителя и дочернего процесса', async () => {

@@ -1,5 +1,6 @@
 import { processDeal } from '../process-deal.mjs';
 import { diagnoseOutcome } from './diagnostics.mjs';
+import { setTimeout as delay } from 'node:timers/promises';
 
 // Методы перечислены явно: запрещённые вызовы не доходят даже до адаптера.
 const READ_METHODS = new Set([
@@ -63,7 +64,7 @@ export function compareWithBaseline(result, baseline) {
  * Адаптеры LLM/медиа должны быть доверенными; это не песочница для чужого кода.
  */
 export function createPilotRunner({ bitrix, llm, transcribe, downloadFile,
-  judgeSystemPrompt, writerSystemPrompt, clock = Date.now }) {
+  judgeSystemPrompt, writerSystemPrompt, clock = Date.now, signal }) {
   readonlyBitrix(bitrix); // Проверка зависимости до выполнения.
   if (!llm || typeof llm.complete !== 'function' || typeof transcribe !== 'function'
       || typeof downloadFile !== 'function' || typeof clock !== 'function'
@@ -72,6 +73,7 @@ export function createPilotRunner({ bitrix, llm, transcribe, downloadFile,
 
   return Object.freeze({
     async run({ dealId, baseline, screenshots = true }) {
+      signal?.throwIfAborted();
       const id = Number(dealId);
       if (!Number.isSafeInteger(id) || id <= 0 || !baseline || Number(baseline.deal_id) !== id
           || typeof screenshots !== 'boolean' || baseline.pipeline_error != null || !baseline.lose_date
@@ -106,9 +108,12 @@ export function createPilotRunner({ bitrix, llm, transcribe, downloadFile,
           savedAudioWait: terminal ? { ...saved, _recheck_terminal: true } : saved,
           silent: true, screenshots, clock, expectedLoseDate: baseline.lose_date,
           expectedHistoryId: sameDate ? saved.origin_stage_history_id : null,
+          ...(signal ? { wait: ms => delay(ms, undefined, { signal }) } : {}),
         });
+        signal?.throwIfAborted();
         return { ...compareWithBaseline(result, baseline), diagnostic: diagnoseOutcome(result, trace), screenshots_enabled: screenshots };
       } catch {
+        signal?.throwIfAborted();
         return { status: 'error', diagnostic: diagnoseOutcome({ status: 'exception' }),
           verdict: 'unavailable', reason_class: 'unavailable', facts: { previous_count: null, current_count: null, exact: 'unavailable' },
           screenshots_enabled: screenshots, limitations: ['manual_review_required'] };

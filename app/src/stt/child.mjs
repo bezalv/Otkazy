@@ -156,36 +156,63 @@ async function freePort() {
   return port;
 }
 
+function cancelled() {
+  const error = new Error('Запуск сервиса распознавания отменён');
+  error.name = 'AbortError';
+  error.code = 'STT_CANCELLED';
+  return error;
+}
+
 // Явный запуск: отдельно от импортирования приложения и только на loopback.
-export async function startSttService({ polzaKey, timeoutMs = 10000, env = process.env } = {}) {
+// При отмене после spawn close завершается только после проверки всей группы.
+export async function startSttService({ polzaKey, timeoutMs = 10000, env = process.env, signal } = {}) {
   if (typeof polzaKey !== 'string' || !polzaKey) throw new TypeError('Не задан ключ Polza');
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 100 || timeoutMs > 60000) throw new TypeError('Некорректный таймаут запуска');
+  if (signal != null && (typeof signal.aborted !== 'boolean' || typeof signal.addEventListener !== 'function'
+      || typeof signal.removeEventListener !== 'function')) throw new TypeError('Некорректный сигнал отмены');
+  const checkCancelled = () => { if (signal?.aborted) throw cancelled(); };
+  checkCancelled();
   const port = await freePort();
+  checkCancelled();
   const key = randomBytes(32).toString('hex');
   const address = `http://127.0.0.1:${port}`;
   await cleanupStaleAudio();
+  checkCancelled();
   const root = await tempRoot(tmpdir());
+  checkCancelled();
   const runName = `run-${randomBytes(16).toString('hex')}`;
   const run = directChild(root, runName);
   const workDir = directChild(run, 'service');
   const clientTempRoot = directChild(run, 'client');
   const marker = directChild(run, '.owner.json');
   const pidNamespace = await processNamespace();
+  checkCancelled();
   const isolatedProcessGroup = process.platform === 'linux';
   const createdAt = Date.now();
   await mkdir(run, { mode: 0o700 });
   try {
+    checkCancelled();
     await mkdir(workDir, { mode: 0o700 });
+    checkCancelled();
     await mkdir(clientTempRoot, { mode: 0o700 });
+    checkCancelled();
     await writeFile(marker, JSON.stringify({ version: 1, parentPid: process.pid, childPid: null, pidNamespace, isolatedProcessGroup, createdAt }), { flag: 'wx', mode: 0o600 });
+    checkCancelled();
   } catch (error) {
     await clearKnownRun(root, runName);
     throw error;
   }
-  const child = spawn(process.execPath, [fileURLToPath(new URL('./server.cjs', import.meta.url))], {
-    env: buildSttEnv({ env, port, key, polzaKey, workDir }),
-    stdio: 'ignore', windowsHide: true, detached: isolatedProcessGroup,
-  });
+  let child;
+  try {
+    checkCancelled();
+    child = spawn(process.execPath, [fileURLToPath(new URL('./server.cjs', import.meta.url))], {
+      env: buildSttEnv({ env, port, key, polzaKey, workDir }),
+      stdio: 'ignore', windowsHide: true, detached: isolatedProcessGroup,
+    });
+  } catch (error) {
+    await clearKnownRun(root, runName);
+    throw error;
+  }
   let failed = false;
   let stopping = false, unexpectedlyExited = false;
   child.once('error', () => { failed = true; });
@@ -193,15 +220,19 @@ export async function startSttService({ polzaKey, timeoutMs = 10000, env = proce
   async function healthy() {
     if (failed || child.exitCode !== null || child.signalCode !== null) return false;
     try {
-      const response = await fetch(`${address}/health`, { signal: AbortSignal.timeout(1000) });
+      const timeout = AbortSignal.timeout(1000);
+      const response = await fetch(`${address}/health`, { signal: signal ? AbortSignal.any([signal, timeout]) : timeout });
       const body = await response.json();
       return response.ok && body.ok === true && body.model === 'ai-sage/gigaam-v3'
         && !failed && child.exitCode === null && child.signalCode === null;
     } catch { return false; }
   }
   let closePromise;
+  let markerUpdate = Promise.resolve();
+  const onAbort = () => { close().catch(() => {}); };
   function close() {
     if (!closePromise) closePromise = (async () => {
+      signal?.removeEventListener('abort', onAbort);
       const wasRunning = child.exitCode === null && child.signalCode === null && !failed;
       stopping = true;
       if (child.exitCode === null && child.signalCode === null && !failed) {
@@ -219,19 +250,31 @@ export async function startSttService({ polzaKey, timeoutMs = 10000, env = proce
       // внезапном завершении не можем доказать отсутствие потомков.
       if (isolatedProcessGroup && child.pid && !processGroupIsDead(child.pid)) throw new Error('Процессы аудио ещё работают; временные файлы сохранены');
       if (!isolatedProcessGroup && (unexpectedlyExited || !wasRunning) && child.pid) throw new Error('Не подтверждена остановка потомков; временные файлы сохранены');
+      // Запись маркера и отмена могут пересечься; не удаляем каталог до её
+      // завершения, иначе поздняя запись оставила бы файл после очистки.
+      await markerUpdate.catch(() => {});
       if (!await clearKnownRun(root, runName)) throw new Error('Не удалось очистить временный каталог распознавания');
     })();
     return closePromise;
   }
+  signal?.addEventListener('abort', onAbort, { once: true });
   try {
-    await writeFile(marker, JSON.stringify({ version: 1, parentPid: process.pid, childPid: child.pid ?? null, pidNamespace, isolatedProcessGroup, createdAt }), { mode: 0o600 });
+    checkCancelled();
+    markerUpdate = writeFile(marker, JSON.stringify({ version: 1, parentPid: process.pid, childPid: child.pid ?? null, pidNamespace, isolatedProcessGroup, createdAt }), { mode: 0o600 });
+    await markerUpdate;
+    checkCancelled();
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
+      checkCancelled();
       if (failed || child.exitCode !== null || child.signalCode !== null) throw new Error('Сервис распознавания не запустился');
       try {
-        if (await healthy()) return { address, key, healthy, close, tempRoot: clientTempRoot };
+        if (await healthy()) {
+          checkCancelled();
+          return { address, key, healthy, close, tempRoot: clientTempRoot };
+        }
       } catch { /* локальный процесс ещё запускается */ }
-      await delay(50);
+      checkCancelled();
+      await delay(50, undefined, signal ? { signal } : undefined);
     }
     throw new Error('Сервис распознавания не ответил при запуске');
   } catch (error) {
