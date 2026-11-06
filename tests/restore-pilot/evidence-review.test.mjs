@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { constants, createDecipheriv, generateKeyPairSync, privateDecrypt } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
-import { reviewOne, runEvidenceReview, extractRedactedProofExcerpts, sealEvidenceReport } from '../../app/src/pilot/evidence-review.mjs';
+import { reviewOne, runEvidenceReview, extractRedactedProofExcerpts, sealEvidenceReport, inspectForSemanticReview } from '../../app/src/pilot/evidence-review.mjs';
 
 const fixture = () => ({
   facts: [
@@ -135,6 +135,7 @@ test('явная пара вызывает только изолированны
   assert.deepEqual(calls, ['crm.deal.get']);
   assert.equal(output.status, 'processed');
   assert.equal(output.detail.correctness, 'requires_manual_review');
+  assert.equal(Object.hasOwn(output.detail, 'inspection'), false);
   assert.equal(output.service_closed, true);
   assert.doesNotMatch(JSON.stringify(output), /PRIVATE-CONTENT|SECRET-REASON|1981|126402/);
 });
@@ -170,6 +171,7 @@ test('opt-in показывает лишь ограниченные выдерж
       return { status: 'processed', analysis: { multi_agent_analysis: { ...j, verdict: 'правомерен', closure_reason_class: 'price', facts_packet: fixture() } } }; },
   });
   const selected = result.detail.selected_excerpts.current;
+  assert.equal(result.detail.inspection.current.available, true);
   assert.equal(selected.available, true);
   assert.ok(selected.excerpts.length > 0 && selected.excerpts.length <= 3);
   assert.match(selected.reason, /\[почта\]/);
@@ -178,6 +180,60 @@ test('opt-in показывает лишь ограниченные выдерж
   assert.equal(selected.shown_facts_count, selected.excerpts.length);
   assert.ok(selected.referenced_facts_count >= selected.shown_facts_count);
   assert.doesNotMatch(JSON.stringify(result), /x@example.com/);
+});
+
+test('absence без ссылок: разнообразный нецитированный контекст не объявляется доказательством', () => {
+  const facts = [
+    { fact_id: 'f001', source: 'call_transcript', actor: 'client', ts: '2026-11-01T07:00:00Z', content: 'Да' },
+    { fact_id: 'f002', source: 'call_transcript', actor: 'unknown', ts: '2026-11-01T09:00:00Z', content: 'Моно запись' },
+    { fact_id: 'f003', source: 'call_event', actor: 'system', ts: '2026-11-01T07:00:00Z', content: 'Автоответчик' },
+    { fact_id: 'f004', source: 'crm_comment', actor: 'manager', ts: '2026-11-01T07:00:00Z', content: 'Запись менеджера' },
+    { fact_id: 'f005', source: 'chat', actor: 'client', content: null },
+  ];
+  const j = { manager_mistakes: [], key_signals: [], risk_factors: [{ factor: 'нет данных', proof_type: 'absence', proof_fact_ids: [] }] };
+  const report = inspectForSemanticReview({ judge: j, facts, transitionLoseDate: '2026-11-01T08:00:00Z' });
+  assert.equal(report.available, true);
+  assert.equal(report.context.total, 4);
+  assert.equal(report.context.shown, 3);
+  assert.equal(report.context.omitted, 1);
+  assert.equal(report.context.missing_content, 1);
+  assert.deepEqual(report.context.items.map(item => item.actor), ['client', 'unknown', 'system']);
+  assert.deepEqual(report.context.items.map(item => item.time_relation), ['before_or_at_lose', 'after_lose', 'before_or_at_lose']);
+  assert.ok(report.context.items.every(item => item.kind === 'unreferenced_context'));
+  assert.ok(report.context.limitations.includes('unreferenced_context_not_proof'));
+  assert.equal(report.mismatches.total, 0);
+});
+
+test('структурное расхождение: текст пункта связан с его фактом, ролью, типом и предупреждением', () => {
+  const facts = [
+    { fact_id: 'f001', source: 'crm_comment', actor: 'manager', ts: '2026-11-01T07:00:00Z', content: 'CRM: клиент указал x@example.com' },
+    { fact_id: 'f002', source: 'call_transcript', actor: 'unknown', ts: '2026-11-01T09:00:00Z', content: 'Моно' },
+    { fact_id: 'f003', source: 'chat', actor: 'client', ts: '2026-11-01T07:00:00Z', content: 'Речь клиента' },
+    { fact_id: 'f004', source: 'call_transcript', actor: 'manager', content: null },
+    { fact_id: 'f005', source: 'screenshot_chat', actor: 'client', ts: '2026-11-01T09:00:00Z', ts_precision: 'day', content: 'Скриншот' },
+  ];
+  const j = { manager_mistakes: [{ mistake: 'Клиент сообщил: +7 999 123-45-67', proof_type: 'client_statement', proof_fact_ids: ['f001', 'f002', 'f004', 'f999'] }],
+    key_signals: [{ signal: 'Несоответствие', proof_type: 'crm_comment', proof_fact_ids: ['f003'] }],
+    risk_factors: [{ factor: 'Цифра', proof_type: 'metric', proof_fact_ids: ['f005'] }] };
+  const report = inspectForSemanticReview({ judge: j, facts, transitionLoseDate: '2026-11-01T08:00:00Z' });
+  assert.equal(report.mismatches.total, 4);
+  assert.equal(report.mismatches.detected, 5);
+  assert.equal(report.mismatches.shown, 3);
+  assert.equal(report.mismatches.omitted, 1);
+  assert.equal(report.mismatches.missing_fact, 1);
+  assert.equal(report.mismatches.missing_content, 1);
+  assert.deepEqual(report.mismatches.items.map(item => item.reason), ['wrong_actor_or_source', 'unknown_speaker', 'wrong_actor_or_source']);
+  assert.equal(report.mismatches.items[0].source, 'crm_comment');
+  assert.equal(report.mismatches.items[0].actor, 'manager');
+  assert.match(report.mismatches.items[0].claim, /\[номер\]/);
+  assert.match(report.mismatches.items[0].excerpt, /\[почта\]/);
+  assert.ok(report.mismatches.limitations.includes('mismatch_is_structural_not_verdict'));
+  const screenshot = inspectForSemanticReview({ judge: { manager_mistakes: [], key_signals: [], risk_factors: [j.risk_factors[0]] },
+    facts, transitionLoseDate: '2026-11-01T08:00:00Z' });
+  assert.equal(screenshot.mismatches.items[0].reason, 'incompatible_reference');
+  assert.equal(screenshot.mismatches.items[0].time_relation, 'unknown');
+  assert.equal(inspectForSemanticReview({ judge: j, facts: [...facts, facts[0]] }).available, false);
+  assert.doesNotMatch(JSON.stringify(report), /999 123|x@example.com|f001|f999/);
 });
 
 test('sealed: RSA-OAEP-SHA256 и AES-256-GCM восстанавливают данные, без plaintext и без marker при ошибке', () => {

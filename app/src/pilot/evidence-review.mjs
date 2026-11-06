@@ -233,6 +233,76 @@ function selectedEvidence(judge, facts) {
     limitations: ['redaction_may_leave_names_addresses_or_unknown_secrets', 'excerpts_are_partial_and_require_manual_review', 'verdict_proof_not_guaranteed'] };
 }
 
+/** Выбор контекста и спорных ссылок только для ручной содержательной проверки. */
+export function inspectForSemanticReview({ judge, facts, transitionLoseDate } = {}) {
+  const unavailable = { available: false, context: null, mismatches: null };
+  if (!judge || typeof judge !== 'object' || Array.isArray(judge) || !Array.isArray(facts) || facts.length > MAX_ITEMS
+      || GROUPS.some(group => !Array.isArray(judge[group]) || judge[group].length > MAX_ITEMS)) return unavailable;
+  const factById = new Map();
+  for (const fact of facts) {
+    if (!fact || typeof fact !== 'object' || Array.isArray(fact) || typeof fact.fact_id !== 'string'
+        || !/^f\d{1,8}$/i.test(fact.fact_id) || factById.has(fact.fact_id)) return unavailable;
+    factById.set(fact.fact_id, fact);
+  }
+  const loseDate = exactMillisTimestamp(transitionLoseDate);
+  const relation = fact => {
+    if (fact.source === 'screenshot_chat' && fact.ts_precision !== 'exact') return 'unknown';
+    const time = exactMillisTimestamp(fact.ts);
+    return !loseDate || !time ? 'unknown' : time.getTime() > loseDate.getTime() ? 'after_lose' : 'before_or_at_lose';
+  };
+  const usable = fact => typeof fact?.content === 'string' && fact.content.trim().length > 0 && fact.content.length <= 500000;
+  const referenced = new Set();
+  const conflicts = [];
+  let refs = 0, missingFact = 0, missingContent = 0;
+  const claimFields = { manager_mistakes: 'mistake', key_signals: 'signal', risk_factors: 'factor' };
+  for (const group of GROUPS) for (const item of judge[group]) {
+    if (!item || typeof item !== 'object' || Array.isArray(item) || !Array.isArray(item.proof_fact_ids)
+        || item.proof_fact_ids.length > MAX_ITEMS) return unavailable;
+    const type = bucket(item.proof_type, [...TYPES, 'other']);
+    for (const id of item.proof_fact_ids) {
+      if (++refs > MAX_ITEMS || typeof id !== 'string' || !id || id.length > 256) return unavailable;
+      if (id.startsWith('metric:')) continue;
+      referenced.add(id);
+      const fact = factById.get(id);
+      if (!fact) { missingFact++; continue; }
+      let reason = null;
+      if (type === 'client_statement' || type === 'manager_statement') {
+        if (fact.actor === 'unknown' && CLIENT_SOURCES.has(fact.source)) reason = 'unknown_speaker';
+        else if (fact.actor !== (type === 'client_statement' ? 'client' : 'manager') || !CLIENT_SOURCES.has(fact.source)) reason = 'wrong_actor_or_source';
+      } else if (type === 'crm_comment' && fact.source !== 'crm_comment') reason = 'wrong_actor_or_source';
+      else if (type === 'metric') reason = 'incompatible_reference';
+      if (!reason) continue;
+      if (!usable(fact)) { missingContent++; continue; }
+      const value = item[claimFields[group]];
+      conflicts.push({ group, proof_type: type, reason,
+        claim: typeof value === 'string' && value.length <= 500000 ? redactText(value) : null,
+        source: bucket(fact.source, SOURCES), actor: bucket(fact.actor, ACTORS),
+        time_relation: relation(fact), excerpt: redactText(fact.content) });
+    }
+  }
+  const available = [...factById.values()].filter(fact => !referenced.has(fact.fact_id));
+  const contextMissing = available.filter(fact => !usable(fact)).length;
+  const candidates = available.filter(usable);
+  const chosen = [];
+  for (const wanted of [fact => fact.actor === 'client' && CLIENT_SOURCES.has(fact.source),
+    fact => fact.actor === 'unknown' && CLIENT_SOURCES.has(fact.source), fact => fact.source === 'call_event']) {
+    const found = candidates.find(fact => wanted(fact) && !chosen.includes(fact));
+    if (found) chosen.push(found);
+  }
+  for (const fact of candidates) if (chosen.length < 3 && !chosen.includes(fact)) chosen.push(fact);
+  const contextItems = chosen.map(fact => ({ kind: 'unreferenced_context', source: bucket(fact.source, SOURCES),
+    actor: bucket(fact.actor, ACTORS), time_relation: relation(fact), excerpt: redactText(fact.content) }));
+  const mismatchItems = conflicts.slice(0, 3);
+  return { available: true,
+    context: { total: candidates.length, shown: contextItems.length, omitted: candidates.length - contextItems.length,
+      missing_content: contextMissing, items: contextItems,
+      limitations: ['unreferenced_context_not_proof', 'time_is_recorded_timestamp_not_event_time', 'redaction_may_leave_names_addresses_or_unknown_secrets'] },
+    mismatches: { detected: conflicts.length + missingContent, total: conflicts.length, shown: mismatchItems.length, omitted: conflicts.length - mismatchItems.length,
+      missing_fact: missingFact, missing_content: missingContent, items: mismatchItems,
+      limitations: ['mismatch_is_structural_not_verdict', 'claim_may_not_establish_verdict',
+        'time_is_recorded_timestamp_not_event_time', 'redaction_may_leave_names_addresses_or_unknown_secrets'] } };
+}
+
 function parsePublicKey(encoded) {
   if (typeof encoded !== 'string' || encoded.length < 100 || encoded.length > 8192
       || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(encoded)) throw new TypeError('Некорректный открытый ключ');
@@ -314,6 +384,10 @@ export async function runEvidenceReview({ dealId, analysisId, includeExcerpts = 
         if (includeExcerpts) detail.selected_excerpts = {
           previous: selectedEvidence(previousJudge, baseline.ai_facts_json?.facts),
           current: selectedEvidence(current, current?.facts_packet?.facts),
+        };
+        if (includeExcerpts) detail.inspection = {
+          previous: inspectForSemanticReview({ judge: previousJudge, facts: baseline.ai_facts_json?.facts, transitionLoseDate: baseline.lose_date }),
+          current: inspectForSemanticReview({ judge: current, facts: current?.facts_packet?.facts, transitionLoseDate: baseline.lose_date }),
         };
       }
       return { ...compareWithBaseline(result, baseline), diagnostic: diagnoseOutcome(result), composition: describeComposition(result, baseline) };
