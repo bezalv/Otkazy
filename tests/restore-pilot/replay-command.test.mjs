@@ -1,10 +1,10 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { runSavedReplayCommand } from '../../app/src/pilot/replay-command.mjs';
+import { createSavedReplayClient, runSavedReplayCommand } from '../../app/src/pilot/replay-command.mjs';
 
 const env = Object.freeze({ DATABASE_URL: 'postgresql://u:PRIVATE-PASSWORD@localhost:5432/test', POLZA_API_KEY: 'PRIVATE-POLZA-KEY' });
 const packet = { facts: [{ fact_id: 'F1', source: 'chat', actor: 'client', content: 'PRIVATE-FACT' }], metrics: {}, deal_card: {} };
-const baseline = { deal_id: 42, ai_verdict: 'неправомерен', ai_reason_class: 'manager_dropped', ai_facts_json: packet,
+const baseline = { deal_id: 42, analysis_id: '2021', ai_verdict: 'неправомерен', ai_reason_class: 'manager_dropped', ai_facts_json: packet,
   processed_at: '2026-11-01T08:04:41.827Z', ai_judge_json: { PRIVATE: 'PRIVATE-JUDGE' }, private: 'PRIVATE-BASELINE' };
 const modelResult = { scope: 'saved_facts_only', status: 'processed',
   verdict: { previous: 'неправомерен', current: 'правомерен', comparison: 'different' },
@@ -14,7 +14,7 @@ const modelResult = { scope: 'saved_facts_only', status: 'processed',
 
 function stub(overrides = {}) {
   const events = [];
-  const args = { id: '42', env,
+  const args = { id: '42', analysisId: '2021', env,
     async makePool() { events.push('pool_created'); return { on() {}, async connect() { throw new Error('NO-NETWORK'); },
       async end() { events.push('pool_closed'); } }; },
     async readBaselines(_pool, { dealIds }) { assert.deepEqual(dealIds, [42]); events.push('baseline_read'); return { baselines: [baseline] }; },
@@ -64,6 +64,48 @@ test('ошибочный эталон не запускает модель и с
   assert.equal(result.resources_closed, true);
   assert.ok(events.includes('pool_closed'));
   assert.equal(events.includes('model_called'), false);
+});
+
+test('сменившийся ID эталонного разбора не запускает модель', async () => {
+  const { args, events } = stub({ async readBaselines() { return { baselines: [{ ...baseline, analysis_id: '2022' }] }; } });
+  const result = await runSavedReplayCommand(args);
+  assert.equal(result.status, 'error');
+  assert.equal(result.resources_closed, true);
+  assert.ok(events.includes('pool_closed'));
+  assert.equal(events.includes('model_called'), false);
+});
+
+test('некорректный ID эталона не открывает БД', async () => {
+  for (const analysisId of [undefined, '', '0', '01', '2021,2', '9223372036854775808', 2021]) {
+    let touched = false;
+    await assert.rejects(runSavedReplayCommand(stub({ analysisId, async makePool() { touched = true; } }).args));
+    assert.equal(touched, false);
+  }
+});
+
+test('поток HTTP-ошибки Polza закрывается перед повтором', async () => {
+  const signal = new AbortController().signal;
+  let requests = 0, cancelled = 0, unknown = 0;
+  const client = createSavedReplayClient({ apiKey: 'mock', signal, wait: async () => {},
+    onCleanupUnknown() { unknown++; },
+    async fetchImpl() { requests++; return { ok: false, status: 429, body: { async cancel() { cancelled++; } } }; },
+  });
+  await assert.rejects(client.complete({}));
+  assert.equal(requests, 2);
+  assert.equal(cancelled, 2);
+  assert.equal(unknown, 0);
+});
+
+test('ошибка закрытия тела Polza не выдаёт marker закрытых ресурсов', async () => {
+  const { args } = stub({
+    makeClient({ apiKey, signal, onCleanupUnknown }) {
+      return createSavedReplayClient({ apiKey, signal, onCleanupUnknown, wait: async () => {},
+        async fetchImpl() { return { ok: false, status: 500, body: { async cancel() { throw new Error('PRIVATE-ERROR'); } } }; } });
+    },
+    async replay({ client }) { await client.complete({}).catch(() => {}); return modelResult; },
+  });
+  await assert.rejects(runSavedReplayCommand(args), error => error?.code === 'REPLAY_CLEANUP_UNKNOWN'
+    && !String(error.message).includes('PRIVATE'));
 });
 
 test('сырой текст исключения БД не попадает наружу; пул закрывается', async () => {

@@ -34,12 +34,27 @@ async function confirmedClose(action, graceMs) {
   finally { clearTimeout(timer); }
 }
 
-function defaultClient({ apiKey, signal }) {
-  const guardedFetch = (url, options = {}) => {
-    signal.throwIfAborted();
-    return fetch(url, { ...options, signal: options.signal ? AbortSignal.any([signal, options.signal]) : signal });
+export function createSavedReplayClient({ apiKey, signal, fetchImpl = fetch, onCleanupUnknown = () => {},
+  wait = ms => delay(ms, undefined, { signal }) }) {
+  const cancelBody = async response => {
+    try { await response.body?.cancel?.(); }
+    catch { onCleanupUnknown(); }
   };
-  return createPolzaClient({ apiKey, fetchImpl: guardedFetch, wait: ms => delay(ms, undefined, { signal }) });
+  const guardedFetch = async (url, options = {}) => {
+    signal.throwIfAborted();
+    const response = await fetchImpl(url, { ...options, signal: options.signal ? AbortSignal.any([signal, options.signal]) : signal });
+    if (!response.ok) {
+      // Общий клиент Polza на ошибочном HTTP не читает тело. До перехода к
+      // повтору явно останавливаем поток и учитываем неподтверждённое закрытие.
+      await cancelBody(response);
+      return response;
+    }
+    return { ok: response.ok, status: response.status, async json() {
+      try { return await response.json(); }
+      catch (error) { await cancelBody(response); throw error; }
+    } };
+  };
+  return createPolzaClient({ apiKey, fetchImpl: guardedFetch, wait });
 }
 
 function resultValue(value, allowed) { return allowed.has(value) ? value : null; }
@@ -57,20 +72,23 @@ function safeResult(result) {
 }
 
 /** Одна сделка, сохранённые факты, только READ ONLY и явные запросы модели. */
-export async function runSavedReplayCommand({ id, env = process.env,
+export async function runSavedReplayCommand({ id, analysisId, env = process.env,
   makePool = async config => { const { default: pg } = await import('pg'); return new pg.Pool(config); },
-  readBaselines = loadPilotBaselines, makeClient = defaultClient, replay = replaySavedFacts,
+  readBaselines = loadPilotBaselines, makeClient = createSavedReplayClient, replay = replaySavedFacts,
   readPrompts = async () => ({ judgeSystemPrompt: await readFile(new URL('../../prompts/judge.md', import.meta.url), 'utf8'),
     writerSystemPrompt: await readFile(new URL('../../prompts/writer.md', import.meta.url), 'utf8') }),
   deadlineMs = 420000, closeGraceMs = 30000,
 } = {}) {
   if (typeof id !== 'string' || !/^[1-9]\d{0,9}$/.test(id) || BigInt(id) > 2147483647n) throw new TypeError('Укажите одну корректную сделку');
+  if (typeof analysisId !== 'string' || !/^[1-9]\d{0,18}$/.test(analysisId) || BigInt(analysisId) > 9223372036854775807n) {
+    throw new TypeError('Укажите один корректный ID эталонного разбора');
+  }
   if (!Number.isSafeInteger(deadlineMs) || deadlineMs < 10 || deadlineMs > 480000
       || !Number.isSafeInteger(closeGraceMs) || closeGraceMs < 10 || closeGraceMs > 30000) throw new TypeError('Некорректный срок');
   if (typeof env?.POLZA_API_KEY !== 'string' || !env.POLZA_API_KEY.trim()) throw new Error('Не задан ключ модели');
   const controller = new AbortController(), signal = controller.signal;
   const timer = setTimeout(() => controller.abort(deadlineError()), deadlineMs);
-  let pool, dbTask, replayTask, promptTask, expired = false, failed = false, output;
+  let pool, dbTask, replayTask, promptTask, expired = false, failed = false, modelCleanupUnknown = false, output;
   try {
     const config = databaseConfig(env);
     const opening = Promise.resolve().then(() => makePool(config));
@@ -84,7 +102,8 @@ export async function runSavedReplayCommand({ id, env = process.env,
     pool = createDeadlinePool(raw, { initializationSignal: signal });
     dbTask = Promise.resolve().then(() => readBaselines(pool, { dealIds: [Number(id)] }));
     const data = await waitAbortable(dbTask, signal);
-    if (!data || !Array.isArray(data.baselines) || data.baselines.length !== 1 || Number(data.baselines[0].deal_id) !== Number(id)) {
+    if (!data || !Array.isArray(data.baselines) || data.baselines.length !== 1 || Number(data.baselines[0].deal_id) !== Number(id)
+        || String(data.baselines[0].analysis_id) !== analysisId) {
       throw new Error('Эталон не подтверждён');
     }
     const closing = pool;
@@ -96,7 +115,7 @@ export async function runSavedReplayCommand({ id, env = process.env,
     const baseline = data.baselines[0];
     const at = new Date(baseline.processed_at).getTime();
     if (!Number.isFinite(at) || !VERDICTS.has(baseline.ai_verdict)) throw new Error('Эталон не подтверждён');
-    const client = makeClient({ apiKey: env.POLZA_API_KEY, signal });
+    const client = makeClient({ apiKey: env.POLZA_API_KEY, signal, onCleanupUnknown() { modelCleanupUnknown = true; } });
     replayTask = Promise.resolve().then(() => replay({ packet: baseline.ai_facts_json,
       golden: { judge: { verdict: baseline.ai_verdict, closure_reason_class: baseline.ai_reason_class } },
       judgeSystemPrompt: prompts.judgeSystemPrompt, writerSystemPrompt: prompts.writerSystemPrompt, client, now: at }));
@@ -111,6 +130,7 @@ export async function runSavedReplayCommand({ id, env = process.env,
       if (pool) await confirmedClose(async () => { if (dbTask) await dbTask.catch(() => {}); await pool.end(); }, closeGraceMs);
       if (signal.aborted && promptTask) await confirmedClose(() => promptTask.catch(() => {}), closeGraceMs);
       if (signal.aborted && replayTask) await confirmedClose(() => replayTask.catch(() => {}), closeGraceMs);
+      if (modelCleanupUnknown) throw cleanupError();
     } finally { clearTimeout(timer); }
   }
   return expired || failed ? { status: expired ? 'deadline' : 'error', resources_closed: true, limitations: [...LIMITATIONS] }
@@ -118,11 +138,11 @@ export async function runSavedReplayCommand({ id, env = process.env,
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  if (process.argv.length !== 3) {
-    console.error('Укажите одну сделку');
+  if (process.argv.length !== 4) {
+    console.error('Укажите одну сделку и один ID эталонного разбора');
     process.exitCode = 1;
   } else {
-    runSavedReplayCommand({ id: process.argv[2] }).then(result => console.log(JSON.stringify(result))).catch(error => {
+    runSavedReplayCommand({ id: process.argv[2], analysisId: process.argv[3] }).then(result => console.log(JSON.stringify(result))).catch(error => {
       console.error(error?.code === 'REPLAY_CLEANUP_UNKNOWN' ? 'Завершение ресурсов не подтверждено' : 'Сравнение не выполнено');
       process.exitCode = 1;
     });
