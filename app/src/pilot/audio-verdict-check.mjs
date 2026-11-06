@@ -19,7 +19,7 @@ const MAX_JSON = 3 * 1024 * 1024;
 const MAX_CLIP = 4 * 1024 * 1024;
 const CLIP_RANGES = new Map([['126554:1660320', new Set(['0:30', '30:60', '60:90', '90:109'])],
   ['126956:1665898', new Set(['0:30', '30:60', '60:83'])]]);
-const MP3_CLIP_RANGES = new Map([['126554:1660320', new Set(['80:95', '95:109'])],
+const MP3_CLIP_RANGES = new Map([['126554:1660320', new Set(['0:20', '20:40', '40:60', '60:80', '80:95', '95:109'])],
   ['126956:1665898', new Set(['60:72', '72:83'])]]);
 const HTTP_CODES = new Set([400, 401, 403, 404, 408, 413, 415, 422, 429, 500, 502, 503, 504]);
 const SAFE_ERRORS = new Set(['model_unavailable', 'audio_unavailable', 'unsupported_format', 'audio_clip_failed', 'bitrix_error', 'deadline', 'unexpected_error',

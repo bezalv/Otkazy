@@ -61,8 +61,8 @@ function longTones(seconds, channels = 2) {
   return b;
 }
 
-test('четыре коротких MP3 сохраняют каналы и смещение, длительность проверена по фреймам', async () => {
-  const original = longTones(109), cases = [[80,95],[95,109],[60,72],[72,83]];
+test('восемь коротких MP3 сохраняют каналы и смещение, длительность проверена по фреймам', async () => {
+  const original = longTones(109), cases = [[0,20],[20,40],[40,60],[60,80],[80,95],[95,109],[60,72],[72,83]];
   for (const [start, end] of cases) {
     const output = await clipAudio(original, { start_seconds: start, end_seconds: end, signal: signal(), format: 'mp3' });
     const meta = mp3ClipMetadata(output);
@@ -94,6 +94,7 @@ test('MP3-клипы ограничены точными парами и диа�
     ['96621','1454929',{start_seconds:80,end_seconds:95}],
     ['126554','1660320',{start_seconds:60,end_seconds:72}],
     ['126956','1665898',{start_seconds:80,end_seconds:95}],
+    ['126956','1665898',{start_seconds:0,end_seconds:20}],
     ['126554','1660320',{start_seconds:80,end_seconds:94}],
   ]) await assert.rejects(() => inspectOneAudio({ dealId, activityId, clip, clipFormat: 'mp3', model, apiKey: 'secret', ...h, signal: signal() }));
   assert.equal(h.requests.length, 0);
