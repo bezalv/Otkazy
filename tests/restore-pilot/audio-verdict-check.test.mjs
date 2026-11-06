@@ -1,8 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { inspectOneAudio, runAudioCommand, chooseAudioModel, audioMetadata } from '../../app/src/pilot/audio-verdict-check.mjs';
+import { inspectOneAudio, runAudioCommand, chooseAudioModel, audioMetadata, clipAudio } from '../../app/src/pilot/audio-verdict-check.mjs';
 
 const model = 'xiaomi/mimo-v2.6-flash';
 const signal = () => new AbortController().signal;
@@ -12,11 +12,11 @@ function wav() {
   b.writeUInt32LE(16000, 28); b.writeUInt16LE(2, 32); b.writeUInt16LE(16, 34); b.write('data', 36); b.writeUInt32LE(4, 40);
   return b;
 }
-function harness({ owner = '96621', available = true, redirect = null, recording = wav(), selectedModel = model } = {}) {
+function harness({ owner = '96621', activityId = '1454929', available = true, redirect = null, recording = wav(), selectedModel = model } = {}) {
   const requests = [], methods = [];
   const client = { async request(method, body) {
     methods.push({ method, body });
-    if (method === 'crm.activity.get') return { result: { ID: '1454929', OWNER_ID: owner, OWNER_TYPE_ID: 2, TYPE_ID: 2,
+    if (method === 'crm.activity.get') return { result: { ID: activityId, OWNER_ID: owner, OWNER_TYPE_ID: 2, TYPE_ID: 2,
       FILES: [{ urlDownload: '/download?fileId=42' }] } };
     if (method === 'disk.file.get') return { result: { DOWNLOAD_URL: 'https://dinalnsk.bitrix24.ru/download/42' } };
     throw new Error('unexpected method');
@@ -38,6 +38,69 @@ test('разрешает только подтверждённые точные 
   assert.throws(() => chooseAudioModel({ data: [{ id: model, architecture: { input_modalities: ['text'] } }] }, model));
   assert.throws(() => chooseAudioModel({ data: [{ id: 'another', input_modalities: ['audio'] }] }, 'another'));
   assert.throws(() => chooseAudioModel({ data: [] }, model));
+});
+
+function longWav(seconds, channels = 2) {
+  const rate = 8000, bytes = seconds * rate * channels * 2, b = Buffer.alloc(44 + bytes);
+  b.write('RIFF'); b.writeUInt32LE(36 + bytes, 4); b.write('WAVE', 8); b.write('fmt ', 12); b.writeUInt32LE(16, 16);
+  b.writeUInt16LE(1, 20); b.writeUInt16LE(channels, 22); b.writeUInt32LE(rate, 24); b.writeUInt32LE(rate * channels * 2, 28);
+  b.writeUInt16LE(channels * 2, 32); b.writeUInt16LE(16, 34); b.write('data', 36); b.writeUInt32LE(bytes, 40);
+  for (let second = 0; second < seconds; second++) for (let frame = 0; frame < rate; frame++) for (let channel = 0; channel < channels; channel++) {
+    b.writeInt16LE((second + 1) * 100, 44 + ((second * rate + frame) * channels + channel) * 2);
+  }
+  return b;
+}
+
+test('семь разрешённых сегментов создаются ffmpeg в памяти с сохранением каналов и правильным смещением', async () => {
+  const original = longWav(109), cases = [[0,30],[30,60],[60,90],[90,109],[0,30],[30,60],[60,83]];
+  for (const [start, end] of cases) {
+    const output = await clipAudio(original, { start_seconds: start, end_seconds: end, signal: signal() });
+    const meta = audioMetadata(output);
+    assert.equal(meta.channels, 2); assert.equal(meta.sample_rate, 16000);
+    assert.ok(Math.abs(meta.duration_seconds - (end - start)) < 0.05);
+    let at = 12;
+    while (output.toString('ascii', at, at + 4) !== 'data') { const n = output.readUInt32LE(at + 4); at += 8 + n + (n & 1); }
+    const sample = output.readInt16LE(at + 8 + 16000 * 2 * 2);
+    assert.ok(Math.abs(sample - (start + 2) * 100) < 10, `wrong offset ${start}`);
+  }
+});
+
+test('клипы доступны только закреплённым диапазонам двух звонков до любых запросов', async () => {
+  const h = harness();
+  for (const [dealId, activityId, clip] of [
+    ['96621','1454929',{start_seconds:0,end_seconds:30}],
+    ['126554','1660320',{start_seconds:60,end_seconds:83}],
+    ['126956','1665898',{start_seconds:90,end_seconds:109}],
+    ['126554','1660320',{start_seconds:1,end_seconds:30}],
+  ]) {
+    await assert.rejects(() => inspectOneAudio({ dealId, activityId, clip, model, apiKey: 'secret', ...h, signal: signal() }));
+  }
+  assert.equal(h.requests.length, 0);
+});
+
+test('отмена завершает процесс ffmpeg до отклонения и не оставляет открытых ресурсов', async () => {
+  const controller = new AbortController(); let closed = false;
+  const spawnImpl = (_executable, _args, options) => {
+    const child = spawn(process.execPath, ['-e', 'process.stdin.resume();setInterval(()=>{},1000)'], options);
+    child.once('close', () => { closed = true; }); return child;
+  };
+  const work = clipAudio(wav(), { start_seconds: 0, end_seconds: 30, signal: controller.signal, spawnImpl });
+  setTimeout(() => controller.abort(), 30);
+  await assert.rejects(work); assert.equal(closed, true);
+});
+
+test('в клип отправляются только байты нарезки и сохраняется смещение оригинала', async () => {
+  const recording = longWav(109);
+  const h = harness({ owner: '126554', activityId: '1660320', recording });
+  const report = await inspectOneAudio({ dealId: '126554', activityId: '1660320', model, apiKey: 'secret', ...h,
+    clip: { start_seconds: 30, end_seconds: 60 }, signal: signal() });
+  assert.equal(report.clip.offset_seconds, 30);
+  assert.equal(report.clip.audio_metadata.channels, 2);
+  const posted = JSON.parse(h.requests.find(x => x.u.endsWith('/chat/completions')).options.body);
+  const input = posted.messages[0].content.find(x => x.type === 'input_audio');
+  assert.notEqual(input.input_audio.data, recording.toString('base64'));
+  assert.equal(audioMetadata(Buffer.from(input.input_audio.data, 'base64')).duration_seconds, 30);
+  assert.match(posted.messages[0].content[0].text, /фрагмент с 30 по 60 секунду/);
 });
 
 test('распознаёт параметры WAV, отвергает неподдерживаемый и повреждённый файл', () => {
@@ -111,4 +174,13 @@ test('таймаут останавливает запрос и закрывае
     closeLimiter: () => { closed++; }, deadlineMs: 20 });
   assert.deepEqual(report, { status: 'error', phase: 'model_check', error_code: 'deadline', resources_closed: true, service_closed: true });
   assert.equal(closed, 1); assert.doesNotMatch(JSON.stringify(report), /secret/);
+});
+
+test('если завершение нарезки не подтверждено за grace, маркер закрытия не выдаётся', async () => {
+  const h = harness({ owner: '126554', activityId: '1660320' });
+  const clipper = async () => new Promise(resolve => setTimeout(() => resolve(wav()), 150));
+  await assert.rejects(() => runAudioCommand({ dealId: '126554', activityId: '1660320', model, apiKey: 'secret', ...h,
+    clip: { start_seconds: 0, end_seconds: 30 }, clipper, closeLimiter: () => {}, deadlineMs: 20, closeGraceMs: 20 }),
+  error => error?.code === 'AUDIO_CLEANUP_UNKNOWN');
+  assert.equal(h.requests.some(x => x.u.endsWith('/chat/completions')), false);
 });
