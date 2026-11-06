@@ -8,6 +8,7 @@ import { loadPilotBaselines } from './candidates.mjs';
 import { createPilotDependencies } from './dependencies.mjs';
 import { createPilotRunner } from './index.mjs';
 import { DIAGNOSTIC_CATEGORIES, DIAGNOSTIC_METHODS, DIAGNOSTIC_SOURCES, DIAGNOSTIC_MEDIA } from './diagnostics.mjs';
+import { describeComposition, emptyComposition, addComposition } from './composition.mjs';
 
 const STATUSES = new Set(['processed', 'waiting', 'skip', 'skipped', 'skipped_by_reason', 'blocked',
   'error', 'obsolete_transition', 'source_incomplete', 'unverified']);
@@ -122,6 +123,7 @@ export async function runPilotCommand({ ids, env = process.env,
     const runner = makeRunner({ ...deps, ...prompts, signal });
     output = { selected: selected.length, attempted: 0, statuses: {}, verdict: counts(),
       reason_class: counts(), exact_facts: counts(), screenshots_enabled: true,
+      composition: emptyComposition(),
       diagnostics: { categories: namedCounts(DIAGNOSTIC_CATEGORIES), last_bitrix_methods: namedCounts(DIAGNOSTIC_METHODS),
         failed_sources: namedCounts(DIAGNOSTIC_SOURCES), recognition_failures: namedCounts(DIAGNOSTIC_MEDIA), http_statuses: {} },
       limitations: ['legacy_origin_unverified', 'current_card_may_have_changed', 'historical_inputs_may_have_changed', 'historical_transition_not_verified',
@@ -138,10 +140,12 @@ export async function runPilotCommand({ ids, env = process.env,
       catch (error) { if (signal.aborted) throw error;
         output.statuses.error = (output.statuses.error || 0) + 1; output.attempted++;
         addDiagnostic(output.diagnostics, { category: 'processing_exception' });
+        addComposition(output.composition, describeComposition(null, baseline));
         output.verdict.unavailable++; output.reason_class.unavailable++; output.exact_facts.unavailable++;
         break; }
       output.attempted++;
       addDiagnostic(output.diagnostics, result?.diagnostic);
+      addComposition(output.composition, result?.composition);
       const status = STATUSES.has(result?.status) ? result.status : 'other';
       output.statuses[status] = (output.statuses[status] || 0) + 1;
       for (const [field, value] of [['verdict', result?.verdict], ['reason_class', result?.reason_class], ['exact_facts', result?.facts?.exact]]) {

@@ -37,6 +37,9 @@ test('пилот закрывает пул до аудио, обрабатыва
   assert.equal(output.statuses.processed, 2);
   assert.ok(output.limitations.includes('legacy_origin_unverified'));
   assert.ok(output.limitations.includes('current_card_may_have_changed'));
+  assert.equal(output.composition.verdicts.previous.unavailable, 2);
+  assert.equal(output.composition.verdicts.current.unavailable, 2);
+  assert.equal(output.composition.facts.previous.available, 0);
   assert.equal(JSON.stringify(output).includes('PRIVATE'), false);
 });
 
@@ -73,6 +76,8 @@ test('исключение анализа даёт закрытый коррек
   assert.equal(result.exact_facts.unavailable, 1);
   assert.equal(result.diagnostics.categories.processing_exception, 1);
   assert.equal(result.service_closed, true);
+  assert.equal(result.composition.verdicts.previous.unavailable, 1);
+  assert.equal(result.composition.verdicts.current.unavailable, 1);
   assert.equal(JSON.stringify(result).includes('PRIVATE'), false);
 });
 

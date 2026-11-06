@@ -1,5 +1,6 @@
 import { processDeal } from '../process-deal.mjs';
 import { diagnoseOutcome } from './diagnostics.mjs';
+import { describeComposition } from './composition.mjs';
 import { setTimeout as delay } from 'node:timers/promises';
 
 // Методы перечислены явно: запрещённые вызовы не доходят даже до адаптера.
@@ -84,7 +85,8 @@ export function createPilotRunner({ bitrix, llm, transcribe, downloadFile,
       // Историческое ожидание без ID невозможно надёжно связать с переходом.
       if ((saved?.state === 'waiting' || (terminal && sameDate)) && (typeof saved.origin_stage_history_id !== 'string'
           || !/^[1-9]\d{0,29}$/.test(saved.origin_stage_history_id))) {
-        return { status: 'unverified', reason: 'audio_origin_missing', diagnostic: diagnoseOutcome({ status: 'unverified' }), limitations: ['manual_review_required'] };
+        return { status: 'unverified', reason: 'audio_origin_missing', diagnostic: diagnoseOutcome({ status: 'unverified' }),
+          composition: describeComposition(null, baseline), limitations: ['manual_review_required'] };
       }
       const trace = { lastMethod: null, httpStatus: null };
       const reader = readonlyBitrix({ request(method, body, options) {
@@ -111,11 +113,13 @@ export function createPilotRunner({ bitrix, llm, transcribe, downloadFile,
           ...(signal ? { wait: ms => delay(ms, undefined, { signal }) } : {}),
         });
         signal?.throwIfAborted();
-        return { ...compareWithBaseline(result, baseline), diagnostic: diagnoseOutcome(result, trace), screenshots_enabled: screenshots };
+        return { ...compareWithBaseline(result, baseline), diagnostic: diagnoseOutcome(result, trace),
+          composition: describeComposition(result, baseline), screenshots_enabled: screenshots };
       } catch {
         signal?.throwIfAborted();
         return { status: 'error', diagnostic: diagnoseOutcome({ status: 'exception' }),
           verdict: 'unavailable', reason_class: 'unavailable', facts: { previous_count: null, current_count: null, exact: 'unavailable' },
+          composition: describeComposition(null, baseline),
           screenshots_enabled: screenshots, limitations: ['manual_review_required'] };
       }
     },
