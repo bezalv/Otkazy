@@ -2,7 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { inspectOneAudio, runAudioCommand, chooseAudioModel, audioMetadata, clipAudio } from '../../app/src/pilot/audio-verdict-check.mjs';
+import { inspectOneAudio, runAudioCommand, chooseAudioModel, audioMetadata, mp3ClipMetadata, clipAudio } from '../../app/src/pilot/audio-verdict-check.mjs';
+import { resolveBinary } from '../../app/src/stt/binaries.mjs';
 
 const model = 'xiaomi/mimo-v2.6-flash';
 const signal = () => new AbortController().signal;
@@ -50,6 +51,89 @@ function longWav(seconds, channels = 2) {
   }
   return b;
 }
+
+function longTones(seconds, channels = 2) {
+  const b = longWav(seconds, channels), rate = 8000;
+  for (let second = 0; second < seconds; second++) for (let frame = 0; frame < rate; frame++) for (let channel = 0; channel < channels; channel++) {
+    const frequency = 250 + second * 4 + channel * 90;
+    b.writeInt16LE(Math.round(9000 * Math.sin(2 * Math.PI * frequency * frame / rate)), 44 + ((second * rate + frame) * channels + channel) * 2);
+  }
+  return b;
+}
+
+test('четыре коротких MP3 сохраняют каналы и смещение, длительность проверена по фреймам', async () => {
+  const original = longTones(109), cases = [[80,95],[95,109],[60,72],[72,83]];
+  for (const [start, end] of cases) {
+    const output = await clipAudio(original, { start_seconds: start, end_seconds: end, signal: signal(), format: 'mp3' });
+    const meta = mp3ClipMetadata(output);
+    assert.equal(meta.channels, 2); assert.equal(meta.sample_rate, 16000);
+    assert.ok(Math.abs(meta.duration_seconds - (end - start)) < 0.15);
+    const decoded = spawnSync(resolveBinary('ffmpeg'), ['-hide_banner','-loglevel','error','-i','pipe:0','-f','s16le','-acodec','pcm_s16le','pipe:1'],
+      { input: output, maxBuffer: 4 * 1024 * 1024 });
+    assert.equal(decoded.status, 0);
+    // Вторая секунда относится к start + 1; разная частота каналов также
+    // обнаружит ошибочное смешивание стерео при перекодировании.
+    for (let channel = 0; channel < 2; channel++) {
+      let up = 0, previous = 0;
+      for (let n = 16000 + 3200; n < 16000 + 11200; n++) {
+        const current = decoded.stdout.readInt16LE((n * 2 + channel) * 2);
+        if (previous <= 0 && current > 0) up++;
+        previous = current;
+      }
+      assert.ok(Math.abs(up * 2 - (250 + (start + 1) * 4 + channel * 90)) < 5, `wrong frequency/offset ${start} channel ${channel}`);
+    }
+  }
+  const mono = await clipAudio(longTones(109, 1), { start_seconds: 80, end_seconds: 95, signal: signal(), format: 'mp3' });
+  assert.equal(mp3ClipMetadata(mono).channels, 1);
+  assert.throws(() => mp3ClipMetadata(mono.subarray(0, mono.length - 10)));
+});
+
+test('MP3-клипы ограничены точными парами и диапазонами до сетевых запросов', async () => {
+  const h = harness();
+  for (const [dealId, activityId, clip] of [
+    ['96621','1454929',{start_seconds:80,end_seconds:95}],
+    ['126554','1660320',{start_seconds:60,end_seconds:72}],
+    ['126956','1665898',{start_seconds:80,end_seconds:95}],
+    ['126554','1660320',{start_seconds:80,end_seconds:94}],
+  ]) await assert.rejects(() => inspectOneAudio({ dealId, activityId, clip, clipFormat: 'mp3', model, apiKey: 'secret', ...h, signal: signal() }));
+  assert.equal(h.requests.length, 0);
+  await assert.rejects(() => inspectOneAudio({ dealId: '126554', activityId: '1660320', clipFormat: 'mp3', model, apiKey: 'secret', ...h, signal: signal() }));
+});
+
+test('отмена MP3-нарезки ожидает закрытия дочернего процесса', async () => {
+  const controller = new AbortController(); let closed = false;
+  const spawnImpl = (_executable, _args, options) => {
+    const child = spawn(process.execPath, ['-e', 'process.stdin.resume();setInterval(()=>{},1000)'], options);
+    child.once('close', () => { closed = true; }); return child;
+  };
+  const work = clipAudio(wav(), { start_seconds: 80, end_seconds: 95, signal: controller.signal, format: 'mp3', spawnImpl });
+  setTimeout(() => controller.abort(), 30);
+  await assert.rejects(work); assert.equal(closed, true);
+});
+
+test('Polza получает только заданный MP3-клип с правильным offset и метаданными', async () => {
+  const recording = longWav(109), h = harness({ owner: '126554', activityId: '1660320', recording });
+  const result = await inspectOneAudio({ dealId: '126554', activityId: '1660320', model, apiKey: 'secret', ...h,
+    clip: { start_seconds: 80, end_seconds: 95 }, clipFormat: 'mp3', signal: signal() });
+  assert.equal(result.clip.offset_seconds, 80); assert.equal(result.clip.audio_metadata.channels, 2);
+  assert.equal(result.clip.audio_metadata.format, 'mp3'); assert.ok(Math.abs(result.clip.audio_metadata.duration_seconds - 15) < 0.15);
+  const posted = JSON.parse(h.requests.find(x => x.u.endsWith('/chat/completions')).options.body);
+  const item = posted.messages[0].content.find(x => x.type === 'input_audio');
+  assert.equal(item.input_audio.format, 'mp3'); assert.equal(mp3ClipMetadata(Buffer.from(item.input_audio.data, 'base64')).channels, 2);
+  assert.match(posted.messages[0].content[0].text, /фрагмент с 80 по 95 секунду/);
+});
+
+test('MP3 неверной длительности или числа каналов не отправляется в Polza', async () => {
+  const stereo = longWav(109, 2), mono = longWav(109, 1);
+  const wrongLength = await clipAudio(stereo, { start_seconds: 60, end_seconds: 72, format: 'mp3', signal: signal() });
+  const wrongChannels = await clipAudio(mono, { start_seconds: 80, end_seconds: 95, format: 'mp3', signal: signal() });
+  for (const output of [wrongLength, wrongChannels]) {
+    const h = harness({ owner: '126554', activityId: '1660320', recording: stereo });
+    await assert.rejects(() => inspectOneAudio({ dealId:'126554', activityId:'1660320', model, apiKey:'secret', ...h,
+      clip: { start_seconds:80, end_seconds:95 }, clipFormat:'mp3', clipper: async () => Buffer.from(output), signal:signal() }));
+    assert.equal(h.requests.some(x => x.u.endsWith('/chat/completions')), false);
+  }
+});
 
 test('семь разрешённых сегментов создаются ffmpeg в памяти с сохранением каналов и правильным смещением', async () => {
   const original = longWav(109), cases = [[0,30],[30,60],[60,90],[90,109],[0,30],[30,60],[60,83]];

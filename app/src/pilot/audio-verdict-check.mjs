@@ -19,6 +19,8 @@ const MAX_JSON = 3 * 1024 * 1024;
 const MAX_CLIP = 4 * 1024 * 1024;
 const CLIP_RANGES = new Map([['126554:1660320', new Set(['0:30', '30:60', '60:90', '90:109'])],
   ['126956:1665898', new Set(['0:30', '30:60', '60:83'])]]);
+const MP3_CLIP_RANGES = new Map([['126554:1660320', new Set(['80:95', '95:109'])],
+  ['126956:1665898', new Set(['60:72', '72:83'])]]);
 const HTTP_CODES = new Set([400, 401, 403, 404, 408, 413, 415, 422, 429, 500, 502, 503, 504]);
 const SAFE_ERRORS = new Set(['model_unavailable', 'audio_unavailable', 'unsupported_format', 'audio_clip_failed', 'bitrix_error', 'deadline', 'unexpected_error',
   'polza_http_other', ...[...HTTP_CODES].map(x => `polza_http_${x}`)]);
@@ -41,11 +43,13 @@ function requirePair(deal, activity) {
   if (typeof deal !== 'string' || typeof activity !== 'string' || !PAIRS.get(deal)?.has(activity)) throw new Error('Пара не разрешена');
 }
 
-function requireClip(deal, activity, clip) {
+function requireClip(deal, activity, clip, clipFormat = 'wav') {
+  if (!['wav', 'mp3'].includes(clipFormat) || (clip == null && clipFormat !== 'wav')) throw new Error('Формат не разрешён');
   if (clip == null) return;
+  const ranges = clipFormat === 'mp3' ? MP3_CLIP_RANGES : CLIP_RANGES;
   if (!clip || typeof clip !== 'object' || Array.isArray(clip)
       || !Number.isInteger(clip.start_seconds) || !Number.isInteger(clip.end_seconds)
-      || Object.keys(clip).length !== 2 || !CLIP_RANGES.get(`${deal}:${activity}`)?.has(`${clip.start_seconds}:${clip.end_seconds}`)) throw new Error('Диапазон не разрешён');
+      || Object.keys(clip).length !== 2 || !ranges.get(`${deal}:${activity}`)?.has(`${clip.start_seconds}:${clip.end_seconds}`)) throw new Error('Диапазон не разрешён');
 }
 
 export function chooseAudioModel(payload, model) {
@@ -109,13 +113,41 @@ export function audioMetadata(buffer) {
   throw new Error('Поддерживаются только WAV и MP3');
 }
 
+// Проверяем каждый фрейм созданного нами MPEG-2 Layer III: продолжительность
+// включает небольшое дополнение кодека и не зависит от заголовка Xing.
+export function mp3ClipMetadata(buffer) {
+  if (!Buffer.isBuffer(buffer) || buffer.length < 44 || buffer.length > MAX_CLIP) throw new Error('MP3 недопустим');
+  let at = 0, frames = 0, channels = null;
+  if (buffer.toString('ascii', 0, 3) === 'ID3') {
+    if (buffer.length < 10 || [...buffer.subarray(6, 10)].some(n => n & 0x80)) throw new Error('ID3 повреждён');
+    at = 10 + ((buffer[6] << 21) | (buffer[7] << 14) | (buffer[8] << 7) | buffer[9]);
+  }
+  const bitrates = [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160];
+  while (at + 4 <= buffer.length) {
+    const h = buffer.readUInt32BE(at);
+    const sync = h >>> 21, version = (h >>> 19) & 3, layer = (h >>> 17) & 3;
+    const bitrate = bitrates[(h >>> 12) & 15], rateIndex = (h >>> 10) & 3;
+    const channelCount = ((h >>> 6) & 3) === 3 ? 1 : 2;
+    if (sync !== 0x7ff || version !== 2 || layer !== 1 || !bitrate || rateIndex !== 2
+        || (channels !== null && channels !== channelCount)) throw new Error('MP3 фрейм повреждён');
+    const length = Math.floor(72000 * bitrate / 16000) + ((h >>> 9) & 1);
+    if (at + length > buffer.length) throw new Error('MP3 усечён');
+    channels = channelCount; frames++; at += length;
+  }
+  if (!frames || at !== buffer.length) throw new Error('MP3 фреймы неполны');
+  return { format: 'mp3', bytes: buffer.length, channels, sample_rate: 16000, duration_seconds: frames * 576 / 16000 };
+}
+
 /** FFmpeg работает без shell и временных файлов; завершение процесса ожидается даже при отмене. */
-export async function clipAudio(buffer, { start_seconds, end_seconds, signal, spawnImpl = spawn, executable = resolveBinary('ffmpeg') }) {
-  if (![...CLIP_RANGES.values()].some(ranges => ranges.has(`${start_seconds}:${end_seconds}`))) throw new Error('Диапазон не разрешён');
+export async function clipAudio(buffer, { start_seconds, end_seconds, signal, format = 'wav', spawnImpl = spawn, executable = resolveBinary('ffmpeg') }) {
+  const formats = format === 'wav' ? CLIP_RANGES : format === 'mp3' ? MP3_CLIP_RANGES : null;
+  if (!formats || ![...formats.values()].some(ranges => ranges.has(`${start_seconds}:${end_seconds}`))) throw new Error('Диапазон не разрешён');
   if (!Buffer.isBuffer(buffer) || buffer.length < 44 || buffer.length > MAX_AUDIO || !signal || typeof spawnImpl !== 'function') throw new Error('Недопустимый фрагмент');
   signal.throwIfAborted();
   const args = ['-hide_banner', '-loglevel', 'error', '-i', 'pipe:0', '-ss', String(start_seconds), '-t', String(end_seconds - start_seconds),
-    '-map', '0:a:0', '-vn', '-ar', '16000', '-acodec', 'pcm_s16le', '-f', 'wav', 'pipe:1'];
+    '-map', '0:a:0', '-vn', '-ar', '16000', ...(format === 'wav'
+      ? ['-acodec', 'pcm_s16le', '-f', 'wav']
+      : ['-acodec', 'libmp3lame', '-b:a', '64k', '-write_xing', '0', '-f', 'mp3']), 'pipe:1'];
   const child = spawnImpl(executable, args, { stdio: ['pipe', 'pipe', 'ignore'], windowsHide: true, detached: false, shell: false });
   const chunks = [];
   let size = 0, failure = false, aborted = false;
@@ -137,6 +169,11 @@ export async function clipAudio(buffer, { start_seconds, end_seconds, signal, sp
       try {
         if (failure || aborted || signal.aborted || code !== 0 || size < 44) throw new Error('Фрагмент не создан');
         output = Buffer.concat(chunks, size);
+        if (format === 'mp3') {
+          const meta = mp3ClipMetadata(output), wanted = end_seconds - start_seconds;
+          if (meta.duration_seconds < wanted - 0.25 || meta.duration_seconds > wanted + 0.25) throw new Error('Длительность фрагмента не подтверждена');
+          cleanup(); resolveClip(output); return;
+        }
         if (output.toString('ascii', 0, 4) !== 'RIFF' || output.toString('ascii', 8, 12) !== 'WAVE') throw new Error('Не WAV');
         // Потоковый WAV может содержать неопределённые размеры 0xffffffff.
         if (output.readUInt32LE(4) === 0xffffffff) output.writeUInt32LE(output.length - 8, 4);
@@ -191,9 +228,9 @@ function activityFileId(activity) {
 }
 
 /** Анализирует выбранную запись напрямую, без использования сохранённой расшифровки. */
-export async function inspectOneAudio({ dealId, activityId, model, apiKey, client, fetchImpl = fetch, signal, onPhase = () => {}, clip = null, clipper = clipAudio }) {
+export async function inspectOneAudio({ dealId, activityId, model, apiKey, client, fetchImpl = fetch, signal, onPhase = () => {}, clip = null, clipFormat = 'wav', clipper = clipAudio }) {
   requirePair(dealId, activityId);
-  requireClip(dealId, activityId, clip);
+  requireClip(dealId, activityId, clip, clipFormat);
   if (!MODELS.has(model) || typeof apiKey !== 'string' || !apiKey || !client || typeof client.request !== 'function'
       || typeof fetchImpl !== 'function' || typeof onPhase !== 'function' || typeof clipper !== 'function' || !signal || typeof signal.throwIfAborted !== 'function') throw new Error('Параметры не подтверждены');
   const call = async (method, body) => {
@@ -227,11 +264,16 @@ export async function inspectOneAudio({ dealId, activityId, model, apiKey, clien
     const metadata = await safeStage(() => audioMetadata(bytes), 'unsupported_format');
     let input = bytes, inputMetadata = metadata;
     if (clip) {
+      if (clipFormat === 'mp3' && metadata.format === 'wav' && ![1, 2].includes(metadata.channels)) throw new SafeAudioError('unsupported_format');
       onPhase('audio_clip');
-      clipped = await safeStage(() => clipper(bytes, { ...clip, signal }), 'audio_clip_failed');
+      clipped = await safeStage(() => clipper(bytes, { ...clip, signal, format: clipFormat }), 'audio_clip_failed');
       if (!Buffer.isBuffer(clipped) || clipped.length > MAX_CLIP) throw new SafeAudioError('audio_clip_failed');
       input = clipped;
-      inputMetadata = await safeStage(() => audioMetadata(clipped), 'audio_clip_failed');
+      inputMetadata = await safeStage(() => clipFormat === 'mp3' ? mp3ClipMetadata(clipped) : audioMetadata(clipped), 'audio_clip_failed');
+      const wanted = clip.end_seconds - clip.start_seconds;
+      if (clipFormat === 'mp3' && (![1, 2].includes(inputMetadata.channels) || (metadata.channels != null && metadata.channels !== inputMetadata.channels)
+          || inputMetadata.sample_rate !== 16000 || inputMetadata.duration_seconds == null
+          || inputMetadata.duration_seconds < wanted - 0.25 || inputMetadata.duration_seconds > wanted + 0.25)) throw new SafeAudioError('audio_clip_failed');
     }
     signal.throwIfAborted();
     const body = { model, temperature: 0, messages: [{ role: 'user', content: [
@@ -255,13 +297,13 @@ export async function inspectOneAudio({ dealId, activityId, model, apiKey, clien
 }
 
 /** После завершения работы и закрытия limiter возвращает только ограниченный код ошибки. */
-export async function runAudioCommand({ dealId, activityId, model, apiKey, client, fetchImpl = fetch, closeLimiter, deadlineMs = 150000, closeGraceMs = 30000, clip = null, clipper = clipAudio }) {
+export async function runAudioCommand({ dealId, activityId, model, apiKey, client, fetchImpl = fetch, closeLimiter, deadlineMs = 150000, closeGraceMs = 30000, clip = null, clipFormat = 'wav', clipper = clipAudio }) {
   requirePair(dealId, activityId);
-  requireClip(dealId, activityId, clip);
+  requireClip(dealId, activityId, clip, clipFormat);
   if (!MODELS.has(model) || typeof closeLimiter !== 'function') throw new Error('Параметры не подтверждены');
   let phase = 'model_check';
   const result = await withAudioInspectionResources({ run: async signal => {
-    try { return await inspectOneAudio({ dealId, activityId, model, apiKey, client, fetchImpl, signal, clip, clipper, onPhase: next => { phase = next; } }); }
+    try { return await inspectOneAudio({ dealId, activityId, model, apiKey, client, fetchImpl, signal, clip, clipFormat, clipper, onPhase: next => { phase = next; } }); }
     catch (error) { return { audio_error: true, phase, error_code: signal.aborted ? 'deadline' : SAFE_ERRORS.has(error?.code) ? error.code : 'unexpected_error' }; }
   }, closeLimiter, closePool: async () => {}, deadlineMs, closeGraceMs });
   return result.status === 'error' ? { status: 'error', phase, error_code: 'deadline', resources_closed: true, service_closed: true }
@@ -272,13 +314,15 @@ export async function runAudioCommand({ dealId, activityId, model, apiKey, clien
 async function main() {
   const regular = process.argv.length === 7 && process.argv[5] === '--sealed';
   const sliced = process.argv.length === 10 && process.argv[5] === '--clip' && process.argv[8] === '--sealed';
-  if (!regular && !sliced) throw new Error('Требуется защищённый вывод');
+  const mp3Sliced = process.argv.length === 10 && process.argv[5] === '--mp3-clip' && process.argv[8] === '--sealed';
+  if (!regular && !sliced && !mp3Sliced) throw new Error('Требуется защищённый вывод');
   const [, , dealId, activityId, model] = process.argv;
-  const publicKey = process.argv[sliced ? 9 : 6];
-  const clip = sliced ? { start_seconds: Number(process.argv[6]), end_seconds: Number(process.argv[7]) } : null;
-  if (sliced && (String(clip.start_seconds) !== process.argv[6] || String(clip.end_seconds) !== process.argv[7])) throw new Error('Некорректный диапазон');
+  const publicKey = process.argv[sliced || mp3Sliced ? 9 : 6];
+  const clip = sliced || mp3Sliced ? { start_seconds: Number(process.argv[6]), end_seconds: Number(process.argv[7]) } : null;
+  const clipFormat = mp3Sliced ? 'mp3' : 'wav';
+  if (clip && (String(clip.start_seconds) !== process.argv[6] || String(clip.end_seconds) !== process.argv[7])) throw new Error('Некорректный диапазон');
   requirePair(dealId, activityId);
-  requireClip(dealId, activityId, clip);
+  requireClip(dealId, activityId, clip, clipFormat);
   if (!MODELS.has(model)) throw new Error('Модель не разрешена');
   // Проверяем ключ до любых сетевых запросов.
   sealEvidenceReport({ service_closed: true }, publicKey);
@@ -287,7 +331,7 @@ async function main() {
       || base.search || base.hash || !/^\/rest\/\d+\/[A-Za-z0-9]+\/?$/.test(base.pathname)) throw new Error('Адрес Битрикса запрещён');
   const limiter = createBitrixLimiter();
   const client = createBitrixClient({ baseUrl: base.toString(), limiter });
-  const report = await runAudioCommand({ dealId, activityId, model, apiKey: process.env.POLZA_API_KEY, client, clip, closeLimiter: () => limiter.close() });
+  const report = await runAudioCommand({ dealId, activityId, model, apiKey: process.env.POLZA_API_KEY, client, clip, clipFormat, closeLimiter: () => limiter.close() });
   console.log(JSON.stringify(sealEvidenceReport(report, publicKey)));
 }
 
