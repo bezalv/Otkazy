@@ -54,6 +54,8 @@ for (var j = 0; j < events.length; j++) {
     var authorLabel = '';
     if (d.author_name && d.role && d.role !== 'unknown') { authorLabel = ', ' + d.role + ': ' + d.author_name; }
     else if (d.author_name) { authorLabel = ', ' + d.author_name; }
+    if (d._role_source === 'semantic_inference' && d._has_audio !== true && d._has_files !== true
+        && d._has_audio_transcript !== true && !d.transcript) { authorLabel += ', предположительно, по контексту'; }
     line = '[' + dateStr + '] СООБЩЕНИЕ (' + ch + authorLabel + ')';
     if (d.text && d.text.length > 0) {
       var chatText = d.text;

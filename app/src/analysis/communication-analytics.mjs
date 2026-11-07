@@ -158,7 +158,19 @@ if (transcribedPct < 50 && callsWithAudio.length > 0) dataWarnings.push('Low tra
 if (callsPending > 0) dataWarnings.push(callsPending + ' calls pending');
 var unknownPct = chats.length > 0 ? Math.round(chatUnknown.length / chats.length * 100) : 0;
 if (unknownPct > 50 && chats.length > 0) dataWarnings.push(chatUnknown.length + '/' + chats.length + ' unknown author');
+// Роли, восстановленные моделью из смысла, — оценки, а не технически
+// подтверждённые участники. Метрики ниже, которые используют сторону, тоже
+// зависят от этих оценок. Обычные анализы не получают дополнительных полей.
+var semanticRoleCount = chats.filter(function(c) { return c.data._role_source === 'semantic_inference'; }).length;
+if (semanticRoleCount > 0) dataWarnings.push('Авторы ' + semanticRoleCount + ' сообщений оценены по контексту: метрики сторон являются предположительными');
 var analytics = { cutoff_at: new Date(cutoffTs).toISOString(), cutoff_source: cutoffSource, calls_no_conversation: callsNoConversation, calls_mono_recorded: callsMono, days_in_funnel_until_lose: daysInFunnel, calls_total: calls.length, calls_outgoing: callsOutgoing.length, calls_incoming: callsIncoming.length, calls_unanswered_outgoing: unansweredOutgoing.length, calls_unanswered_outgoing_pct: callsOutgoing.length > 0 ? Math.round(unansweredOutgoing.length / callsOutgoing.length * 100) : 0, calls_missed_incoming: missedIncoming.length, calls_meaningful: meaningfulCalls.length, calls_avg_duration_sec: avgMeaningfulDuration, calls_longest_duration_sec: longestDuration, calls_longest_date: longestCall ? formatDateRu(longestCall.ts) : null, calls_last_successful: lastSuccessfulCall ? formatDateRu(lastSuccessfulCall.ts) : null, calls_last_successful_days_before_lose: lastSuccessfulCall ? daysAgo(lastSuccessfulCall.ts) : null, calls_pending: callsPending, calls_incoming_pct: calls.length > 0 ? Math.round(callsIncoming.length / calls.length * 100) : 0, calls_max_unanswered_streak: maxUnansweredStreak, calls_max_missed_incoming_streak: maxMissedIncomingStreak, chats_total: chats.length, chats_manager: chatManager.length, chats_client: chatClient.length, chats_unknown: chatUnknown.length, chats_last_client_msg: lastClientChat ? formatDateRu(lastClientChat.ts) : null, chats_last_client_days_before_lose: lastClientChat ? daysAgo(lastClientChat.ts) : null, chats_last_manager_msg: lastManagerChat ? formatDateRu(lastManagerChat.ts) : null, chats_last_manager_days_before_lose: lastManagerChat ? daysAgo(lastManagerChat.ts) : null, chats_unanswered_by_manager: unansweredByManager, chats_unanswered_by_client: unansweredByClient, preferred_channel: preferredChannel, first_contact: firstContact ? formatDateRu(firstContact) : null, last_contact: lastContact ? formatDateRu(lastContact) : null, last_contact_days_before_lose: lastContact ? daysAgo(lastContact) : null, initiative_manager_pct: initiativeManagerPct, initiative_client_pct: initiativeClientPct, max_gap_days: maxGapDays, max_gap_who: maxGapWho, max_gap_period: maxGapStart && maxGapEnd ? formatDateRu(maxGapStart) + ' - ' + formatDateRu(maxGapEnd) : null, trend: trend, pause_cycles: pauseCycles, comments_count: comments.length, tasks_count: tasks.length, data_quality_transcribed_pct: transcribedPct, data_quality_unknown_author_pct: unknownPct, data_quality_warnings: dataWarnings };
+if (semanticRoleCount > 0) analytics.chat_role_inference = {
+  source: 'semantic_inference', count: semanticRoleCount,
+  affected_metrics: ['chats_manager', 'chats_client', 'chats_unknown', 'chats_last_client_msg',
+    'chats_last_client_days_before_lose', 'chats_last_manager_msg', 'chats_last_manager_days_before_lose',
+    'chats_unanswered_by_manager', 'chats_unanswered_by_client', 'initiative_manager_pct', 'initiative_client_pct',
+    'max_gap_who', 'data_quality_unknown_author_pct']
+};
 var L = [];
 L.push('--- COMM ANALYTICS ---');
 var pS = firstContact ? formatDateRu(firstContact) : formatDateRu(dateCreate);

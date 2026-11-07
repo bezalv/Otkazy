@@ -37,6 +37,9 @@ export function toPersistenceResult(job, outcome, audioOriginHistoryId = null) {
  * delivery вызывается лишь после сохранения результата либо его восстановления.
  */
 export async function runJob({ job, queue, store, loadAudioWait, delivery, process = processDeal, processOptions = {}, heartbeatMs = 60000 }) {
+  if (processOptions.semanticChatRoles === true) {
+    throw new Error('Эксперимент определения ролей доступен только без записи и доставки');
+  }
   if (!job?.id || !job?.lease_token || !job?.deal_id || !job?.lose_date) throw new TypeError('Не задано захваченное задание');
   if (!queue?.renew || !store?.loadResumableResult || !store?.persistResult || typeof loadAudioWait !== 'function') {
     throw new TypeError('Не заданы зависимости обработки');

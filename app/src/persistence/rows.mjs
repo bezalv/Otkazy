@@ -132,12 +132,16 @@ export function communicationRow(dealId, comm, index) {
     && Math.abs(Date.parse(comm.duration_start) - Date.parse(comm.date)) > 600000) duration = 0;
   const text = cleanHtml(comm.text || comm.description || '');
   const transcript = comm.transcript || '';
+  // Модельная роль хранится в facts_packet как гипотеза; в плоской таблице
+  // нет колонки её происхождения, поэтому не выдаём её за известного автора.
+  const semanticTextRole = eventType === 'chat' && comm._role_source === 'semantic_inference'
+    && comm._has_audio !== true && comm._has_files !== true && comm._has_audio_transcript !== true && !transcript;
   let transcriptStatus = transcript.length ? 'transcribed' : comm._transcription_empty ? 'empty_transcript' : comm._needs_transcription ? 'pending' : 'skipped';
   if (transcriptStatus === 'transcribed' && eventType === 'call' && isVoicemail(transcript)) transcriptStatus = 'voicemail';
   return {
     deal_id: dealId, event_type: eventType, event_id: String(eventId), event_date: emptyToNull(comm.date),
-    direction: emptyToNull(comm.direction), author_id: emptyToNull(comm.author_id),
-    author_name: emptyToNull(comm.author_name), responsible_id: emptyToNull(comm.responsible_id),
+    direction: semanticTextRole ? 'unknown' : emptyToNull(comm.direction), author_id: emptyToNull(comm.author_id),
+    author_name: semanticTextRole ? 'Участник чата' : emptyToNull(comm.author_name), responsible_id: emptyToNull(comm.responsible_id),
     text_content: text, full_content: eventType === 'call' && transcript ? transcript : text,
     call_subject: emptyToNull(comm.subject), call_duration_start: emptyToNull(comm.duration_start),
     call_duration_end: emptyToNull(comm.duration_end), call_duration_seconds: duration,

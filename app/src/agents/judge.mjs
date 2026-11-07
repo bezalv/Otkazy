@@ -45,6 +45,11 @@ function validateProofs(judge, facts, metrics) {
   const byId = new Map(facts.map((fact) => [fact.fact_id, fact]));
   const warnings = [];
   let errorCount = 0;
+  // Не все выводы судьи снабжены ссылками. Общая отметка сохраняется даже
+  // когда массивы доказательств пусты: авторство части фактов — оценка модели.
+  if (facts.some((fact) => fact?.role_source === 'semantic_inference')) {
+    warnings.push({ path: 'facts_packet', issue: 'Авторство части сообщений определено предположительно по контексту', severity: 'warning' });
+  }
   for (const category of ['manager_mistakes', 'key_signals', 'risk_factors']) {
     judge[category].forEach((item, index) => {
       for (const id of item.proof_fact_ids) {
@@ -54,8 +59,15 @@ function validateProofs(judge, facts, metrics) {
         if (id.startsWith('metric:')) {
           const name = id.slice(7);
           if (metrics[name] === undefined) issue = `metric ${name} не существует`;
+          if (metrics[name] !== undefined && Array.isArray(metrics.chat_role_inference?.affected_metrics)
+              && metrics.chat_role_inference.affected_metrics.includes(name)) {
+            warnings.push({ path, issue: `metric ${name} зависит от ролей, предположительно определённых по контексту`, severity: 'warning' });
+          }
         } else {
           const fact = byId.get(id);
+          if (fact?.role_source === 'semantic_inference') {
+            warnings.push({ path, issue: `У ${id} автор определён предположительно по контексту, а не подтверждён технически`, severity: 'warning' });
+          }
           if (!fact) {
             issue = `fact_id ${id} не существует`;
           } else if (['client_statement', 'manager_statement'].includes(item.proof_type)

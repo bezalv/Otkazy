@@ -274,6 +274,7 @@ for (var i = 0; i < comms.length; i++) {
       fact_id: nextId(),
       source: chatHasVoice ? 'chat_voice_transcript' : 'chat',
       actor: actor,
+      ...(c._role_source === 'semantic_inference' ? { role_source: 'semantic_inference' } : {}),
       ts: ts, channel: c.channel || null, author_name: c.author_name || null,
       content: txt
     });

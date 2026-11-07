@@ -5,6 +5,7 @@ import { transcribeCalls } from './calls/index.mjs';
 import { buildJournal } from './analysis/journal.mjs';
 import { buildCommunicationAnalytics } from './analysis/communication-analytics.mjs';
 import { assembleFacts } from './analysis/facts-assembler.mjs';
+import { inferChatRoles } from './analysis/chat-role-inference.mjs';
 import { processScreenshots } from './screenshots/process.mjs';
 import { pgDecide } from './rules/pipeline-gate.mjs';
 import { dsEvaluate, dsInsufficientJudge } from './rules/data-sufficiency.mjs';
@@ -15,7 +16,11 @@ export async function processDeal({
   dealId, bitrix, llm, resolveFile, downloadFile, transcribe,
   judgeSystemPrompt, writerSystemPrompt, audioWaitEnabledAt, savedAudioWait = null,
   silent = false, screenshots = true, nowMs = null, clock = Date.now, expectedLoseDate = null, expectedHistoryId = null, wait,
+  semanticChatRoles = false,
 }) {
+  if (semanticChatRoles === true && silent !== true) {
+    throw new Error('Эксперимент определения ролей доступен только в тихом режиме');
+  }
   if (typeof judgeSystemPrompt !== 'string' || !judgeSystemPrompt.trim()) {
     throw new Error('Не задан промпт судьи');
   }
@@ -55,21 +60,37 @@ export async function processDeal({
   const normalized = await normalizeCommunications({
     collection: collected, resolveFile, transcribeVoice: transcribe, screenshots,
   });
+  let chatRoleInferenceStats = null;
+  let chatRoleInferenceEvidence = null;
+  // Только явный ручной режим для проверки текста. Обычная обработка по умолчанию
+  // не подключает эту экспериментальную оценку и не ослабляет защиту источников.
+  if (semanticChatRoles === true) {
+    const prerequisites = pgDecide({ sources: collected._sources, recognition: { voices: normalized.voice_failures } });
+    if (prerequisites.block) return { status: 'blocked', collection: collected, audioWait, pipelineGate: prerequisites };
+    const inferred = await inferChatRoles({ communications: normalized.deal_data.communications, client: llm,
+      cutoff: collected.deal_data.lose_date });
+    normalized.deal_data.communications = inferred.communications;
+    chatRoleInferenceStats = inferred.stats;
+    chatRoleInferenceEvidence = inferred.evidence;
+  }
   const earlyGate = pgDecide({ sources: collected._sources, communications: normalized.deal_data.communications,
     recognition: { voices: normalized.voice_failures } });
-  if (earlyGate.block) return { status: 'blocked', collection: collected, audioWait, pipelineGate: earlyGate };
+  if (earlyGate.block) return { status: 'blocked', collection: collected, audioWait, pipelineGate: earlyGate,
+    ...(chatRoleInferenceStats ? { chatRoleInferenceStats, chatRoleInferenceEvidence } : {}) };
 
   const calls = await transcribeCalls({ dealData: normalized.deal_data, transcribe });
   const recognition = { calls: calls.transcription_errors, voices: normalized.voice_failures, screenshots: [] };
   const initialGate = pgDecide({ sources: collected._sources, recognition, communications: normalized.deal_data.communications });
-  if (initialGate.block) return { status: 'blocked', collection: collected, audioWait, calls, pipelineGate: initialGate };
+  if (initialGate.block) return { status: 'blocked', collection: collected, audioWait, calls, pipelineGate: initialGate,
+    ...(chatRoleInferenceStats ? { chatRoleInferenceStats, chatRoleInferenceEvidence } : {}) };
 
   const journalInput = { ...normalized.deal_data, communications: calls.communications, transcription_stats: calls.transcription_stats };
   const analytics = buildCommunicationAnalytics(buildJournal(journalInput), evaluatedAt);
   const screenshotResult = await processScreenshots({ base: analytics, resolveFile, downloadFile, client: llm });
   recognition.screenshots = screenshotResult.failures;
   const pipelineGate = pgDecide({ sources: collected._sources, recognition, communications: calls.communications });
-  if (pipelineGate.block) return { status: 'blocked', collection: collected, audioWait, calls, pipelineGate };
+  if (pipelineGate.block) return { status: 'blocked', collection: collected, audioWait, calls, pipelineGate,
+    ...(chatRoleInferenceStats ? { chatRoleInferenceStats, chatRoleInferenceEvidence } : {}) };
 
   const prepared = assembleFacts(screenshotResult.output, judgeSystemPrompt);
   const sufficiency = dsEvaluate(prepared.facts_packet.facts);
@@ -84,5 +105,6 @@ export async function processDeal({
   return {
     status: analysis.pipeline_error ? 'error' : 'processed',
     collection: collected, dealData: normalized.deal_data, audioWait, calls, pipelineGate, analysis,
+    ...(chatRoleInferenceStats ? { chatRoleInferenceStats, chatRoleInferenceEvidence } : {}),
   };
 }
