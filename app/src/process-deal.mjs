@@ -74,13 +74,14 @@ export async function processDeal({
     chatRoleInferenceEvidence = inferred.evidence;
   }
   const earlyGate = pgDecide({ sources: collected._sources, communications: normalized.deal_data.communications,
-    recognition: { voices: normalized.voice_failures } });
+    recognition: { voices: normalized.voice_failures }, allowNonmaterialUnknown: semanticChatRoles === true });
   if (earlyGate.block) return { status: 'blocked', collection: collected, audioWait, pipelineGate: earlyGate,
     ...(chatRoleInferenceStats ? { chatRoleInferenceStats, chatRoleInferenceEvidence } : {}) };
 
   const calls = await transcribeCalls({ dealData: normalized.deal_data, transcribe });
   const recognition = { calls: calls.transcription_errors, voices: normalized.voice_failures, screenshots: [] };
-  const initialGate = pgDecide({ sources: collected._sources, recognition, communications: normalized.deal_data.communications });
+  const initialGate = pgDecide({ sources: collected._sources, recognition, communications: normalized.deal_data.communications,
+    allowNonmaterialUnknown: semanticChatRoles === true });
   if (initialGate.block) return { status: 'blocked', collection: collected, audioWait, calls, pipelineGate: initialGate,
     ...(chatRoleInferenceStats ? { chatRoleInferenceStats, chatRoleInferenceEvidence } : {}) };
 
@@ -88,7 +89,8 @@ export async function processDeal({
   const analytics = buildCommunicationAnalytics(buildJournal(journalInput), evaluatedAt);
   const screenshotResult = await processScreenshots({ base: analytics, resolveFile, downloadFile, client: llm });
   recognition.screenshots = screenshotResult.failures;
-  const pipelineGate = pgDecide({ sources: collected._sources, recognition, communications: calls.communications });
+  const pipelineGate = pgDecide({ sources: collected._sources, recognition, communications: calls.communications,
+    allowNonmaterialUnknown: semanticChatRoles === true });
   if (pipelineGate.block) return { status: 'blocked', collection: collected, audioWait, calls, pipelineGate,
     ...(chatRoleInferenceStats ? { chatRoleInferenceStats, chatRoleInferenceEvidence } : {}) };
 
@@ -100,7 +102,7 @@ export async function processDeal({
   const analysis = await runAgents({
     prepared, pipelineGate, analytics: screenshotResult.output,
     screenshotStats: screenshotResult.output.screenshot_stats,
-    writerSystemPrompt, client: llm, now: evaluatedAt,
+    writerSystemPrompt, client: llm, now: evaluatedAt, rejectUnknownRoleProof: semanticChatRoles === true,
   });
   return {
     status: analysis.pipeline_error ? 'error' : 'processed',

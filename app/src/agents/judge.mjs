@@ -50,15 +50,26 @@ function validateProofs(judge, facts, metrics) {
   if (facts.some((fact) => fact?.role_source === 'semantic_inference')) {
     warnings.push({ path: 'facts_packet', issue: 'Авторство части сообщений определено предположительно по контексту', severity: 'warning' });
   }
+  if (facts.some((fact) => fact?.actor === 'unknown' && fact?.source === 'chat'
+      && fact?.unknown_role_nonmaterial === 'semantic_inference')) {
+    warnings.push({ path: 'facts_packet', issue: 'Автор короткой реакции неизвестен; несущественность оценена по контексту',
+      severity: 'warning', code: 'unknown_nonmaterial_present' });
+  }
   for (const category of ['manager_mistakes', 'key_signals', 'risk_factors']) {
     judge[category].forEach((item, index) => {
       for (const id of item.proof_fact_ids) {
         const path = `${category}[${index}]`;
         let issue;
+        let issueCode;
         let severity = 'error';
         if (id.startsWith('metric:')) {
           const name = id.slice(7);
           if (metrics[name] === undefined) issue = `metric ${name} не существует`;
+          else if (metrics[name] === null && Array.isArray(metrics.chat_unknown_nonmaterial?.affected_metrics)
+              && metrics.chat_unknown_nonmaterial.affected_metrics.includes(name)) {
+            issue = `metric ${name} не определена из-за неизвестного автора сообщения`;
+            issueCode = 'unknown_nonmaterial_metric_as_proof';
+          }
           if (metrics[name] !== undefined && Array.isArray(metrics.chat_role_inference?.affected_metrics)
               && metrics.chat_role_inference.affected_metrics.includes(name)) {
             warnings.push({ path, issue: `metric ${name} зависит от ролей, предположительно определённых по контексту`, severity: 'warning' });
@@ -70,6 +81,10 @@ function validateProofs(judge, facts, metrics) {
           }
           if (!fact) {
             issue = `fact_id ${id} не существует`;
+          } else if (fact.actor === 'unknown' && fact.unknown_role_nonmaterial === 'semantic_inference'
+            && fact.source === 'chat') {
+            issue = `proof_type=${item.proof_type}, а ${id} — реакция с неизвестным автором; её нельзя использовать как доказательство`;
+            issueCode = 'unknown_nonmaterial_as_statement';
           } else if (['client_statement', 'manager_statement'].includes(item.proof_type)
             && fact.actor === 'unknown' && PROOF_SOURCES.includes(fact.source)) {
             severity = 'warning';
@@ -85,7 +100,7 @@ function validateProofs(judge, facts, metrics) {
           }
         }
         if (issue) {
-          warnings.push({ path, issue, severity });
+          warnings.push({ path, issue, severity, ...(issueCode ? { code: issueCode } : {}) });
           if (severity === 'error') errorCount++;
         }
       }

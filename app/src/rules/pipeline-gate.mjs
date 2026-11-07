@@ -229,6 +229,21 @@ function pgSourcesReason(marks, incomplete) {
 // руками воркфлоу «Отказ: Прогон зависших».
 //
 // Поэтому у обеих веток блокировки final = true: ждать больше нечего, нужно починить причину.
+// Только строгий ручной эксперимент может пропустить уже проверенную в контексте
+// короткую реплику. Маркер — оценка модели, НЕ доказательство стороны.
+function pgAllowedNonmaterialUnknown(item, enabled) {
+  if (enabled !== true || !item || item.type !== 'chat'
+      || item._wazzup_author_ambiguous !== true || item._chat_connector_unknown === true
+      || item._unknown_role_nonmaterial !== 'semantic_inference'
+      || item.role !== 'unknown' || item.direction !== 'unknown') return false;
+  if (item._has_audio === true || item._has_files === true || item._has_audio_transcript === true
+      || item.transcript != null || item.attachments != null || item.files != null || item.file_id != null) return false;
+  var connector = String(item.connector_id || '');
+  if (!/^(?:wz_|.*wazzup)/i.test(connector)) return false;
+  var text = typeof item.text === 'string' ? item.text.trim() : '';
+  return /^(?:👍\uFE0F?|спасибо[!.…]*)$/iu.test(text);
+}
+
 function pgDecide(state) {
   var s = state || {};
   var incomplete = pgIncompleteSources(s.sources);
@@ -249,7 +264,8 @@ function pgDecide(state) {
   // после исправления источника/разбора оператором, а не как автоматический verdict.
   var communications = Array.isArray(s.communications) ? s.communications : [];
   var ambiguous = communications.filter(function (item) {
-    return item && item._wazzup_author_ambiguous === true;
+    return item && item._wazzup_author_ambiguous === true
+      && !pgAllowedNonmaterialUnknown(item, s.allowNonmaterialUnknown);
   });
   if (ambiguous.length) {
     return {

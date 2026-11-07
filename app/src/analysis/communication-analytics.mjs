@@ -158,6 +158,8 @@ if (transcribedPct < 50 && callsWithAudio.length > 0) dataWarnings.push('Low tra
 if (callsPending > 0) dataWarnings.push(callsPending + ' calls pending');
 var unknownPct = chats.length > 0 ? Math.round(chatUnknown.length / chats.length * 100) : 0;
 if (unknownPct > 50 && chats.length > 0) dataWarnings.push(chatUnknown.length + '/' + chats.length + ' unknown author');
+var nonmaterialUnknownCount = chatUnknown.filter(function(c) { return c.data._unknown_role_nonmaterial === 'semantic_inference'; }).length;
+if (nonmaterialUnknownCount > 0) dataWarnings.push('Автор ' + nonmaterialUnknownCount + ' сообщений неизвестен; модель предположила их несущественность, метрики сторон могут быть не определены');
 // Роли, восстановленные моделью из смысла, — оценки, а не технически
 // подтверждённые участники. Метрики ниже, которые используют сторону, тоже
 // зависят от этих оценок. Обычные анализы не получают дополнительных полей.
@@ -171,6 +173,22 @@ if (semanticRoleCount > 0) analytics.chat_role_inference = {
     'chats_unanswered_by_manager', 'chats_unanswered_by_client', 'initiative_manager_pct', 'initiative_client_pct',
     'max_gap_who', 'data_quality_unknown_author_pct']
 };
+if (nonmaterialUnknownCount > 0) {
+  // Любое неизвестное авторство меняет возможные значения численности,
+  // последнего сообщения и инициативы; ноль или false здесь были бы ложной
+  // уверенностью. Общее число чатов и число unknown по-прежнему известны.
+  var unknownAffectedMetrics = ['chats_manager', 'chats_client', 'chats_last_client_msg',
+    'chats_last_client_days_before_lose', 'chats_last_manager_msg', 'chats_last_manager_days_before_lose',
+    'initiative_manager_pct', 'initiative_client_pct', 'max_gap_who'];
+  for (var uai = 0; uai < unknownAffectedMetrics.length; uai++) analytics[unknownAffectedMetrics[uai]] = null;
+  if (lastChat && (lastChat.data.role === 'unknown' || lastChat.data.direction === 'unknown')) {
+    analytics.chats_unanswered_by_manager = null;
+    analytics.chats_unanswered_by_client = null;
+    unknownAffectedMetrics.push('chats_unanswered_by_manager', 'chats_unanswered_by_client');
+  }
+  analytics.chat_unknown_nonmaterial = { source: 'semantic_inference', count: nonmaterialUnknownCount,
+    affected_metrics: unknownAffectedMetrics };
+}
 var L = [];
 L.push('--- COMM ANALYTICS ---');
 var pS = firstContact ? formatDateRu(firstContact) : formatDateRu(dateCreate);
@@ -194,12 +212,12 @@ if (maxUnansweredStreak >= 3) L.push('  ! ' + maxUnansweredStreak + ' unanswered
 if (maxMissedIncomingStreak >= 3) L.push('  ! ' + maxMissedIncomingStreak + ' missed incoming streak');
 if (callsPending > 0) L.push('  [i] Pending transcription: ' + callsPending);
 L.push('');
-if (chats.length > 0) { var cp = ['manager: ' + chatManager.length, 'client: ' + chatClient.length]; if (chatUnknown.length > 0) cp.push('unknown: ' + chatUnknown.length); L.push('Chats: ' + chats.length + ' (' + cp.join(', ') + ')'); if (lastClientChat) L.push('  Last client msg: ' + formatDateRu(lastClientChat.ts) + ' (' + daysAgo(lastClientChat.ts) + ' days before lose)'); if (lastManagerChat) L.push('  Last manager msg: ' + formatDateRu(lastManagerChat.ts) + ' (' + daysAgo(lastManagerChat.ts) + ' days before lose)'); if (unansweredByManager) L.push('  ! Last msg from client - manager did not reply'); if (unansweredByClient) L.push('  [i] Last msg from manager - client did not reply'); if (unknownPct > 50) L.push('  ! ' + chatUnknown.length + ' msgs without author attribution'); L.push(''); }
+if (chats.length > 0) { var cp = nonmaterialUnknownCount > 0 ? ['авторы сторон частично неизвестны'] : ['manager: ' + chatManager.length, 'client: ' + chatClient.length]; if (chatUnknown.length > 0) cp.push('unknown: ' + chatUnknown.length); L.push('Chats: ' + chats.length + ' (' + cp.join(', ') + ')'); if (lastClientChat && !nonmaterialUnknownCount) L.push('  Last client msg: ' + formatDateRu(lastClientChat.ts) + ' (' + daysAgo(lastClientChat.ts) + ' days before lose)'); if (lastManagerChat && !nonmaterialUnknownCount) L.push('  Last manager msg: ' + formatDateRu(lastManagerChat.ts) + ' (' + daysAgo(lastManagerChat.ts) + ' days before lose)'); if (analytics.chats_unanswered_by_manager === true) L.push('  ! Last msg from client - manager did not reply'); if (analytics.chats_unanswered_by_client === true) L.push('  [i] Last msg from manager - client did not reply'); if (unknownPct > 50) L.push('  ! ' + chatUnknown.length + ' msgs without author attribution'); L.push(''); }
 L.push('Dynamics:');
 if (firstContact) L.push('  First contact: ' + formatDateRu(firstContact));
 if (lastContact) L.push('  Last contact: ' + formatDateRu(lastContact) + ' (' + daysAgo(lastContact) + ' days before lose)');
-if (maxGapDays > 0 && maxGapStart) L.push('  Max gap: ' + maxGapDays + ' days (' + formatDateRu(maxGapStart) + ' - ' + formatDateRu(maxGapEnd) + ', ' + (maxGapWho === 'manager' ? 'manager silent' : maxGapWho === 'client' ? 'client silent' : '?') + ')');
-L.push('  Initiative: manager ' + initiativeManagerPct + '% / client ' + initiativeClientPct + '%');
+if (maxGapDays > 0 && maxGapStart) L.push('  Max gap: ' + maxGapDays + ' days (' + formatDateRu(maxGapStart) + ' - ' + formatDateRu(maxGapEnd) + ', ' + (!nonmaterialUnknownCount && maxGapWho === 'manager' ? 'manager silent' : !nonmaterialUnknownCount && maxGapWho === 'client' ? 'client silent' : '?') + ')');
+L.push(nonmaterialUnknownCount ? '  Initiative: неизвестно (часть авторов сообщений не установлена)' : '  Initiative: manager ' + initiativeManagerPct + '% / client ' + initiativeClientPct + '%');
 L.push('  Trend: ' + trend);
 L.push('  Pause cycles: ' + pauseCycles);
 if (preferredChannel !== 'mixed') L.push('  Channel: ' + preferredChannel);

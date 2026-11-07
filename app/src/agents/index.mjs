@@ -44,7 +44,8 @@ function pipelineError(reason, prepared, { parsed, judgeResponse, writerResponse
  * client.complete(body) возвращает уже разобранный ответ Polza и сам отвечает
  * за таймауты и повторы. При _data_enough=false клиент не вызывается.
  */
-export async function runAgents({ prepared, pipelineGate, analytics, screenshotStats, writerSystemPrompt, client, now = Date.now() }) {
+export async function runAgents({ prepared, pipelineGate, analytics, screenshotStats, writerSystemPrompt, client, now = Date.now(),
+  rejectUnknownRoleProof = false }) {
   if (pipelineGate?.block === true) {
     return {
       deal_id: prepared?.deal_id || null,
@@ -103,6 +104,14 @@ export async function runAgents({ prepared, pipelineGate, analytics, screenshotS
   }
 
   if (parsed.error) return pipelineError(`Сбой судьи: ${parsed.message}`, prepared, { judgeResponse });
+  // В эксперименте короткая реакция с неизвестным автором не может стать
+  // доказанной репликой стороны или основанием по неопределённой метрике.
+  // Проверяем до вызова писателя; прежнюю политику остальных ошибок не меняем.
+  if (rejectUnknownRoleProof === true && (parsed.proof_warnings || []).some((warning) =>
+    ['unknown_nonmaterial_as_statement', 'unknown_nonmaterial_metric_as_proof'].includes(warning.code))) {
+    return pipelineError('Сбой анализа: судья использовал данные с неизвестным автором как подтверждённое доказательство',
+      prepared, { parsed, judgeResponse });
+  }
   let writerOutput;
   if (shouldRunWriter(parsed.judge)) {
     if (typeof writerSystemPrompt !== 'string' || !writerSystemPrompt.trim()) {

@@ -31,7 +31,10 @@ function fixture({ messages = baseMessages(), enabled = true, response = 'ok', i
       if (response === 'error') throw new Error('TEST ERROR');
       if (response === 'bad-json') return { choices: [{ finish_reason: 'stop', message: { content: '{' } }] };
       const entries = JSON.parse(body.messages[1].content).messages;
-      const roles = entries.map((item, i) => ({ id: item.id, role: i === 0 ? 'manager' : response === 'unknown' ? 'unknown' : 'client' }));
+      const roles = entries.map((item, i) => {
+        const role = i === 0 ? 'manager' : response === 'unknown' ? 'unknown' : 'client';
+        return { id: item.id, role, impact: role === 'unknown' ? 'material_or_unclear' : 'not_applicable' };
+      });
       return { choices: [{ finish_reason: 'stop', message: { content: JSON.stringify({ roles }) } }] };
     }
     if (options.role === 'judge') {
@@ -70,6 +73,70 @@ test('ручной эксперимент передаёт судье конте
   const inferred = packet.facts.find(f => f.content.includes('уже заказали окна'));
   assert.equal(inferred.actor, 'client'); assert.equal(inferred.role_source, 'semantic_inference');
   assert.equal(result.analysis.multi_agent_analysis.facts_packet.facts.find(f => f.fact_id === inferred.fact_id).role_source, 'semantic_inference');
+});
+
+function neutralFixture(badProof = null) {
+  const texts = [
+    'Добрый день, нужно поставить две створки на готовое окно. Сможете?',
+    '👍', '👍',
+    '=== Исходящее сообщение ===\nМы можем предложить только полную замену окна.',
+    'Сколько будет стоить заменить такое окно?',
+    '=== Исходящее сообщение ===\nСтоимость назовём после замера специалиста.',
+    'Нам уже не нужно менять окно, другие варианты у нас есть.',
+    '=== Исходящее сообщение ===\nПоняла вас, отменяю выезд специалиста.',
+  ];
+  const messages = Object.fromEntries(texts.map((text, i) => [i + 1, {
+    id: i + 1, senderid: 55, date: `2026-11-04T10:0${i}:00Z`, text,
+  }]));
+  const { args, calls } = fixture({ messages });
+  calls.writer = 0;
+  args.llm = { async complete(body, options = {}) {
+    if (options.role === 'chat-role-inference') {
+      calls.roles++;
+      const entries = JSON.parse(body.messages[1].content).messages;
+      const expected = ['client', 'unknown', 'unknown', 'manager', 'client', 'manager', 'client', 'manager'];
+      return { choices: [{ finish_reason: 'stop', message: { content: JSON.stringify({ roles: entries.map((entry, i) => ({
+        id: entry.id, role: expected[i], impact: expected[i] === 'unknown' ? 'not_material' : 'not_applicable',
+      })) }) } }] };
+    }
+    if (options.role === 'judge') {
+      calls.judge++; calls.judgeBody = body;
+      const packet = JSON.parse(body.messages[1].content);
+      const neutral = packet.facts.find(f => f.unknown_role_nonmaterial === 'semantic_inference');
+      const refs = badProof === 'fact' ? [neutral.fact_id] : badProof === 'metric' ? ['metric:chats_client'] : [];
+      const judge = { verdict: 'правомерен', verdict_reason_short: 'Клиент отказался', recoverable_level: null,
+        closure_reason_class: 'other', misplaced: false, correct_stage: null, exact_reason: 'Клиент отказался от замены.',
+        manager_mistakes: badProof ? [{ mistake: 'Ошибка', proof_type: badProof === 'metric' ? 'metric' : 'client_statement', proof_fact_ids: refs }] : [],
+        key_signals: [], risk_factors: [], questions_for_manager: [] };
+      return { choices: [{ message: { content: JSON.stringify(judge) } }] };
+    }
+    if (options.role === 'writer') { calls.writer++; throw new Error('Писатель не должен вызываться'); }
+    throw new Error('Неожиданная модель');
+  } };
+  return { args, calls };
+}
+
+test('две неизвестные реакции в дальнейшем диалоге не становятся клиентом и не блокируют эксперимент', async () => {
+  const { args, calls } = neutralFixture();
+  const result = await processDeal(args);
+  assert.equal(result.status, 'processed');
+  assert.equal(result.chatRoleInferenceStats.nonmaterial_unknown, 2);
+  const packet = JSON.parse(calls.judgeBody.messages[1].content);
+  const reactions = packet.facts.filter(f => f.unknown_role_nonmaterial === 'semantic_inference');
+  assert.equal(reactions.length, 2);
+  assert.ok(reactions.every(f => f.actor === 'unknown' && f.content === '👍'));
+  assert.equal(packet.metrics.chats_client, null);
+  assert.ok(result.analysis.multi_agent_analysis.proof_warnings.some(w => w.code === 'unknown_nonmaterial_present'));
+});
+
+test('ошибочная ссылка на реакцию или неопределённую метрику останавливает анализ до писателя', async () => {
+  for (const proof of ['fact', 'metric']) {
+    const { args, calls } = neutralFixture(proof);
+    const result = await processDeal(args);
+    assert.equal(result.status, 'error', proof);
+    assert.match(result.analysis.pipeline_error, /неизвестным автором/, proof);
+    assert.equal(calls.writer, 0, proof);
+  }
 });
 
 test('unknown, сбой модели и некорректный JSON оставляют защиту и не запускают судью', async () => {

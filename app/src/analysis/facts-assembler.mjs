@@ -275,6 +275,8 @@ for (var i = 0; i < comms.length; i++) {
       source: chatHasVoice ? 'chat_voice_transcript' : 'chat',
       actor: actor,
       ...(c._role_source === 'semantic_inference' ? { role_source: 'semantic_inference' } : {}),
+      ...(c._unknown_role_nonmaterial === 'semantic_inference' && actor === 'unknown'
+        ? { unknown_role_nonmaterial: 'semantic_inference' } : {}),
       ts: ts, channel: c.channel || null, author_name: c.author_name || null,
       content: txt
     });
