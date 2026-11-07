@@ -16,6 +16,7 @@ const MODEL = 'anthropic/claude-sonnet-4.6';
 const MAX_COMMENTS = 1000, MAX_IMAGES = 20, MAX_EVENTS = 150;
 const positiveId = value => /^[1-9]\d{0,29}$/.test(String(value ?? ''));
 const httpStatus = value => Number.isInteger(value) && value >= 100 && value <= 599 ? value : null;
+const safeCount = value => Number.isSafeInteger(value) && value >= 0 && value <= 10000000 ? value : null;
 
 function mime(buffer) {
   if (!Buffer.isBuffer(buffer)) return 'unknown';
@@ -38,6 +39,29 @@ function responseSchema(response, expected) {
   const covered=arr&&shots.length===expected&&new Set(ids).size===expected&&shots.every(x=>idx(x?.file_id)>=0&&idx(x?.file_id)<expected&&typeof x?.is_chat_screenshot==='boolean');
   const valid=ta&&turns.every(x=>x&&typeof x==='object'&&!Array.isArray(x)&&idx(x.file_id)>=0&&idx(x.file_id)<expected&&['manager','client','unknown'].includes(x.speaker)&&['text','attachment','time','date_label'].every(k=>x[k]===undefined||x[k]===null||typeof x[k]==='string'));
   return {json:true,screenshots_array:arr,turns_array:ta,files_covered:covered,turns_valid:valid,expected};
+}
+
+/** Только структура ответа: никакие слова модели, ошибки и изображения не возвращаются. */
+export function responseMetadata(response) {
+  const choices=Array.isArray(response?.choices)?response.choices:null;
+  const first=choices?.[0],message=first?.message;
+  const present=message&&typeof message==='object'&&Object.hasOwn(message,'content');
+  const content=present?message.content:undefined;
+  const type=!present?'missing':content===null?'null':typeof content==='string'?'string':Array.isArray(content)?'array':'other';
+  const text=type==='string'?content:type==='array'?content.map(x=>typeof x?.text==='string'?x.text:'').join(''):null;
+  const reason=first?.finish_reason;
+  const finish=reason==null?'missing':['stop','length','content_filter','tool_calls','function_call'].includes(reason)?reason:'other';
+  const reasoningValue=message?.reasoning??message?.reasoning_content??message?.reasoning_details;
+  const reasoning=typeof reasoningValue==='string'?reasoningValue:Array.isArray(reasoningValue)
+    ?reasoningValue.map(x=>typeof x==='string'?x:typeof x?.text==='string'?x.text:typeof x?.summary==='string'?x.summary:'').join(''):null;
+  const usage=response?.usage||{},detail=usage?.completion_tokens_details||{};
+  const trimmed=typeof text==='string'?text.trim():null;
+  return {choices_count:choices?safeCount(choices.length):null,content_type:type,content_length:typeof text==='string'?safeCount(text.length):null,
+    finish_reason:finish,reasoning_length:reasoning===null?null:safeCount(reasoning.length),
+    usage:{prompt_tokens:safeCount(usage.prompt_tokens),completion_tokens:safeCount(usage.completion_tokens),total_tokens:safeCount(usage.total_tokens),
+      reasoning_tokens:safeCount(detail.reasoning_tokens??usage.reasoning_tokens)},
+    empty:trimmed===null?null:trimmed.length===0,looks_fence:trimmed===null?null:trimmed.startsWith('```'),
+    starts_brace:trimmed===null?null:trimmed.startsWith('{'),contains_braces:trimmed===null?null:trimmed.includes('{')&&trimmed.includes('}')};
 }
 
 async function commentsForDeal(client,signal) {
@@ -106,7 +130,7 @@ export async function inspectScreenshots({client,model,download=standardDownload
     if(role!=='screenshots'||body?.model!==MODEL)throw new Error('model');
     const content=body?.messages?.find(x=>x?.role==='user')?.content;
     const expected=Array.isArray(content)?content.filter(x=>x?.type==='image_url').length:0;
-    try{const response=await model.complete(body,{role});signal.throwIfAborted();log({stage:'model',outcome:'ok',http_status:null,schema:responseSchema(response,expected)});return response;}
+    try{const response=await model.complete(body,{role});signal.throwIfAborted();log({stage:'model',outcome:'ok',http_status:null,schema:responseSchema(response,expected),response:responseMetadata(response)});return response;}
     catch(e){log({stage:'model',outcome:signal.aborted?'deadline':'error',http_status:httpStatus(e?.status),retryable:e?.retryable===true});throw e;}
   }};
   try{

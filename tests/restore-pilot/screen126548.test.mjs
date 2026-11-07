@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { generateKeyPairSync, privateDecrypt, constants, createDecipheriv } from 'node:crypto';
-import { inspectScreenshots, runDiagnostic } from '../../app/src/pilot/screen126548.mjs';
+import { inspectScreenshots, runDiagnostic, responseMetadata } from '../../app/src/pilot/screen126548.mjs';
 import { sealEvidenceReport } from '../../app/src/pilot/evidence-review.mjs';
 
 const PNG=Buffer.from([137,80,78,71,13,10,26,10,0,0,0,0]);
@@ -59,6 +59,31 @@ test('ошибка модели и неправильная структура �
   assert.doesNotMatch(JSON.stringify(first),/secret-token/);
   const bad=fixtures({response:{choices:[{message:{content:'not JSON'}}]}}),second=await inspectScreenshots({...bad,signal:signal()});
   assert.equal(second.failures,1);assert.equal(second.events.find(x=>x.stage==='model').schema.json,false);
+});
+
+test('метаданные Polza не раскрывают текст, reasoning или произвольные значения finish_reason',async()=>{
+  const secret='НЕВЫВОДИМЫЙ_ТЕКСТ_ОТВЕТА_И_REASONING';
+  const response={choices:[{finish_reason:secret,message:{content:`  \`\`\`json\n{${secret}}\n\`\`\``,reasoning:secret}}],
+    usage:{prompt_tokens:42,completion_tokens:17,total_tokens:59,completion_tokens_details:{reasoning_tokens:11}}};
+  const meta=responseMetadata(response);
+  assert.equal(meta.choices_count,1);assert.equal(meta.content_type,'string');assert.equal(meta.finish_reason,'other');
+  assert.equal(meta.reasoning_length,secret.length);assert.deepEqual(meta.usage,{prompt_tokens:42,completion_tokens:17,total_tokens:59,reasoning_tokens:11});
+  assert.equal(meta.empty,false);assert.equal(meta.looks_fence,true);assert.equal(meta.starts_brace,false);assert.equal(meta.contains_braces,true);
+  assert.doesNotMatch(JSON.stringify(meta),/НЕВЫВОДИМЫЙ/);
+  const f=fixtures({response}),result=await inspectScreenshots({...f,signal:signal()});
+  assert.deepEqual(result.events.find(x=>x.stage==='model').response,meta);assert.equal(result.failures,1);
+  assert.doesNotMatch(JSON.stringify(result),/НЕВЫВОДИМЫЙ/);
+});
+
+test('метаданные различают пустой, отсутствующий, null и массивный content и reasoning_details',()=>{
+  assert.deepEqual(responseMetadata({}),{choices_count:null,content_type:'missing',content_length:null,finish_reason:'missing',reasoning_length:null,
+    usage:{prompt_tokens:null,completion_tokens:null,total_tokens:null,reasoning_tokens:null},empty:null,looks_fence:null,starts_brace:null,contains_braces:null});
+  assert.equal(responseMetadata({choices:[{message:{content:null}}]}).content_type,'null');
+  const empty=responseMetadata({choices:[{finish_reason:'length',message:{content:'  ',reasoning_details:[{text:'internal'}]}}]});
+  assert.equal(empty.empty,true);assert.equal(empty.content_length,2);assert.equal(empty.finish_reason,'length');assert.equal(empty.reasoning_length,8);
+  const arr=responseMetadata({choices:[{message:{content:[{type:'text',text:'{}'}]}}],usage:{prompt_tokens:-1,total_tokens:10000001}});
+  assert.equal(arr.content_type,'array');assert.equal(arr.content_length,2);assert.equal(arr.starts_brace,true);assert.equal(arr.contains_braces,true);
+  assert.equal(arr.usage.prompt_tokens,null);assert.equal(arr.usage.total_tokens,null);
 });
 
 test('неподтверждённая пагинация и предел изображений не вызывают модель',async()=>{
