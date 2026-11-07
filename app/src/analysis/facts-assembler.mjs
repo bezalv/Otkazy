@@ -264,8 +264,10 @@ for (var i = 0; i < comms.length; i++) {
     if (!txt) continue;
     if (!hasChatAttachments(c) && isSystemChatText(txt)) continue;
     var actor = 'unknown';
-    if (c.role === 'client' || (c.direction === 'incoming' && c.author_name === 'Клиент')) actor = 'client';
-    else if (c.role === 'manager' || c.direction === 'outgoing') actor = 'manager';
+    if (c.role !== 'unknown' && !c._wazzup_author_ambiguous) {
+      if (c.role === 'client' || (c.direction === 'incoming' && c.author_name === 'Клиент')) actor = 'client';
+      else if (c.role === 'manager' || c.direction === 'outgoing') actor = 'manager';
+    }
     var chatHasVoice = (c._has_audio_transcript === true)
       || !!(c.transcript && String(c.transcript).trim().length > 0);
     facts.push({

@@ -11,7 +11,7 @@ const voiceFile = { id: 101, name: 'voice.ogg', type: 'audio', extension: 'ogg' 
 const otherVoice = { id: 102, name: 'orphan.ogg', type: 'audio', extension: 'ogg', authorid: 77 };
 const sessionHistory = {
   chat: { 100: {} },
-  users: { 77: { name: 'Менеджер' } },
+  users: { 77: { name: 'Менеджер', active: true, connector: false, extranet: false, externalAuthId: 'default' } },
   files: { 101: voiceFile, 102: otherVoice },
   message: {
     11: { id: 11, senderid: 0, text: '', params: { FILE_ID: [101] }, date: '2026-11-01T01:00:00Z' },
@@ -89,15 +89,15 @@ test('сбор и нормализация голосовых, дублей се
     },
     async transcribeVoice(input) {
       calls.push(`voice:${input.file_id}`);
-      return { success: true, formatted_dialog: 'Клиент: интересует цена', client_text: 'интересует цена', total_replicas: 1 };
+      return { success: true, formatted_dialog: 'Участник чата: интересует цена', total_replicas: 1 };
     },
   });
   const events = result.deal_data.communications;
   const voice = events.find(event => event.message_id === '80_11');
-  assert.equal(voice.text, 'интересует цена');
+  assert.equal(voice.text, 'Участник чата: интересует цена');
   assert.equal(voice._has_audio_transcript, true);
   assert.equal(voice._has_files, true);
-  assert.equal(voice.role, 'Клиент');
+  assert.equal(voice.role, 'unknown');
   assert.equal(events.filter(event => event.message_id?.endsWith('_11')).length, 1);
   assert.equal(events.some(event => event.message_id === '80_13'), false);
   assert.equal(events.find(event => event.message_id === '80_12').text, 'Здравствуйте');
@@ -313,19 +313,134 @@ test('шаблон служебного сообщения с вложением
   const result = await normalizeCommunications({
     collection,
     async resolveFile() { return { NAME: 'voice.ogg', DOWNLOAD_URL: 'https://example.test/audio' }; },
-    async transcribeVoice() { return { success: true, formatted_dialog: 'Клиент: речь', client_text: 'речь' }; },
+    async transcribeVoice() { return { success: true, formatted_dialog: 'Участник чата: речь' }; },
   });
   assert.equal(result.deal_data.communications.length, 1);
   assert.equal(result.deal_data.communications[0]._has_files, true);
-  assert.equal(result.deal_data.communications[0].text, 'Сессия завершена\n\n[Голосовое сообщение]: речь');
+  assert.equal(result.deal_data.communications[0].text, 'Сессия завершена\n\n[Голосовое сообщение]: Участник чата: речь');
   const journal = buildJournal(result.deal_data);
   const analytics = buildCommunicationAnalytics(journal, new Date('2026-10-19T12:00:00Z'));
   assert.equal(analytics.comm_analytics.chats_total, 1);
   const assembled = assembleFacts(analytics, 'Тестовый промпт');
   const fact = assembled.facts_packet.facts.find(item => item.source === 'chat_voice_transcript');
   assert.ok(fact);
-  assert.equal(fact.actor, 'client');
+  assert.equal(fact.actor, 'unknown');
   assert.match(fact.content, /речь/);
+});
+
+test('Wazzup: роли из наблюдаемых заголовков, неопределённые авторы и голосовые доходят до фактов', async () => {
+  const messages = {
+    1: { senderid: 55, text: '=== Исходящее сообщение ===\nПодберём дату замера' },
+    2: { senderid: 55, text: '=== Исходящее сообщение, автор: Менеджер (Ольга) ===\nУточните адрес' },
+    3: { senderid: 55, text: 'Спасибо, заказали у других' },
+    4: { senderid: 55, text: 'Цитата:\n=== Исходящее сообщение, автор: Менеджер (Ольга) ===\nПодберём дату' },
+    5: { senderid: 55, text: '=== Входящее сообщение ===\nУточнение' },
+    6: { text: 'Сообщение без senderid' },
+    7: { senderid: 55, text: '', params: { FILE_ID: [101] } },
+    8: { senderid: 77, text: 'Ответ действующего сотрудника' },
+    9: { senderid: 55, text: '=== Исходящее сообщение ===\n=== Входящее сообщение ===\nПротиворечивые заголовки' },
+    10: { senderid: 55, text: '', params: { FILE_ID: [103] } },
+  };
+  const collection = collected({
+    chats: [{ CHAT_ID: 2, CONNECTOR_ID: 'wz_test', CONNECTOR_TITLE: 'Wazzup' }, { CHAT_ID: 3, CONNECTOR_ID: 'wappi', CONNECTOR_TITLE: 'Wappi' }],
+    sessions: [
+      { chat_id: 2, session_id: 1, history: { users: { 55: { connector: true }, 77: { active: true, connector: false, extranet: false, externalAuthId: 'default', name: 'Сотрудник' } }, message: messages, files: [voiceFile, { id: 103, name: 'screen.png', type: 'image' }] } },
+      { chat_id: 3, session_id: 2, history: { users: { 55: { connector: true }, 77: { name: 'Сотрудник' } }, message: { 11: { senderid: 55, text: 'Вопрос клиента Wappi' }, 12: { senderid: 77, text: 'Ответ сотрудника Wappi' } }, files: [] } },
+    ],
+  });
+  let voiceRequest;
+  const result = await normalizeCommunications({ collection,
+    async resolveFile() { return { NAME: 'voice.ogg', DOWNLOAD_URL: 'https://example.test/audio' }; },
+    async transcribeVoice(input) { voiceRequest = input; return { success: true, formatted_dialog: 'Участник чата: Голосовое сообщение', total_replicas: 1 }; },
+  });
+  const events = result.deal_data.communications;
+  const event = id => events.find(item => item.message_id === `1_${id}`);
+  assert.equal(event(1).role, 'Менеджер');
+  assert.equal(event(1).direction, 'outgoing');
+  assert.equal(event(2).author_name, 'Ольга');
+  assert.equal(event(8).role, 'Менеджер');
+  for (const id of [3, 4, 5, 6, 7, 9, 10]) {
+    assert.equal(event(id).role, 'unknown', `роль сообщения ${id}`);
+    assert.equal(event(id).direction, 'unknown');
+    assert.equal(event(id).author_name, 'Участник чата');
+    assert.equal(event(id)._wazzup_author_ambiguous, true);
+  }
+  assert.match(event(4).text, /=== Исходящее сообщение/);
+  assert.equal(voiceRequest.call_direction, 'unknown');
+  assert.equal(voiceRequest.speaker_role, 'Участник чата');
+  assert.equal(events.find(item => item.message_id === '2_11').role, 'Клиент');
+  assert.equal(events.find(item => item.message_id === '2_12').role, 'Менеджер');
+  const analytics = buildCommunicationAnalytics(buildJournal(result.deal_data));
+  const facts = assembleFacts(analytics, 'Тест').facts_packet.facts;
+  assert.equal(facts.find(item => item.content.includes('заказали у других')).actor, 'unknown');
+  assert.equal(facts.find(item => item.content.includes('Голосовое сообщение')).actor, 'unknown');
+  assert.equal(facts.find(item => item.content.includes('Подберём дату замера')).actor, 'manager');
+  assert.equal(facts.find(item => item.content.includes('Вопрос клиента Wappi')).actor, 'client');
+});
+
+test('неопределённый автор Wazzup сохраняется при ошибке STT и у отдельного файла', async () => {
+  const collection = collected({ chats: [{ CHAT_ID: 2, CONNECTOR_ID: 'wz_test' }], sessions: [{ chat_id: 2, session_id: 1, history: {
+    users: { 55: { connector: true } }, message: { 1: { senderid: 55, params: { FILE_ID: [101] } } },
+    files: [voiceFile, { id: 102, name: 'orphan.ogg', type: 'audio', authorid: 55 }],
+  } }] });
+  const result = await normalizeCommunications({ collection, async resolveFile() { throw new Error('недоступно'); } });
+  assert.equal(result.voice_failures.length, 2);
+  assert.equal(result.deal_data.communications.length, 2);
+  for (const item of result.deal_data.communications) {
+    assert.equal(item._wazzup_author_ambiguous, true);
+    assert.equal(item.role, 'unknown');
+    assert.equal(item.direction, 'unknown');
+    assert.equal(item._voice_unrecognized, 1);
+  }
+});
+
+test('без ID коннектора или карточки чата автор коннектора остаётся неизвестным', async () => {
+  for (const chats of [[], [{ CHAT_ID: 2, CONNECTOR_TITLE: 'Wazzup' }], [{ CHAT_ID: 2, CONNECTOR_ID: '' }]]) {
+    const result = await normalizeCommunications({ collection: collected({ chats, sessions: [{ chat_id: 2, session_id: 1, history: {
+      users: { 55: { connector: true } }, message: { 1: { senderid: 55, text: 'Содержательный текст' } }, files: [],
+    } }] }) });
+    const event = result.deal_data.communications[0];
+    assert.equal(event.role, 'unknown');
+    assert.equal(event.direction, 'unknown');
+    assert.equal(event._chat_connector_unknown, true);
+    assert.equal(event._wazzup_author_ambiguous, undefined);
+  }
+});
+
+test('противоречащие друг другу ID и название коннектора не определяют сторону автора', async () => {
+  for (const meta of [
+    { CONNECTOR_ID: 'wappi', CONNECTOR_TITLE: 'Wazzup' },
+    { CONNECTOR_ID: 'arbitrary', CONNECTOR_TITLE: 'Wazzup' },
+    { CONNECTOR_ID: 'wz_test', CONNECTOR_TITLE: 'Wappi' },
+  ]) {
+    const result = await normalizeCommunications({ collection: collected({ chats: [{ CHAT_ID: 2, ...meta }], sessions: [{ chat_id: 2, session_id: 1, history: {
+      users: { 55: { active: true, connector: false, extranet: false, externalAuthId: 'default' } }, message: { 1: { senderid: 55, text: 'Содержательный текст' } }, files: [],
+    } }] }) });
+    const event = result.deal_data.communications[0];
+    assert.equal(event.role, 'unknown');
+    assert.equal(event._chat_connector_unknown, true);
+  }
+});
+
+test('структурный заголовок Wazzup с senderid=0 и дополнительными пробелами не отбрасывается как служебный', async () => {
+  const result = await normalizeCommunications({ collection: collected({ chats: [{ CHAT_ID: 2, CONNECTOR_ID: 'wz_test' }], sessions: [{ chat_id: 2, session_id: 1, history: {
+    message: { 1: { senderid: 0, text: '===   Исходящее сообщение ===\nПодберём дату' } }, files: [],
+  } }] }) });
+  assert.equal(result.deal_data.communications.length, 1);
+  assert.equal(result.deal_data.communications[0].role, 'Менеджер');
+  assert.equal(result.deal_data.communications[0].text, 'Подберём дату');
+});
+
+test('active без подтверждённых полей пользователя не доказывает авторство менеджера Wazzup', async () => {
+  const users = { 55: { active: true, name: 'Пользователь без признаков' }, 56: { active: true, connector: false, extranet: false } };
+  const result = await normalizeCommunications({ collection: collected({ chats: [{ CHAT_ID: 2, CONNECTOR_ID: 'wz_test' }], sessions: [{ chat_id: 2, session_id: 1, history: {
+    users, message: { 1: { senderid: 55, text: 'Первое сообщение' }, 2: { senderid: 56, text: 'Второе сообщение' } }, files: [],
+  } }] }) });
+  assert.equal(result.deal_data.communications.length, 2);
+  for (const item of result.deal_data.communications) {
+    assert.equal(item.role, 'unknown');
+    assert.equal(item._wazzup_author_ambiguous, true);
+  }
 });
 
 test('processDeal блокирует OGG без имени файла и некорректный успешный ответ ASR', async () => {
@@ -338,7 +453,7 @@ test('processDeal блокирует OGG без имени файла и нек�
       if (method === 'crm.stagehistory.list') return { result: { items: [{ ID: '101', STAGE_ID: 'C23:LOSE', CREATED_TIME: '2026-11-04T00:00:00Z' }] } };
       if (method === 'crm.activity.list') return { result: body.filter.TYPE_ID ? [] : [{ ASSOCIATED_ENTITY_ID: '80' }] };
       if (method === 'crm.timeline.comment.list') return { result: [] };
-      if (method === 'imopenlines.crm.chat.get') return { result: [{ CHAT_ID: 100 }] };
+      if (method === 'imopenlines.crm.chat.get') return { result: [{ CHAT_ID: 100, CONNECTOR_ID: 'wappi' }] };
       if (method === 'imopenlines.session.history.get') return { result: {
         chat: { 100: {} }, files: { 101: { type: 'audio', extension: 'ogg' } },
         message: { 1: { senderid: 0, text: '', params: { FILE_ID: [101] } } },

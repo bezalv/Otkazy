@@ -7,6 +7,15 @@ import { join } from 'node:path';
 import test from 'node:test';
 import { runInNewContext } from 'node:vm';
 import { createSttClient, reserveToTranscript } from '../../app/src/stt-client.mjs';
+
+test('моно-голосовое неизвестного участника не превращается в речь менеджера или клиента', () => {
+  const result = reserveToTranscript({ channels: 1, segments: [{ channel: 0, start: 0, text: 'Хочу уточнить условия' }] },
+    { channel_count: 1, speaker_role: 'Участник чата', call_direction: 'unknown' });
+  assert.equal(result.manager_text, '');
+  assert.equal(result.client_text, '');
+  assert.equal(result.direction, 'unknown');
+  assert.equal(result.formatted_dialog, 'Участник чата: Хочу уточнить условия');
+});
 import { transcribeCalls } from '../../app/src/calls/index.mjs';
 import { normalizeCommunications } from '../../app/src/collect/normalize.mjs';
 
@@ -314,7 +323,7 @@ test('прямые ссылки голосового используются т
   } finally { await env.close(); }
 });
 
-test('нормализатор голосового использует настоящий контракт адаптера и сохраняет слова клиента', async () => {
+test('нормализатор голосового сохраняет неизвестного автора при настоящем контракте адаптера', async () => {
   const env = await setup(async (req, res) => {
     if (req.url === '/audio') { res.end(Buffer.alloc(1024)); return; }
     for await (const chunk of req) void chunk;
@@ -333,8 +342,10 @@ test('нормализатор голосового использует нас�
     const result = await normalizeCommunications({ collection, transcribeVoice: transcribe,
       async resolveFile() { return { NAME: 'voice.ogg', DOWNLOAD_URL: `${env.base}/audio` }; },
     });
-    assert.equal(result.deal_data.communications[0].text, 'Нужны окна');
-    assert.equal(result.deal_data.communications[0].transcript_client_text, 'Нужны окна');
+    assert.equal(result.deal_data.communications[0].text, 'Участник чата: Нужны окна');
+    assert.equal(result.deal_data.communications[0].transcript_client_text, '');
+    assert.equal(result.deal_data.communications[0].transcript_manager_text, '');
+    assert.equal(result.deal_data.communications[0]._wazzup_author_ambiguous, true);
     assert.deepEqual(result.voice_failures, []);
     assert.equal(calls.length, 1);
   } finally { await env.close(); }

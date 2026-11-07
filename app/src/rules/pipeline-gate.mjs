@@ -218,6 +218,8 @@ function pgSourcesReason(marks, incomplete) {
 //
 // state.sources     — карта отметок полноты
 // state.recognition — { calls: [], voices: [], screenshots: [] } с полями retryable/error
+// state.communications — нормализованные сообщения, в том числе с флагом
+// ненадёжного автора Wazzup, выставленным сборщиком конкретной коммуникации.
 //
 // 19.10.2026 (решение Сани): разбора при неполных данных больше нет вовсе. Раньше третья
 // попытка (last_attempt) снимала блокировку по распознаванию, и сделка разбиралась на том,
@@ -237,6 +239,35 @@ function pgDecide(state) {
       kind: 'collect',
       pipeline_error: 'сбор неполный: ' + labels + pgSourcesReason(s.sources, incomplete),
       sources: incomplete,
+      final: true
+    };
+  }
+
+  // В некоторых чатах Wazzup один senderid используется клиентом и менеджером.
+  // Содержимое сообщения есть, но установить его автора нельзя: подмена роли
+  // сделала бы вердикт и его доказательства недостоверными. Повтор имеет смысл
+  // после исправления источника/разбора оператором, а не как автоматический verdict.
+  var communications = Array.isArray(s.communications) ? s.communications : [];
+  var ambiguous = communications.filter(function (item) {
+    return item && item._wazzup_author_ambiguous === true;
+  });
+  if (ambiguous.length) {
+    return {
+      block: true,
+      kind: 'author_ambiguous',
+      pipeline_error: 'не определён автор сообщения Wazzup: требуется проверка источника (' + ambiguous.length + ')',
+      final: true
+    };
+  }
+
+  var unknownConnector = communications.filter(function (item) {
+    return item && item._chat_connector_unknown === true;
+  });
+  if (unknownConnector.length) {
+    return {
+      block: true,
+      kind: 'chat_connector_unknown',
+      pipeline_error: 'не определён коннектор и автор сообщения чата: требуется проверка источника (' + unknownConnector.length + ')',
       final: true
     };
   }

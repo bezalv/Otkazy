@@ -55,16 +55,20 @@ export async function processDeal({
   const normalized = await normalizeCommunications({
     collection: collected, resolveFile, transcribeVoice: transcribe, screenshots,
   });
+  const earlyGate = pgDecide({ sources: collected._sources, communications: normalized.deal_data.communications,
+    recognition: { voices: normalized.voice_failures } });
+  if (earlyGate.block) return { status: 'blocked', collection: collected, audioWait, pipelineGate: earlyGate };
+
   const calls = await transcribeCalls({ dealData: normalized.deal_data, transcribe });
   const recognition = { calls: calls.transcription_errors, voices: normalized.voice_failures, screenshots: [] };
-  const initialGate = pgDecide({ sources: collected._sources, recognition });
+  const initialGate = pgDecide({ sources: collected._sources, recognition, communications: normalized.deal_data.communications });
   if (initialGate.block) return { status: 'blocked', collection: collected, audioWait, calls, pipelineGate: initialGate };
 
   const journalInput = { ...normalized.deal_data, communications: calls.communications, transcription_stats: calls.transcription_stats };
   const analytics = buildCommunicationAnalytics(buildJournal(journalInput), evaluatedAt);
   const screenshotResult = await processScreenshots({ base: analytics, resolveFile, downloadFile, client: llm });
   recognition.screenshots = screenshotResult.failures;
-  const pipelineGate = pgDecide({ sources: collected._sources, recognition });
+  const pipelineGate = pgDecide({ sources: collected._sources, recognition, communications: calls.communications });
   if (pipelineGate.block) return { status: 'blocked', collection: collected, audioWait, calls, pipelineGate };
 
   const prepared = assembleFacts(screenshotResult.output, judgeSystemPrompt);

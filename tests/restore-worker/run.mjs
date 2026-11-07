@@ -53,6 +53,46 @@ test('неизвестное состояние не становится усп
   assert.equal(toPersistenceResult(job, { status: 'unexpected' })._status, 'error');
 });
 
+test('только известная окончательная блокировка передаёт причину для остановки аудио', () => {
+  for (const kind of ['author_ambiguous', 'chat_connector_unknown']) {
+    const outcome = { status: 'blocked', pipelineGate: { kind, final: true, pipeline_error: 'проверка' } };
+    const result = toPersistenceResult(job, outcome, '101');
+    assert.equal(result._status, 'error');
+    assert.equal(result.error_kind, kind);
+    assert.equal(result.audio_origin_stage_history_id, '101');
+    assert.equal(toPersistenceResult(job, { ...outcome, pipelineGate: { ...outcome.pipelineGate, final: false } }).error_kind, undefined);
+  }
+  assert.equal(toPersistenceResult(job, { status: 'blocked', pipelineGate: { kind: 'recognition', final: true } }).error_kind, undefined);
+});
+
+test('задание ожидания передаёт для сохранения проверенный исходный переход и окончательную ошибку', async () => {
+  const localJob = { ...job, trigger_type: 'audio_wait', request_key: 'audio-wait:test' };
+  const waiting = { state: 'waiting', lose_date: job.lose_date, origin_stage_history_id: '101', _scheduled_request_key: localJob.request_key };
+  const { calls, args } = deps({ job: localJob, loadAudioWait: async () => waiting,
+    process: async options => {
+      assert.equal(options.expectedHistoryId, '101');
+      return { status: 'blocked', pipelineGate: { kind: 'author_ambiguous', final: true, pipeline_error: 'проверка' } };
+    }, delivery: async () => assert.fail('доставки при ошибке нет'),
+  });
+  assert.equal((await runJob(args)).status, 'error');
+  assert.equal(calls[0].error_kind, 'author_ambiguous');
+  assert.equal(calls[0].audio_origin_stage_history_id, '101');
+});
+
+test('ручной и ночной повтор могут переоценить отменённое ожидание аудио', async () => {
+  for (const trigger of ['manual', 'nightly']) {
+    const terminal = { state: 'cancelled', lose_date: job.lose_date, origin_stage_history_id: '101' };
+    let processed = false;
+    const { args } = deps({ job: { ...job, trigger_type: trigger }, loadAudioWait: async () => terminal,
+      queue: { async renew() { return true; }, async finishObsoleteNightly() { return false; } },
+      process: async options => { processed = true; assert.equal(options.savedAudioWait._recheck_terminal, true); return { status: 'skipped' }; },
+    });
+    assert.equal((await runJob(args)).status, 'skipped');
+    assert.equal(processed, true);
+    assert.equal(terminal._recheck_terminal, undefined);
+  }
+});
+
 test('только ручной и ночной повтор переоценивают завершённую очередь, не меняя её', async () => {
   for (const trigger of ['manual', 'nightly', 'live', 'audio_wait']) {
     const terminal = { state: 'expired', lose_date: job.lose_date, origin_stage_history_id: '101' };

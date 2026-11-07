@@ -22,7 +22,7 @@ function mockPool({ failAt, emptyQueue = false, invalidLease = false, expiredAtF
       if (text.includes('INSERT INTO public.lost_deal_analyses') && text.includes('RETURNING id')) {
         return { rowCount: 1, rows: [{ id: '71' }] };
       }
-      if (text.includes('RETURNING deal_id')) return { rowCount: emptyQueue ? 0 : 1, rows: emptyQueue ? [] : [{ deal_id: 42 }] };
+      if (text.includes('RETURNING deal_id') || text.includes('RETURNING w.deal_id')) return { rowCount: emptyQueue ? 0 : 1, rows: emptyQueue ? [] : [{ deal_id: 42 }] };
       return { rowCount: 1, rows: [] };
     },
     release(error) { released = error || null; },
@@ -113,6 +113,34 @@ test('сбой проверки аудио двигает только её ак
   assert.match(update.text, /w\.next_check_at <= retry_clock\.at/);
   assert.ok(statements.indexOf(update.text) < statements.findIndex((text) => text.includes("SET status='done'")));
   assert.equal(statements.at(-1), 'COMMIT');
+});
+
+test('неоднозначность автора завершает только исходное ожидание аудио вместе с записью сбоя', async () => {
+  for (const kind of ['author_ambiguous', 'chat_connector_unknown']) {
+    const mock = mockPool({ triggerType: 'audio_wait', requestKey: 'audio-wait:test' });
+    const saved = await persistResult(mock.pool, { ...lease, deal_id: 42, _status: 'error', _error: 'требуется проверка',
+      error_kind: kind, audio_origin_stage_history_id: '101' });
+    const statements = texts(mock.calls);
+    const update = mock.calls.find(call => typeof call !== 'string' && call.text.includes("SET state='cancelled'"));
+    assert.deepEqual(update.values, [42, '2026-11-02T00:00:00Z', 'audio-wait:test', '101']);
+    assert.match(update.text, /w\.lose_date=\$2 AND w\.state='waiting' AND w\.origin_stage_history_id=\$4/);
+    assert.match(update.text, /w\.next_check_at/);
+    assert.ok(statements.findIndex(text => text.includes('INSERT INTO public.lost_deal_analyses')) < statements.indexOf(update.text));
+    assert.equal(statements.some(text => text.includes('retry_clock')), false);
+    assert.equal(saved.status, 'error');
+    assert.equal(saved.needsExternalActions, false);
+    assert.equal(statements.at(-1), 'COMMIT');
+  }
+});
+
+test('изменённое ожидание или неизвестный переход откатывают сохранение окончательной ошибки', async () => {
+  for (const [emptyQueue, history] of [[true, '101'], [false, null]]) {
+    const mock = mockPool({ triggerType: 'audio_wait', requestKey: 'audio-wait:test', emptyQueue });
+    await assert.rejects(persistResult(mock.pool, { ...lease, deal_id: 42, _status: 'error',
+      error_kind: 'author_ambiguous', audio_origin_stage_history_id: history }));
+    assert.equal(texts(mock.calls).at(-1), 'ROLLBACK');
+    assert.equal(texts(mock.calls).some(text => text.includes("SET status='done'")), false);
+  }
 });
 
 test('сбой обычного задания не меняет расписание аудио', async () => {

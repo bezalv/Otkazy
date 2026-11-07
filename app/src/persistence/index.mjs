@@ -236,6 +236,24 @@ async function rescheduleFailedAudioCheck(connection, job, id) {
   });
 }
 
+// Ошибка авторства не исправится ожиданием записи. Завершать можно только то
+// ожидание, которому принадлежало задание, не затрагивая новый переход.
+async function cancelAmbiguousAudioCheck(connection, job, id, historyId) {
+  if (typeof historyId !== 'string' || !/^[1-9]\d{0,29}$/.test(historyId)) {
+    throw new TypeError('Неизвестен исходный переход ожидания аудио');
+  }
+  const response = await connection.query({
+    text: `UPDATE public.lost_audio_wait w SET state='cancelled', lease_until=NULL, updated_at=NOW()
+      WHERE w.deal_id=$1 AND w.lose_date=$2 AND w.state='waiting' AND w.origin_stage_history_id=$4
+        AND $3 = 'audio-wait:' || w.deal_id::text || ':' ||
+          (extract(epoch from w.lose_date) * 1000000)::bigint::text || ':' ||
+          (extract(epoch from w.next_check_at) * 1000000)::bigint::text
+      RETURNING w.deal_id`,
+    values: [id, job.lose_date, job.request_key, historyId],
+  });
+  if (response.rowCount !== 1) throw new Error('Ожидание аудио изменилось до завершения');
+}
+
 // Снимок существует только если содержательная старая запись будет изменена.
 // FOR UPDATE удерживает текущую строку до той же транзакции записи результата.
 async function archiveCommunication(connection, operation, id, row) {
@@ -357,7 +375,13 @@ export async function persistResult(pool, result) {
         pipeline_operation_id: operation,
       }, { returning: ' RETURNING id' }));
       if (inserted.rowCount !== 1 || !inserted.rows?.[0]?.id) throw new Error('Не удалось сохранить сбой');
-      if (job.trigger_type === 'audio_wait') await rescheduleFailedAudioCheck(connection, job, id);
+      if (job.trigger_type === 'audio_wait') {
+        if (['author_ambiguous', 'chat_connector_unknown'].includes(result.error_kind)) {
+          await cancelAmbiguousAudioCheck(connection, job, id, result.audio_origin_stage_history_id);
+        } else {
+          await rescheduleFailedAudioCheck(connection, job, id);
+        }
+      }
       return { status, dealId: id, analysisId: inserted.rows[0].id };
     }
     if (status === 'waiting_audio') {

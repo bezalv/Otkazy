@@ -22,6 +22,11 @@ export function toPersistenceResult(job, outcome, audioOriginHistoryId = null) {
   if (outcome?.status === 'skipped' || outcome?.status === 'skip' || collection._reason === 'not_in_lost_stage') return { ...base, _status: 'skipped' };
   return {
     ...base, _status: 'error',
+    // Только блокировка с известной непоправимой без ручной проверки причиной
+    // завершает конкретное ожидание аудио. Сетевые ошибки остаются повторяемыми.
+    ...(outcome?.status === 'blocked' && outcome.pipelineGate?.final === true
+      && ['author_ambiguous', 'chat_connector_unknown'].includes(outcome.pipelineGate.kind)
+      ? { error_kind: outcome.pipelineGate.kind } : {}),
     _error: outcome?.pipelineGate?.pipeline_error || outcome?.analysis?.pipeline_error || collection._error
       || (outcome?.status === 'source_incomplete' ? 'сбор неполный: не установлены данные для ожидания записи' : 'Сбой обработки сделки'),
   };

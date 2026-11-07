@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { processDeal } from '../../app/src/process-deal.mjs';
+import { runJob } from '../../app/src/worker/run-job.mjs';
 
 const nowMs = Date.parse('2026-11-05T00:00:00Z');
 function fixture(overrides = {}) {
@@ -134,4 +135,85 @@ test('содержательный комментарий доходит до с
   assert.equal(result.status, 'processed');
   assert.equal(result.analysis.multi_agent_analysis.verdict, 'правомерен');
   assert.equal(calls, 1);
+});
+
+function withChat(args, connector, messages) {
+  const original = args.bitrix.request;
+  args.bitrix.request = async (method, body) => {
+    if (method === 'crm.activity.list' && body.filter.PROVIDER_ID === 'IMOPENLINES_SESSION') return { result: [{ ASSOCIATED_ENTITY_ID: '80' }] };
+    if (method === 'imopenlines.crm.chat.get') return { result: [{ CHAT_ID: 100, CONNECTOR_ID: connector, CONNECTOR_TITLE: connector }] };
+    if (method === 'imopenlines.session.history.get') return { result: {
+      chat: { 100: {} }, users: { 55: { connector: true, name: 'Wazzup App' } }, message: messages, files: {},
+    } };
+    return original(method, body);
+  };
+  return args;
+}
+
+test('неоднозначный автор Wazzup блокирует вердикт и доставку, ошибка сохраняется', async () => {
+  const args = withChat(fixture(), 'wazzup', {
+    1: { id: 1, senderid: 55, text: '=== Исходящее сообщение, автор: Иван (Иван Иванов) ===\nМы вам перезвоним' },
+    2: { id: 2, senderid: 55, text: 'Сообщение без указания стороны' },
+  });
+  let llmCalls = 0, deliveries = 0, stored;
+  args.llm = { async complete() { llmCalls++; throw new Error('Модель вызвана'); } };
+  const job = { id: 'job', lease_token: 'lease', deal_id: 42, lose_date: '2026-11-04T00:00:00Z', trigger_type: 'manual', silent: false };
+  const outcome = await runJob({ job, queue: { async renew() { return true; } }, loadAudioWait: async () => null,
+    processOptions: args, delivery: async () => { deliveries++; },
+    store: {
+      async loadResumableResult() { return null; },
+      async persistResult(result) { stored = result; return { status: result._status, needsExternalActions: result._status === 'processed' }; },
+    },
+  });
+  assert.equal(outcome.status, 'error');
+  assert.equal(stored._status, 'error');
+  assert.match(stored._error, /автор сообщения Wazzup/);
+  assert.equal(llmCalls, 0);
+  assert.equal(deliveries, 0);
+});
+
+test('явное исходящее Wazzup и обычный Wappi не блокируются ограничением автора', async () => {
+  for (const [connector, text] of [['wazzup', '=== Исходящее сообщение, автор: Иван (Иван Иванов) ===\nХорошо'], ['wappi', 'Да']]) {
+    const result = await processDeal(withChat(fixture(), connector, { 1: { id: 1, senderid: 55, text } }));
+    assert.equal(result.status, 'processed', connector);
+    assert.equal(result.pipelineGate.block, false, connector);
+  }
+});
+
+test('неизвестный коннектор при неопределённом авторе блокирует вызов судьи', async () => {
+  for (const missingMetadata of [false, true]) {
+    let llmCalls = 0;
+    const args = withChat(fixture(), '', { 1: { id: 1, senderid: 55, text: 'Мы заказали окна в другом месте' } });
+    if (missingMetadata) {
+      const request = args.bitrix.request;
+      args.bitrix.request = async (method, body) => method === 'imopenlines.crm.chat.get' ? { result: [] } : request(method, body);
+    }
+    args.llm = { async complete() { llmCalls++; throw new Error('Модель вызвана'); } };
+    const result = await processDeal(args);
+    assert.equal(result.status, 'blocked');
+    assert.equal(result.pipelineGate.kind, 'chat_connector_unknown');
+    assert.equal(llmCalls, 0);
+  }
+});
+
+test('неоднозначное голосовое Wazzup блокируется и при успешной, и при неудачной расшифровке', async () => {
+  for (const succeeds of [true, false]) {
+    let sttCalls = 0;
+    const args = withChat(fixture({
+      resolveFile: async () => ({ name: 'voice.ogg', url: 'https://example.test/voice.ogg' }),
+      transcribe: async () => {
+        sttCalls++;
+        if (!succeeds) throw new Error('Ошибка STT');
+        return { success: true, formatted_dialog: 'Участник чата: Есть вопрос по заказу' };
+      },
+    }), 'wazzup', {
+      1: { id: 1, senderid: 55, text: '=== Исходящее сообщение, автор: Иван (Иван Иванов) ===\nХорошо' },
+      2: { id: 2, senderid: 55, text: '', params: { FILE_ID: [7] } },
+    });
+    const result = await processDeal(args);
+    assert.equal(sttCalls, 1);
+    assert.equal(result.status, 'blocked');
+    assert.equal(result.pipelineGate.kind, 'author_ambiguous');
+    assert.equal(result.analysis, undefined);
+  }
 });

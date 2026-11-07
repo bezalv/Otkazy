@@ -47,7 +47,7 @@ export function reserveToTranscript(body, meta) {
       const speaker = role || 'Говорящий';
       conversation.push({ id: 1, speaker, text });
       if (role === 'Клиент') client.push(text);
-      else manager.push(text);
+      else if (role !== 'Участник чата' && role !== 'unknown') manager.push(text);
     }
   } else {
     for (const segment of segments) {

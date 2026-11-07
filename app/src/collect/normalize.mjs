@@ -16,9 +16,11 @@ function stripBbCodes(value) {
   return String(value || '').replace(/\[\/?\w[\w= ]*\]/g, '').trim();
 }
 
-function cleanChatText(value) {
+const WAZZUP_PREFIX = /^\s*(?:\[(?:B|I|U|S)\]\s*)*===\s*(Исходящее|Входящее)\s+сообщение(?:\s*,[^=\r\n]*)?\s*===/i;
+
+function cleanChatText(value, isWazzup = false) {
   return String(value || '')
-    .replace(/===\s*(?:Исходящее|Входящее)\s+сообщение[^=]*===/g, '')
+    .replace(isWazzup ? WAZZUP_PREFIX : /===\s*(?:Исходящее|Входящее)\s+сообщение[^=]*===/g, '')
     .replace(/=== SYSTEM WZ ===[^\n]*/g, '')
     .replace(/\[\/?\w[\w= ]*\]/g, '')
     .replace(/^>>.*$/gm, '')
@@ -41,7 +43,7 @@ function audioLink(value) {
 function systemMessage(message, text, fileCount) {
   if (fileCount > 0) return false;
   const hasSender = message.senderid !== undefined && message.senderid !== null && String(message.senderid) !== '';
-  const header = /=== (?:Исходящее|Входящее) сообщение/.test(text);
+  const header = /=== (?:Исходящее|Входящее) сообщение/.test(text) || WAZZUP_PREFIX.test(String(text || ''));
   if (hasSender && String(message.senderid) === '0' && !header) return true;
   const clean = stripBbCodes(text);
   return SYSTEM_PATTERNS.some(pattern => clean.includes(pattern));
@@ -57,17 +59,42 @@ function userRole(user) {
     ? 'Клиент' : 'Менеджер';
 }
 
-function roleForMessage(message, text, users, isWazzup) {
-  const author = text.match(/===\s*(?:Исходящее|Входящее)\s+сообщение,\s*автор:\s*[^(]*\(([^)]+)\)/);
-  if (author) return { role: 'Менеджер', author: author[1].trim() };
+function confirmedBitrixManager(user) {
+  return user?.active === true && user.connector === false && user.extranet === false
+    && typeof user.externalAuthId === 'string' && user.externalAuthId.trim().length > 0
+    && user.externalAuthId.trim().toLowerCase() !== 'imconnector';
+}
+
+function roleForMessage(message, text, users, isWazzup, connectorUnknown, connectorConflict) {
   const senderId = String(message.senderid || message.SENDER_ID || message.author_id || message.AUTHOR_ID || '0');
   const user = senderId !== '0' ? users?.[senderId] : null;
+  if (connectorConflict) return { role: 'unknown', author: 'Участник чата' };
+  if (isWazzup) {
+    const header = String(text || '').match(WAZZUP_PREFIX);
+    const nextHeader = header && String(text).slice(header[0].length).match(WAZZUP_PREFIX);
+    const conflict = nextHeader && nextHeader[1].toLowerCase() !== header[1].toLowerCase();
+    if (header && !conflict && header[1].toLowerCase() === 'исходящее') {
+      const name = header[0].match(/автор:\s*[^\n(]*\(([^)]+)\)/i);
+      return { role: 'Менеджер', author: name?.[1]?.trim() || 'Менеджер' };
+    }
+    // Коннектор Wazzup использует один sender для сообщений обеих сторон.
+    // Только подтверждённый активный пользователь Bitrix может служить исключением.
+    if (!header && confirmedBitrixManager(user)) {
+      return { role: 'Менеджер', author: user.name || user.firstName || 'Менеджер' };
+    }
+    return { role: 'unknown', author: 'Участник чата' };
+  }
+  if (connectorUnknown) {
+    if (confirmedBitrixManager(user)) {
+      return { role: 'Менеджер', author: user.name || user.firstName || 'Менеджер' };
+    }
+    return { role: 'unknown', author: 'Участник чата' };
+  }
+  const author = text.match(/===\s*(?:Исходящее|Входящее)\s+сообщение,\s*автор:\s*[^(]*\(([^)]+)\)/);
+  if (author) return { role: 'Менеджер', author: author[1].trim() };
   if (user) {
     const role = userRole(user);
     return { role, author: role === 'Клиент' ? 'Клиент' : (user.name || user.firstName || 'Менеджер') };
-  }
-  if (isWazzup && !/=== (?:Исходящее|Входящее) сообщение/.test(text)) {
-    return { role: 'Клиент', author: 'Клиент' };
   }
   return { role: 'unknown', author: 'Участник чата' };
 }
@@ -191,12 +218,15 @@ export async function normalizeCommunications({ collection, resolveFile, transcr
     }
   }
   const chatMeta = new Map(raw.chats.map(chat => {
-    const connector = chat.CONNECTOR_ID || 'unknown';
-    const title = chat.CONNECTOR_TITLE || connector;
+    const connector = String(chat.CONNECTOR_ID || '').trim() || 'unknown';
+    const title = String(chat.CONNECTOR_TITLE || connector);
+    const idIsWazzup = connector.toLowerCase().includes('wazzup') || connector.toLowerCase().startsWith('wz_');
+    const titleIsWazzup = title.toLowerCase().includes('wazzup');
+    const titleIsWappi = title.toLowerCase().includes('wappi');
+    const conflict = (titleIsWazzup && !idIsWazzup) || (titleIsWappi && idIsWazzup);
     return [String(chat.CHAT_ID), {
-      connector, title,
-      isWazzup: title.toLowerCase().includes('wazzup')
-        || connector.toLowerCase().includes('wazzup') || connector.startsWith('wz_'),
+      connector, title, connectorUnknown: connector.toLowerCase() === 'unknown' || conflict, connectorConflict: conflict,
+      isWazzup: idIsWazzup && !conflict,
     }];
   }));
   const messages = [];
@@ -213,7 +243,7 @@ export async function normalizeCommunications({ collection, resolveFile, transcr
     if (!history.message || typeof history.message !== 'object') throw new Error('В истории открытой линии нет списка сообщений');
     const chatId = session.chat_id ?? Object.keys(history.chat || {})[0] ?? null;
     const sessionId = session.session_id ?? `chat_${chatId}`;
-    const meta = chatMeta.get(String(chatId)) || { connector: 'unknown', title: 'unknown', isWazzup: false };
+    const meta = chatMeta.get(String(chatId)) || { connector: 'unknown', title: 'unknown', isWazzup: false, connectorUnknown: true };
     const users = history.users || {};
     const files = sessionFiles(history.files);
     const byId = new Map(files.filter(file => file && file.id != null).map(file => [String(file.id), file]));
@@ -243,8 +273,8 @@ export async function normalizeCommunications({ collection, resolveFile, transcr
       const link = ids.length ? null : audioLink(text);
       const count = ids.length + (link ? 1 : 0);
       if (systemMessage(message, text, count)) { systemDropped++; continue; }
-      const { role, author } = roleForMessage(message, text, users, meta.isWazzup);
-      const cleaned = link ? '' : cleanChatText(text);
+      const { role, author } = roleForMessage(message, text, users, meta.isWazzup, meta.connectorUnknown, meta.connectorConflict);
+      const cleaned = link ? '' : cleanChatText(text, meta.isWazzup);
       if (!cleaned && !count) continue;
       const msgKey = `${sessionId}_${messageId}`;
       const event = {
@@ -252,6 +282,8 @@ export async function normalizeCommunications({ collection, resolveFile, transcr
         session_id: sessionId, message_id: msgKey, date: message.date || message.DATE || null,
         author_id: message.author_id || message.AUTHOR_ID || 0, author_name: author,
         role, direction: role === 'Менеджер' ? 'outgoing' : role === 'Клиент' ? 'incoming' : 'unknown',
+        ...(meta.isWazzup && role === 'unknown' ? { _wazzup_author_ambiguous: true } : {}),
+        ...(meta.connectorUnknown && role === 'unknown' ? { _chat_connector_unknown: true } : {}),
         text: cleaned, is_system: false, _has_audio: count > 0, _has_files: count > 0,
       };
       messages.push(event);
@@ -278,13 +310,17 @@ export async function normalizeCommunications({ collection, resolveFile, transcr
     if (referencedFiles.has(id)) continue;
     const authorId = String(orphan.file.authorid ?? '0');
     const user = authorId !== '0' ? orphan.users[authorId] : null;
-    const role = user ? userRole(user) : 'Клиент';
-    const author = role === 'Менеджер' ? (user.name || user.firstName || 'Менеджер') : 'Клиент';
+    const role = orphan.meta.connectorConflict ? 'unknown' : orphan.meta.isWazzup || orphan.meta.connectorUnknown
+      ? (confirmedBitrixManager(user) ? 'Менеджер' : 'unknown')
+      : (user ? userRole(user) : 'Клиент');
+    const author = role === 'Менеджер' ? (user.name || user.firstName || 'Менеджер') : role === 'Клиент' ? 'Клиент' : 'Участник чата';
     const event = {
       type: 'chat', channel: orphan.meta.title, connector_id: orphan.meta.connector,
       chat_id: orphan.chatId, session_id: orphan.sessionId, message_id: `${orphan.sessionId}_file_${id}`,
       date: orphan.file.date || null, author_id: authorId, author_name: author,
-      role, direction: role === 'Менеджер' ? 'outgoing' : 'incoming', text: '',
+      role, direction: role === 'Менеджер' ? 'outgoing' : role === 'Клиент' ? 'incoming' : 'unknown', text: '',
+      ...(orphan.meta.isWazzup && role === 'unknown' ? { _wazzup_author_ambiguous: true } : {}),
+      ...(orphan.meta.connectorUnknown && role === 'unknown' ? { _chat_connector_unknown: true } : {}),
       is_system: false, _has_audio: true, _has_files: true,
     };
     messages.push(event);
@@ -332,7 +368,7 @@ export async function normalizeCommunications({ collection, resolveFile, transcr
         file_name: `chat_audio_${collection.deal_id}_${file.id}_${file.name.replace(/[^a-zA-Z0-9._-]/g, '_')}`,
         file_id: file.id,
         activity_id: `chat_${file.id}`, call_date: item.event.date || '',
-        call_direction: item.event.role === 'Менеджер' ? 'outgoing' : 'incoming',
+        call_direction: item.event.direction,
         comm_index: audioFound - 1, channel_count: 1,
         speaker_role: item.event.role === 'unknown' ? 'Участник чата' : item.event.role,
       });
