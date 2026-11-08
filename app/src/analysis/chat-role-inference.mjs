@@ -1,3 +1,5 @@
+import { verifiedInferenceSession } from '../collect/normalize.mjs';
+
 // Экспериментальное определение авторов текстовых реплик Wazzup по контексту.
 // Результат — гипотеза, а не подтверждённое коннектором авторство.
 const ROLE_SOURCE = 'semantic_inference';
@@ -145,7 +147,7 @@ function neutralContext(entries, roles, index) {
  * с источником; ответ модели неизвестно не маскируется исходным автором,
  * причём только для сессий с полностью проверенным ответом модели.
  */
-export async function inferChatRoles({ communications, client, cutoff } = {}) {
+export async function inferChatRoles({ communications, client, cutoff, dealId } = {}) {
   if (!Array.isArray(communications)) throw new TypeError('Нужен список коммуникаций');
   const result = communications.slice();
   const evidence = [];
@@ -171,13 +173,15 @@ export async function inferChatRoles({ communications, client, cutoff } = {}) {
     stats.unresolved = communications.filter(item => item?.type === 'chat' && item._wazzup_author_ambiguous === true).length;
     return { communications: result, stats, evidence };
   }
-  const sessions = new Map();
+  const sessions = new Map(), verifiedHistoryCache = new Map();
   for (let index = 0; index < communications.length; index++) {
     const item = communications[index];
     if (!item || item.type !== 'chat') continue;
-    // Сбор по CHAT_ID может синтезировать `session_id = chat_<ID>`; такой
-    // источник не доказывает границы отдельных сессий и не идёт в модель.
-    const chat = bitrixId(item.chat_id), session = bitrixId(item.session_id);
+    // Синтетический session_id сам по себе границ сессии не доказывает.
+    // Исключение — только подтверждение нормализатора в памяти этого процесса,
+    // явно связанное с той же сделкой, временем и снимком истории.
+    const chat = bitrixId(item.chat_id), session = bitrixId(item.session_id)
+      || verifiedInferenceSession(item, { dealId, cutoff, cache: verifiedHistoryCache });
     // Неизвестные границы недопустимо считать общей перепиской.
     if (!chat || !session) {
       if (item._wazzup_author_ambiguous === true) stats.unresolved++;

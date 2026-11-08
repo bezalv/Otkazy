@@ -6,6 +6,10 @@ import { runCohortCase } from './cohort20.mjs';
 import { runPilotCommand } from './command.mjs';
 import { loadPilotBaselines } from './candidates.mjs';
 import { sealEvidenceReport } from './evidence-review.mjs';
+import { createSemanticSessionVerifier } from './semantic-session-verifier.mjs';
+import { createPilotDependencies } from './dependencies.mjs';
+import { createBitrixClient } from '../bitrix-client.mjs';
+import { createBitrixLimiter } from '../bitrix-limiter.mjs';
 
 const DEAL = '127114', ANALYSIS = '1968';
 const GOLD = Object.freeze({ f001:'client',f005:'client',f006:'client',f008:'client',f009:'client',f011:'client',
@@ -18,7 +22,8 @@ const WARNING_CODES = new Set(['unknown_nonmaterial_present','unknown_nonmateria
 const ROLE = new Set(['client','manager','unknown']);
 const ORIGIN = new Set(['observed','semantic_inference','unknown']);
 const LIMITATIONS = ['screenshots_disabled','audio_transcription_disabled','historical_inputs_may_have_changed',
-  'time_and_text_match_not_proof_of_identity','semantic_role_is_inference_not_proof','model_is_nondeterministic'];
+  'time_and_text_match_not_proof_of_identity','semantic_role_is_inference_not_proof','model_is_nondeterministic',
+  'session_history_completeness_unproven'];
 const count = value => Number.isSafeInteger(value) && value >= 0 && value <= 1_000_000_000 ? value : null;
 const time = value => { const n = typeof value === 'string' ? Date.parse(value) : NaN; return Number.isFinite(n) ? new Date(n).toISOString() : null; };
 const normalize = value => typeof value === 'string' ? value.normalize('NFKC')
@@ -142,13 +147,27 @@ function project(outcome, baseline, activity) {
 
 export async function runSemanticFullEval({ caseRunner=runCohortCase, processFn=processDeal, readBaselines=loadPilotBaselines,
   pilotCommand=runPilotCommand, env=process.env } = {}) {
-  let baseline=null, observed=null, runs=0;
+  let baseline=null, observed=null, runs=0, verifierClient=null;
   const read=async (...args)=>{const data=await readBaselines(...args);if(!data || !Array.isArray(data.baselines)||data.baselines.length!==1
     || String(data.baselines[0]?.deal_id)!==DEAL || String(data.baselines[0]?.analysis_id)!==ANALYSIS)throw new Error('Эталон не подтверждён');
     baseline=data.baselines[0];return data;};
   const activity={audio:false,download:false,roles:0,judge:0,writer:0};
   const report=await caseRunner({dealId:DEAL,analysisId:ANALYSIS,env,readBaselines:read,
-    runCommand: args=>pilotCommand({...args,deadlineMs:480000,startService:async()=>({address:'http://127.0.0.1:1',key:'disabled',tempRoot:resolve('.'),async close(){}})}),
+    runCommand: args=>pilotCommand({...args,deadlineMs:480000,startService:async()=>({address:'http://127.0.0.1:1',key:'disabled',tempRoot:resolve('.'),async close(){}}),
+      makeDependencies: opts => {
+        const base=new URL(opts.bitrixBaseUrl);
+        if(base.protocol!=='https:' || base.hostname!=='dinalnsk.bitrix24.ru' || base.username || base.password || base.port || base.search || base.hash
+            || !/^\/rest\/\d+\/[A-Za-z0-9]+\/?$/.test(base.pathname)) throw new Error('Адрес запрещён');
+        const deps=createPilotDependencies(opts), limiter=createBitrixLimiter();
+        try {
+          verifierClient=createBitrixClient({baseUrl:base.href,limiter,fetchImpl:(url,options={})=>{
+            const target=new URL(url); if(target.origin!==base.origin || !target.pathname.startsWith(base.pathname.replace(/\/$/,'')+'/')) throw new Error('Адрес запрещён');
+            const signal=options.signal && opts.signal ? AbortSignal.any([options.signal,opts.signal]) : options.signal || opts.signal;
+            return fetch(url,{...options,redirect:'error',signal});
+          }});
+          return {...deps,close(){verifierClient=null;limiter.close();deps.close();}};
+        } catch(error) {limiter.close();deps.close();throw error;}
+      }}),
     async processFn(args) {
       runs++;
       if(runs!==1 || Number(args.dealId)!==Number(DEAL) || args.silent!==true)throw new Error('Границы пилота не подтверждены');
@@ -162,6 +181,7 @@ export async function runSemanticFullEval({ caseRunner=runCohortCase, processFn=
         return args.llm.complete(body,options);
       }};
       const result=await processFn({...args,bitrix,llm,silent:true,semanticChatRoles:true,screenshots:false,
+        verifyFallbackSession:createSemanticSessionVerifier(verifierClient),
         transcribe:async()=>{activity.audio=true;throw new Error('Аудио отложено');},
         downloadFile:async()=>{activity.download=true;throw new Error('Загрузка медиа запрещена');},
         resolveFile:async()=>{throw new Error('Вложения отложены');}});

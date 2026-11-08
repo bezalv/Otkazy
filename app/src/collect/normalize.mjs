@@ -1,3 +1,8 @@
+import { createHash } from 'node:crypto';
+
+// Доказательство живёт только в памяти процесса; поля из ответа Битрикса и
+// сериализованной коммуникации сами по себе не дают права на классификацию.
+const verifiedFallbackEvents = new WeakMap();
 const AUDIO_EXTENSIONS = ['mp3', 'mpga', 'ogg', 'opus', 'wav', 'm4a', 'oga'];
 const VOICE_SUPPORTED = ['ogg', 'oga', 'opus', 'mp3', 'mpga'];
 const SYSTEM_PATTERNS = [
@@ -136,6 +141,99 @@ function validBitrixId(value) {
     : typeof value === 'string' && /^[1-9]\d*$/.test(value);
 }
 
+function safeId(value) {
+  const s = String(value ?? '');
+  return /^[1-9]\d{0,15}$/.test(s) && Number.isSafeInteger(Number(s)) ? s : null;
+}
+
+function strictTime(value) {
+  if (typeof value !== 'string') return null;
+  const m = /^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2}):(\d{2})(?:\.\d{1,9})?(Z|[+-]\d{2}:?\d{2})$/i.exec(value);
+  if (!m) return null;
+  const [year, month, day, hour, minute, second] = m.slice(1, 7).map(Number);
+  if (!year || month < 1 || month > 12 || day < 1 || day > new Date(Date.UTC(year, month, 0)).getUTCDate()
+      || hour > 23 || minute > 59 || second > 59) return null;
+  if (m[7].toUpperCase() !== 'Z') {
+    const z = m[7].slice(1).replace(':', '');
+    if (Number(z.slice(0, 2)) > 23 || Number(z.slice(2)) > 59) return null;
+  }
+  const time = Date.parse(value);
+  return Number.isFinite(time) ? time : null;
+}
+
+function historySnapshot(history) {
+  try {
+    const serialized = JSON.stringify(history);
+    if (typeof serialized !== 'string' || serialized.length > 5_000_000) return null;
+    return { serialized, sha256: createHash('sha256').update(serialized).digest('hex') };
+  } catch { return null; }
+}
+
+function lineId(history, chat) {
+  const entity = history?.chat?.[chat]?.entityId;
+  if (typeof entity !== 'string' || entity.length > 1024) return null;
+  const parts = entity.split('|');
+  if (parts.length !== 4 || parts.some(part => !part || part.trim() !== part)) return null;
+  return safeId(parts[1]);
+}
+
+async function verifyFallback({ collection, session, chatId, meta, verifyFallbackSession }) {
+  if (collection.silent !== true || typeof verifyFallbackSession !== 'function' || !meta.isWazzup
+      || session.session_id != null) return null;
+  const deal = safeId(collection.deal_id), chat = safeId(chatId), history = session.history;
+  const sessionId = safeId(history?.sessionId), cutoff = strictTime(collection.deal_data?.lose_date);
+  const line = chat && lineId(history, chat);
+  if (!deal || !chat || !sessionId || cutoff === null || !line || safeId(history?.chatId) !== chat
+      || safeId(session.chat_id) !== chat || collection.raw.chats.filter(item => safeId(item?.CHAT_ID) === chat).length !== 1) return null;
+  const snapshot = historySnapshot(history);
+  if (!snapshot) return null;
+  const matchingChat = collection.raw.chats.find(item => safeId(item?.CHAT_ID) === chat);
+  const chatSnapshot = JSON.stringify(matchingChat);
+  const request = Object.freeze({ deal_id: deal, chat_id: chat, session_id: sessionId, line_id: line,
+    cutoff: new Date(cutoff).toISOString(), history_sha256: snapshot.sha256,
+    history: JSON.parse(snapshot.serialized) });
+  let proof;
+  try { proof = await verifyFallbackSession(request); } catch { return null; }
+  const current = historySnapshot(history);
+  const checks = proof?.checks;
+  const created = strictTime(proof?.session_created_at);
+  if (!proof || typeof proof !== 'object' || Array.isArray(proof) || proof.kind !== 'verified_fallback_session_v1'
+      || safeId(proof.deal_id) !== deal || safeId(proof.chat_id) !== chat
+      || safeId(proof.session_id) !== sessionId || safeId(proof.line_id) !== line
+      || strictTime(proof.cutoff) !== cutoff || proof.history_sha256 !== snapshot.sha256
+      || created === null || created > cutoff
+      || !checks || typeof checks !== 'object' || Array.isArray(checks)
+      || checks.chat_bound_to_deal !== true || checks.session_matches_chat !== true
+      || checks.session_matches_line !== true || checks.session_crm_matches_deal !== true
+      || checks.direct_session_history_matches !== true || checks.current_chat_history_matches !== true
+      || current?.sha256 !== snapshot.sha256 || session.history !== history || collection.silent !== true
+      || collection.raw.chats.filter(item => safeId(item?.CHAT_ID) === chat).length !== 1
+      || JSON.stringify(collection.raw.chats.find(item => safeId(item?.CHAT_ID) === chat)) !== chatSnapshot
+      || safeId(collection.deal_id) !== deal
+      || strictTime(collection.deal_data?.lose_date) !== cutoff || safeId(session.chat_id) !== chat
+      || session.session_id != null || lineId(history, chat) !== line) return null;
+  // Это подтверждение ОДНОЙ сессии; полноту предыдущей истории и смен линий
+  // оно не доказывает. Проверяющий — доверенная внутренняя зависимость.
+  return { deal, chat, sessionId, cutoff, history, sha256: snapshot.sha256 };
+}
+
+// Используется только классификатором в том же процессе. Копирование/JSON
+// намеренно уничтожает подтверждение, даже если видимое поле осталось.
+export function verifiedInferenceSession(event, { dealId, cutoff, cache } = {}) {
+  const binding = verifiedFallbackEvents.get(event);
+  let eventSnapshot;
+  try { eventSnapshot = JSON.stringify(event); } catch { return null; }
+  if (!binding || safeId(dealId) !== binding.deal || strictTime(cutoff) !== binding.cutoff
+      || safeId(event.chat_id) !== binding.chat || safeId(event.inference_session_id) !== binding.sessionId
+      || event.session_id !== `chat_${binding.chat}` || eventSnapshot !== binding.eventSnapshot) return null;
+  let valid = cache?.get(binding.history);
+  if (valid === undefined) {
+    valid = historySnapshot(binding.history)?.sha256 === binding.sha256;
+    cache?.set(binding.history, valid);
+  }
+  return valid ? binding.sessionId : null;
+}
+
 function callEvent(call) {
   const audioUrl = call.SETTINGS?.RECORD_URL || null;
   const files = fileList(call.FILES).map(file => ({
@@ -193,7 +291,7 @@ function taskEvent(task) {
 }
 
 /** Подготовка коммуникаций из результата collectDeal. Все внешние действия внедряются вызывающим кодом. */
-export async function normalizeCommunications({ collection, resolveFile, transcribeVoice, screenshots = true }) {
+export async function normalizeCommunications({ collection, resolveFile, transcribeVoice, screenshots = true, verifyFallbackSession }) {
   if (collection?._status !== 'pending_normalization' || !collection.raw || !collection.deal_data) {
     throw new TypeError('Нужен полный результат первичного сбора');
   }
@@ -244,6 +342,7 @@ export async function normalizeCommunications({ collection, resolveFile, transcr
     const chatId = session.chat_id ?? Object.keys(history.chat || {})[0] ?? null;
     const sessionId = session.session_id ?? `chat_${chatId}`;
     const meta = chatMeta.get(String(chatId)) || { connector: 'unknown', title: 'unknown', isWazzup: false, connectorUnknown: true };
+    const verified = await verifyFallback({ collection, session, chatId, meta, verifyFallbackSession });
     const users = history.users || {};
     const files = sessionFiles(history.files);
     const byId = new Map(files.filter(file => file && file.id != null).map(file => [String(file.id), file]));
@@ -286,6 +385,10 @@ export async function normalizeCommunications({ collection, resolveFile, transcr
         ...(meta.connectorUnknown && role === 'unknown' ? { _chat_connector_unknown: true } : {}),
         text: cleaned, is_system: false, _has_audio: count > 0, _has_files: count > 0,
       };
+      if (verified) {
+        event.inference_session_id = verified.sessionId;
+        verifiedFallbackEvents.set(event, { ...verified, eventSnapshot: JSON.stringify(event) });
+      }
       messages.push(event);
       for (const id of ids) {
         referencedFiles.add(id);
@@ -302,7 +405,7 @@ export async function normalizeCommunications({ collection, resolveFile, transcr
       }
       if (file.id == null) throw new Error('Неизвестен ID аудиофайла открытой линии');
       if (orphanFiles.has(String(file.id))) continue;
-      orphanFiles.set(String(file.id), { file, chatId, sessionId, meta, users });
+      orphanFiles.set(String(file.id), { file, chatId, sessionId, meta, users, verified });
     }
   }
 
@@ -323,6 +426,10 @@ export async function normalizeCommunications({ collection, resolveFile, transcr
       ...(orphan.meta.connectorUnknown && role === 'unknown' ? { _chat_connector_unknown: true } : {}),
       is_system: false, _has_audio: true, _has_files: true,
     };
+    if (orphan.verified) {
+      event.inference_session_id = orphan.verified.sessionId;
+      verifiedFallbackEvents.set(event, { ...orphan.verified, eventSnapshot: null });
+    }
     messages.push(event);
     audioItems.push({ event, fileId: id, fileMeta: orphan.file });
   }
@@ -404,6 +511,11 @@ export async function normalizeCommunications({ collection, resolveFile, transcr
       message._voice_unrecognized = count;
       unrecognizedCount += count;
     }
+    // После штатной обработки вложений закрепляем окончательный объект:
+    // иначе аудиореплика выпала бы из группы, и текст классифицировался бы
+    // без неё. Наличие вложения по-прежнему блокирует всю сессию.
+    const binding = verifiedFallbackEvents.get(message);
+    if (binding) binding.eventSnapshot = JSON.stringify(message);
   }
 
   const chatEvents = messages.filter(message => message.text || message._has_audio_transcript || message._has_files);

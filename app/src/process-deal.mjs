@@ -16,8 +16,14 @@ export async function processDeal({
   dealId, bitrix, llm, resolveFile, downloadFile, transcribe,
   judgeSystemPrompt, writerSystemPrompt, audioWaitEnabledAt, savedAudioWait = null,
   silent = false, screenshots = true, nowMs = null, clock = Date.now, expectedLoseDate = null, expectedHistoryId = null, wait,
-  semanticChatRoles = false,
+  semanticChatRoles = false, verifyFallbackSession,
 }) {
+  if (verifyFallbackSession !== undefined && (semanticChatRoles !== true || silent !== true)) {
+    throw new Error('Проверка сессии доступна только в тихом ручном эксперименте');
+  }
+  if (verifyFallbackSession !== undefined && typeof verifyFallbackSession !== 'function') {
+    throw new TypeError('Проверка сессии должна быть функцией');
+  }
   if (semanticChatRoles === true && silent !== true) {
     throw new Error('Эксперимент определения ролей доступен только в тихом режиме');
   }
@@ -58,7 +64,7 @@ export async function processDeal({
   if (audioWait.action !== 'analyze') return { status: audioWait.action, collection: collected, audioWait };
 
   const normalized = await normalizeCommunications({
-    collection: collected, resolveFile, transcribeVoice: transcribe, screenshots,
+    collection: collected, resolveFile, transcribeVoice: transcribe, screenshots, verifyFallbackSession,
   });
   let chatRoleInferenceStats = null;
   let chatRoleInferenceEvidence = null;
@@ -68,7 +74,7 @@ export async function processDeal({
     const prerequisites = pgDecide({ sources: collected._sources, recognition: { voices: normalized.voice_failures } });
     if (prerequisites.block) return { status: 'blocked', collection: collected, audioWait, pipelineGate: prerequisites };
     const inferred = await inferChatRoles({ communications: normalized.deal_data.communications, client: llm,
-      cutoff: collected.deal_data.lose_date });
+      cutoff: collected.deal_data.lose_date, dealId });
     normalized.deal_data.communications = inferred.communications;
     chatRoleInferenceStats = inferred.stats;
     chatRoleInferenceEvidence = inferred.evidence;
