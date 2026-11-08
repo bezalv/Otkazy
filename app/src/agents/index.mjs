@@ -2,6 +2,7 @@ import { parseJudgeResponse } from './judge.mjs';
 import { skipWriterComment, shouldRunWriter, parseWriterResponse } from './writer.mjs';
 import { buildFinalOutput } from './final-output.mjs';
 import { pgSafeReason } from '../rules/pipeline-gate.mjs';
+import { managerCommentGuard } from './manager-comment-guard.mjs';
 
 function providerFailure(error) {
   return Number.isInteger(error?.status) && error.status >= 100 && error.status <= 599
@@ -231,6 +232,15 @@ export async function runAgents({ prepared, pipelineGate, analytics, screenshotS
   if (rejectUnknownRoleProof === true && (parsed.proof_warnings || []).some((warning) =>
     ['unknown_nonmaterial_as_statement', 'unknown_nonmaterial_metric_as_proof'].includes(warning.code))) {
     return afterRepairFailure('Сбой анализа: судья использовал данные с неизвестным автором как подтверждённое доказательство',
+      prepared, { parsed, judgeResponse }, repaired);
+  }
+  // CRM-комментарий остаётся в материалах, но не превращается в доказанное
+  // решение клиента, когда самих слов клиента нет. Проверка намеренно узкая.
+  const commentCheck = managerCommentGuard(parsed.judge, prepared.facts_packet.facts);
+  if (commentCheck.block) {
+    const reason = commentCheck.reason === 'factory_refusal_without_fact'
+      ? 'Сбой анализа: не удалось автоматически подтвердить технический отказ' : 'Сбой анализа: отказ клиента не подтверждён его словами';
+    return afterRepairFailure(reason,
       prepared, { parsed, judgeResponse }, repaired);
   }
   let writerOutput;

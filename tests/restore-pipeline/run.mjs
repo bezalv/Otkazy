@@ -111,7 +111,7 @@ test('ошибка скриншота блокирует судью', async () =
   assert.equal(result.analysis, undefined);
 });
 
-test('содержательный комментарий доходит до судьи через все проверки', async () => {
+test('комментарий доходит до судьи, но не доказывает слова клиента', async () => {
   let calls = 0;
   const judge = {
     verdict: 'правомерен', verdict_reason_short: 'Клиент отказался', recoverable_level: null,
@@ -132,8 +132,9 @@ test('содержательный комментарий доходит до с
     return original(method, body);
   };
   const result = await processDeal(args);
-  assert.equal(result.status, 'processed');
-  assert.equal(result.analysis.multi_agent_analysis.verdict, 'правомерен');
+  assert.equal(result.status, 'error');
+  assert.equal(result.analysis.multi_agent_analysis, null);
+  assert.match(result.analysis.pipeline_error, /отказ клиента не подтверждён/);
   assert.equal(calls, 1);
 });
 
