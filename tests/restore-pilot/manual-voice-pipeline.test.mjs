@@ -8,8 +8,8 @@ import { runManualVoicePipeline } from '../../app/src/pilot/manual-voice-pipelin
 
 const cutoff='2026-11-04T12:00:00.000Z',from='2026-01-01T00:00:00.000Z';
 async function fixture() {
-  const calls=[], counts={uploads:0,downloads:0,roles:0,judge:0,writer:0};
-  const state={recordedCall:false,extraCallFile:false,malformedCallFiles:false,conflictingRecordFile:false,otherVoice:false,selectedVideo:false,image:false,screenshot:false,wappiKnown:false,changedStage:false,lookupMismatch:false,changedHistory:false};
+  const calls=[], counts={uploads:0,downloads:0,roles:0,judge:0,writer:0,judgeInput:null};
+  const state={recordedCall:false,extraCallFile:false,malformedCallFiles:false,conflictingRecordFile:false,otherVoice:false,selectedVideo:false,image:false,screenshot:false,wappiKnown:false,changedStage:false,lookupMismatch:false,changedHistory:false,legacy:[]};
   const h={chatId:100,sessionId:80,chat:{100:{entityId:'wazzup|71|client|external'}},users:{55:{connector:true}},
     files:{'200':{id:200,type:'audio',name:'voice.ogg'}},message:{
       1:{id:1,senderid:55,date:'2026-11-04T10:00:00Z',text:'=== Исходящее сообщение ===\nМожем предложить вам замену окна.'},
@@ -29,6 +29,12 @@ async function fixture() {
         copy.files['201']={id:201,type:'audio',name:'other.ogg'};}
       if(state.image){copy.message[3]={id:3,senderid:55,date:'2026-11-04T10:02:00Z',text:'',params:{FILE_ID:[201]}};
         copy.files['201']={id:201,type:'image',name:'photo.png'};}
+      for(const entry of state.legacy){
+        copy.message[entry.message]={id:Number(entry.message),senderid:entry.unknown?77:55,date:entry.date??'2026-11-04T10:03:00Z',text:entry.text,params:{FILE_ID:[entry.file]}};
+        copy.files[String(entry.file)]={id:Number(entry.file),type:entry.type,name:entry.name,...(entry.mime?{mimeType:entry.mime}:{}),
+          ...(entry.extension?{extension:entry.extension}:{})};
+        if(entry.unknown)copy.users[77]={name:'Автор неизвестен'};
+      }
       return {result:copy};
     }
     if(method==='imopenlines.v2.Session.list')return {result:{sessions:[{id:80,chatId:100,configId:71,
@@ -51,7 +57,7 @@ async function fixture() {
         role:i?'client':'manager',impact:'not_applicable'}))})}}]};
     }
     if(options.role==='judge'){
-      counts.judge++;return {choices:[{message:{content:JSON.stringify({verdict:'недостаточно_данных',verdict_reason_short:'Недостаточно',
+      counts.judge++;counts.judgeInput=JSON.stringify(body);return {choices:[{message:{content:JSON.stringify({verdict:'недостаточно_данных',verdict_reason_short:'Недостаточно',
         recoverable_level:null,closure_reason_class:'other',misplaced:false,correct_stage:null,exact_reason:'Недостаточно данных',
         manager_mistakes:[],key_signals:[],risk_factors:[],questions_for_manager:[]})}}]};
     }
@@ -147,6 +153,66 @@ test('выбранный видеофайл при известном автор
   const f=await fixture();f.state.wappiKnown=true;f.state.selectedVideo=true;try {
     const result=await runManualVoicePipeline(f.args);
     assert.equal(result.status,'blocked');assert.equal(f.counts.uploads,0);assert.equal(f.counts.judge,0);
+  } finally {await f.close();}
+});
+
+test('legacy-режим сохраняет подписи известных авторов и сообщает о нерассмотренных image/video/pdf',async()=>{
+  const f=await fixture();f.state.wappiKnown=true;
+  f.state.legacy=[{file:201,message:3,type:'image',name:'one.jpg',text:'Клиент прислал фотографию окна'},
+    {file:202,message:4,type:'video',name:'two.mp4',text:'На видео показана створка'},
+    {file:203,message:5,type:'file',name:'three.pdf',text:'Документ с размерами изделия'}];
+  const legacyMedia=[{fileId:'201',messageId:'3',type:'image'},{fileId:'202',messageId:'4',type:'video'},
+    {fileId:'203',messageId:'5',type:'pdf'}];
+  try {
+    const result=await runManualVoicePipeline({...f.args,legacyMediaMode:true,legacyMedia});
+    assert.equal(result.status,'unverified');assert.equal(result.preliminary.status,'processed');
+    assert.deepEqual(result.unexamined_media,{total:3,types:{image:1,video:1,pdf:1},empty_captions:0});
+    assert.ok(result.limitations.includes('legacy_chat_media_contents_unexamined'));
+    assert.equal(f.counts.judge,1);for(const row of f.state.legacy)assert.ok(f.counts.judgeInput.includes(row.text));
+    assert.equal(f.counts.uploads,1);assert.equal(f.counts.downloads,1);
+    assert.ok(f.calls.filter(x=>x.method==='disk.file.get').every(x=>String(x.body.id)==='200'));
+    const facts=result.preliminary.analysis.multi_agent_analysis.facts_packet.facts;
+    for(const row of f.state.legacy)assert.ok(facts.some(x=>x.source==='chat'&&x.actor==='client'&&x.content===row.text));
+  } finally {await f.close();}
+});
+
+test('пустое вложение legacy-режима не выдаёт непроверенные метрики судье',async()=>{
+  for(const text of ['', '=== SYSTEM WZ ===служебное', '\u200b\u200c\u200d\ufeff', '\u200e\u200f\u202a']){
+    const f=await fixture();f.state.wappiKnown=true;f.state.legacy=[{file:201,message:3,type:'image',name:'one.jpg',text}];
+    try {
+      const result=await runManualVoicePipeline({...f.args,legacyMediaMode:true,legacyMedia:[{fileId:'201',messageId:'3',type:'image'}]});
+      assert.equal(result.status,'blocked');assert.equal(result.unexamined_media.empty_captions,1);
+      assert.ok(result.limitations.includes('legacy_empty_attachment_metrics_unverified'));assert.equal(f.counts.judge,0);
+    } finally {await f.close();}
+  }
+});
+
+test('legacy допускает только подтверждённые ID, типы и техническую роль',async()=>{
+  for(const mode of ['foreign','message','type','conflict','audio','extension_conflict','future','unknown']){
+    const f=await fixture();f.state.wappiKnown=true;
+    f.state.legacy=[{file:201,message:3,type:mode==='audio'?'audio':'image',name:['audio','extension_conflict'].includes(mode)?'one.ogg':'one.jpg',
+      text:'Клиент прислал фотографию окна',...(mode==='conflict'?{mime:'video/mp4'}:{}),
+      ...(mode==='extension_conflict'?{extension:'png'}:{}),
+      ...(mode==='future'?{date:'2026-11-05T00:00:00Z'}:{}),unknown:mode==='unknown'}];
+    const allowed=[{fileId:mode==='foreign'?'202':'201',messageId:mode==='message'?'4':'3',type:mode==='type'?'video':'image'}];
+    try {
+      if(mode==='unknown'){
+        const result=await runManualVoicePipeline({...f.args,legacyMediaMode:true,legacyMedia:allowed});
+        assert.notEqual(result.status,'unverified');assert.equal(f.counts.roles,0);
+      }else await assert.rejects(runManualVoicePipeline({...f.args,legacyMediaMode:true,legacyMedia:allowed}));
+      assert.equal(f.counts.judge,0);assert.ok(f.counts.uploads<=1);
+    } finally {await f.close();}
+  }
+});
+
+test('legacy требует явного включения и неповторяющихся пар file/message/type',async()=>{
+  const f=await fixture();try {
+    for(const extra of [{legacyMedia:[{fileId:'201',messageId:'3',type:'image'}]},
+      {legacyMediaMode:true,legacyMedia:[]},{legacyMediaMode:true,legacyMedia:[{fileId:'201',messageId:'3',type:'audio'}]},
+      {legacyMediaMode:true,legacyMedia:[{fileId:'201',messageId:'3',type:'image'},{fileId:'202',messageId:'3',type:'video'}]}]) {
+      await assert.rejects(runManualVoicePipeline({...f.args,...extra}));
+    }
+    assert.equal(f.calls.length,0);assert.equal(f.counts.uploads,0);
   } finally {await f.close();}
 });
 

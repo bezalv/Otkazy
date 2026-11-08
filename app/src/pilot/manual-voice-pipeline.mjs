@@ -50,6 +50,83 @@ function recordedFileIds(row) {
   return result;
 }
 
+function legacyFileType(file) {
+  if (!file || typeof file !== 'object' || Array.isArray(file)) return null;
+  const hints = new Set();
+  for (const value of [file.type, file.TYPE, file.mimeType, file.mime_type, file.MIME_TYPE, file.contentType, file.CONTENT_TYPE]) {
+    const type = String(value ?? '').trim().toLowerCase().split(';')[0];
+    if (!type || ['file','document','application/octet-stream'].includes(type)) continue;
+    if (/^image(?:\/|$)/.test(type)) hints.add('image');
+    else if (/^video(?:\/|$)/.test(type)) hints.add('video');
+    else if (type === 'pdf' || type === 'application/pdf') hints.add('pdf');
+    else return null;
+  }
+  const extensions = [String(file.extension ?? '').toLowerCase().replace(/^\./, ''),
+    ...[file.name, file.NAME].map(name => /\.([a-z0-9]+)$/i.exec(String(name ?? ''))?.[1]?.toLowerCase() || '')];
+  for (const ext of extensions.filter(Boolean)) {
+    if (['jpg','jpeg','png','gif','webp','bmp','heic','heif'].includes(ext)) hints.add('image');
+    else if (['mp4','mov','webm','avi','mkv','mpeg','mpg','m4v'].includes(ext)) hints.add('video');
+    else if (ext === 'pdf') hints.add('pdf');
+    else return null;
+  }
+  return hints.size === 1 ? [...hints][0] : null;
+}
+
+function legacyCaption(row) {
+  return String(row?.text ?? row?.TEXT ?? '')
+    .replace(/^\s*(?:\[(?:B|I|U|S)\]\s*)*===\s*(?:Исходящее|Входящее)\s+сообщение(?:\s*,[^=\r\n]*)?\s*===/i, '')
+    .replace(/===\s*(?:Исходящее|Входящее)\s+сообщение[^=]*===/g, '')
+    .replace(/=== SYSTEM WZ ===[^\n]*/g, '').replace(/\[\/?\w[\w= ]*\]/g, '').replace(/\p{Cf}/gu, '')
+    .replace(/^>>.*$/gm, '').replace(/\n{3,}/g, '\n\n').trim();
+}
+
+// Проверяем только явно выбранные непроанализированные файлы конкретных
+// сообщений. По названию или ID без текущих метаданных тип не предполагаем.
+function verifyLegacyMedia(history, bound, chat, session) {
+  const files = history?.files && typeof history.files === 'object' ? Object.entries(history.files) : [];
+  const rows = history?.message && typeof history.message === 'object' ? Object.entries(history.message) : [];
+  const same = chat === bound.selected.chat && session === bound.selected.session;
+  for (const [key, file] of files) {
+    const fileId = id(file?.id ?? file?.ID ?? (Array.isArray(history.files) ? null : key));
+    if (fileId === bound.selected.file && same) continue;
+    const expected = bound.legacy.get(fileId);
+    if (!same || !expected || legacyFileType(file) !== expected.type) throw new Error('В истории есть непроверенный файл');
+  }
+  for (const [key, row] of rows) {
+    const value = row?.params?.FILE_ID ?? row?.params?.fileId ?? [];
+    const refs = (Array.isArray(value) ? value : [value]).filter(x => x != null && String(x) !== '' && String(x) !== '0');
+    for (const value of refs) {
+      const fileId = id(value);
+      if (fileId === bound.selected.file && same) continue;
+      const expected = bound.legacy.get(fileId);
+      const when = instant(row?.date ?? row?.DATE);
+      if (!same || !expected || id(row?.id ?? row?.ID ?? key) !== expected.message || refs.length !== 1) {
+        throw new Error('В истории есть непроверенное вложение');
+      }
+      if (when === null || when > bound.cutoffMs) throw new Error('Дата вложения не подтверждена');
+    }
+    const text = String(row?.text ?? row?.TEXT ?? '');
+    if (/https?:\/\/\S+\.(?:mp3|mpga|ogg|opus|wav|m4a|oga|png|jpe?g|gif|webp|mp4|mov|pdf)(?:[?#\s\]]|$)/i.test(text)) {
+      throw new Error('В истории есть ссылка на файл');
+    }
+  }
+  if (!same) return;
+  const totals = { image: 0, video: 0, pdf: 0 }, empty = [];
+  for (const [fileId, expected] of bound.legacy) {
+    const metadata = files.filter(([key, file]) => id(file?.id ?? file?.ID ?? (Array.isArray(history.files) ? null : key)) === fileId);
+    const messages = rows.filter(([key, row]) => {
+      const value = row?.params?.FILE_ID ?? row?.params?.fileId ?? [];
+      return id(row?.id ?? row?.ID ?? key) === expected.message && (Array.isArray(value) ? value : [value]).some(x => id(x) === fileId);
+    });
+    if (metadata.length !== 1 || messages.length !== 1 || legacyFileType(metadata[0][1]) !== expected.type) {
+      throw new Error('Перечень вложений не подтверждён историей');
+    }
+    totals[expected.type]++;
+    if (!legacyCaption(messages[0][1])) empty.push(expected.message);
+  }
+  bound.legacySummary = { total: bound.legacy.size, types: totals, empty_captions: empty.length };
+}
+
 // Проверка требует ровно одно сообщение и один FILE_ID. Её применение не
 // доказывает, что остальные сессии сделки получены полностью.
 function selection(history, selected, cutoff) {
@@ -136,14 +213,15 @@ function scopedReader(client, bound, signal) {
       }
       if (method === 'imopenlines.session.history.get') {
         const history = response?.result, chat = id(history?.chatId), session = id(history?.sessionId);
+        if (bound.legacyEnabled) verifyLegacyMedia(history, bound, chat, session);
         if (history?.files && typeof history.files === 'object'
             && Object.entries(history.files).some(([key, file]) => id(file?.id ?? file?.ID ?? key) === selected.file)
             && (chat !== selected.chat || session !== selected.session)) throw new Error('Файл обнаружен вне выбранной сессии');
-        if (history?.files && typeof history.files === 'object'
+        if (!bound.legacyEnabled && history?.files && typeof history.files === 'object'
             && Object.entries(history.files).some(([key, file]) => id(file?.id ?? file?.ID ?? key) !== selected.file)) {
           throw new Error('В истории есть другие файлы');
         }
-        if (history?.message && typeof history.message === 'object'
+        if (!bound.legacyEnabled && history?.message && typeof history.message === 'object'
             && Object.values(history.message).some(row => {
               const value = row?.params?.FILE_ID ?? row?.params?.fileId ?? [];
               const files = Array.isArray(value) ? value : [value];
@@ -196,11 +274,23 @@ export async function runManualVoicePipeline({ dealId, expectedHistoryId, expect
   messageId, fileId, callActivityId = null, callFileId = null, bitrixRestBase, bitrix, llm, sttUrl, sttKey, reserveRequest,
   fetchImpl = globalThis.fetch, probeAudioOnly, tempRoot, judgeSystemPrompt, writerSystemPrompt,
   audioWaitEnabledAt, savedAudioWait = null, nowMs = null, clock = Date.now, wait, signal,
-  maxPages = 20, repairProofErrors = false, silent, semanticChatRoles } = {}) {
+  maxPages = 20, repairProofErrors = false, legacyMediaMode = false, legacyMedia = null, silent, semanticChatRoles } = {}) {
   const deal = id(dealId), transition = id(expectedHistoryId), selected = {
     chat: id(chatId), session: id(sessionId), message: id(messageId), file: id(fileId),
   };
   const call = callActivityId == null && callFileId == null ? null : { activity: id(callActivityId), file: id(callFileId) };
+  const legacy = new Map();
+  if (typeof legacyMediaMode !== 'boolean' || (legacyMediaMode && (!Array.isArray(legacyMedia) || !legacyMedia.length || legacyMedia.length > 20))
+      || (!legacyMediaMode && legacyMedia !== null)) throw new TypeError('Некорректный режим вложений');
+  if (legacyMediaMode) for (const item of legacyMedia) {
+    const file = id(item?.fileId), message = id(item?.messageId), type = item?.type;
+    if (!item || typeof item !== 'object' || Array.isArray(item)
+        || Object.keys(item).sort().join(',') !== 'fileId,messageId,type' || !file || !message
+        || !['image','video','pdf'].includes(type) || legacy.has(file) || file === selected.file
+        || (call && file === call.file) || [...legacy.values()].some(value => value.message === message)
+        || message === selected.message) throw new TypeError('Некорректный список вложений');
+    legacy.set(file, { message, type });
+  }
   const cutoffMs = instant(expectedLoseDate), fromMs = instant(from); let restBase;
   try { restBase = new URL(bitrixRestBase); } catch { throw new TypeError('Некорректный адрес Битрикса'); }
   if (silent !== true || semanticChatRoles !== true || !deal || !transition || Object.values(selected).some(x => !x)
@@ -216,7 +306,7 @@ export async function runManualVoicePipeline({ dealId, expectedHistoryId, expect
   }
   signal.throwIfAborted();
   const bound = { deal, selected, call, callSeen: null, cutoffMs, from: new Date(fromMs).toISOString(), cutoff: new Date(cutoffMs).toISOString(),
-    maxPages, restBase, mediaAllowed: false };
+    maxPages, restBase, legacy, legacyEnabled: legacyMediaMode, legacySummary: null, mediaAllowed: false };
   const reader = scopedReader(bitrix, bound, signal);
   const lookup = createSessionLookup({ client: reader, from: bound.from, maxPages, signal });
   const verifySession = createGeneralSessionVerifier({ client: reader, lookupSession: lookup, dealId: deal,
@@ -284,7 +374,8 @@ export async function runManualVoicePipeline({ dealId, expectedHistoryId, expect
   };
   const restrictedModel = createManualModelLimiter(llm, { repairProofErrors, signal });
   const guardedModel = { async complete(body, options = {}) {
-    if (options.role !== 'chat-role-inference' && (!voiceCompleted || (call && !callCompleted))) {
+    if (options.role !== 'chat-role-inference' && (!voiceCompleted || (call && !callCompleted)
+        || (legacyMediaMode && (!bound.legacySummary || bound.legacySummary.empty_captions > 0)))) {
       throw new Error('Не все выбранные аудиозаписи распознаны');
     }
     return restrictedModel.complete(body, options);
@@ -296,8 +387,12 @@ export async function runManualVoicePipeline({ dealId, expectedHistoryId, expect
     verifyFallbackSession: verifySession, verifyLatestSession: verifySession,
     expectedHistoryId: transition, expectedLoseDate: bound.cutoff, nowMs, clock, wait });
   signal.throwIfAborted();
-  return { status: !voiceCompleted || (call && !callCompleted) ? 'blocked' : result.status === 'processed' ? 'unverified' : result.status, preliminary: result,
+  return { status: !voiceCompleted || (call && !callCompleted) || (legacyMediaMode && (!bound.legacySummary || bound.legacySummary.empty_captions > 0))
+      ? 'blocked' : result.status === 'processed' ? 'unverified' : result.status, preliminary: result,
+    ...(legacyMediaMode ? { unexamined_media: bound.legacySummary } : {}),
     delivery_permitted: false, history_complete: null, limitations: ['one_session_not_full_history',
       call ? 'selected_voice_and_call_only' : 'selected_voice_only', 'other_calls_and_attachments_not_processed', 'screenshots_disabled',
+      ...(legacyMediaMode ? ['legacy_chat_media_contents_unexamined'] : []),
+      ...(bound.legacySummary?.empty_captions ? ['legacy_empty_attachment_metrics_unverified'] : []),
       'semantic_roles_are_inference', 'no_delivery'] };
 }
