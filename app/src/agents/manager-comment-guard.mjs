@@ -3,6 +3,9 @@
 // полную смысловую сверку обоснования этот контроль не заменяет.
 const CLIENT_SOURCES = new Set(['call_transcript', 'chat', 'chat_voice_transcript', 'screenshot_chat']);
 const CLIENT_REASON_CLASSES = new Set(['price', 'competitor', 'no_need', 'no_money', 'timing']);
+// Само по себе приветствие не подтверждает решение об отказе. Список намеренно
+// узкий: любые дополнительные слова оставляются судье, включая короткое «нет».
+const GREETING_ONLY = /^\s*(?:здравствуйте|здравствуй|привет|добрый\s+день|добрый\s+вечер|доброе\s+утро|алло)[\s.!?,…]*$/iu;
 const FACTORY_SOURCES = new Set(['crm_comment', 'call_transcript', 'chat', 'chat_voice_transcript', 'screenshot_chat']);
 const FACTORY_CLAIM = /(?:техническ[^.!?;\n]{0,25}(?:отказ|невозмож)|(?:завод|производств|цех|монтажник)[^.!?;\n]{0,45}(?:отказ|не\s+(?:производ|изготов|может|бер)|невозмож)|отказ[^.!?;\n]{0,30}(?:завод|производств|цех|монтажник))/iu;
 const FACTORY_SUPPORT = /(?:технически\s+(?:не\s*возможно|невозможно)|техническ[^.!?;\n]{0,25}невозмож|не\s+(?:производим|изготавливаем|делаем\s+такое)|не\s+наш\s+профиль|не\s+попадает\s+в\s+производство|не\s+та\s+серия|регион\s+не\s+обслуживаем|засыпной\s+дом|деревянный\s+сруб|плохие\s+перекрытия|(?:завод[ауыом]*|производств[ауыом]*|цех[ауыом]*|монтажник[аыов]*)\s+(?:(?:нам|официально|технически|сам|само)\s+){0,2}(?:отказ|не\s+(?:производ|изготов|может|бер)|невозмож)|отказ(?:а|у|ом|е|ы|ов|ам|ами|ах)?\s+(?:завод[ауыом]*|производств[ауыом]*|цех[ауыом]*|монтажник[аыов]*))/iu;
@@ -28,16 +31,17 @@ function assertsDecision(value) {
 }
 
 /**
- * Проверяется только очевидная ситуация с CRM-комментарием и без каких-либо
- * клиентских слов. Технический отказ завода класса other остаётся на оценку
- * судьи по подтверждающим фактам; поле причины само по себе ничего не доказывает.
+ * Проверяется только очевидная ситуация с CRM-комментарием без клиентских
+ * слов или только с приветствием. Это не проверка смысла иных реплик клиента.
+ * Технический отказ завода остаётся на оценку судьи по подтверждающим фактам;
+ * поле причины само по себе ничего не доказывает.
  */
 export function managerCommentGuard(judge, facts) {
   if (!judge || typeof judge !== 'object' || !Array.isArray(facts)) return { block: false };
   const hasComment = facts.some(f => f?.source === 'crm_comment' && typeof f.content === 'string' && f.content.trim());
   if (!hasComment) return { block: false };
   const hasClientWords = facts.some(f => f?.actor === 'client' && CLIENT_SOURCES.has(f.source)
-    && typeof f.content === 'string' && !!f.content.trim());
+    && typeof f.content === 'string' && !!f.content.trim() && !GREETING_ONLY.test(f.content));
   const claimsFactory = judge.verdict === 'правомерен' && [judge.verdict_reason_short, judge.exact_reason]
     .some(value => typeof value === 'string' && FACTORY_CLAIM.test(value));
   const factorySupport = facts.some(f => FACTORY_SOURCES.has(f?.source)

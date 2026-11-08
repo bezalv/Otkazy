@@ -22,17 +22,19 @@ test('причина клиента не устанавливается толь
 });
 
 test('неподтверждённый отказ останавливается до писателя и не выдаёт вердикт', async () => {
-  let calls = 0;
-  const result = await runAgents({ prepared: { deal_id: 42, facts_packet: { facts: [comment], metrics: {} },
+  for (const facts of [[comment], [comment, { ...client, content: 'Здравствуйте!' }]]) {
+    let calls = 0;
+    const result = await runAgents({ prepared: { deal_id: 42, facts_packet: { facts, metrics: {} },
     deal_card: {}, communications: [], journal_text: '', analytics_text: '', transcription_stats: {},
     judge_request_body: { model: 'openai/gpt-6-sol' }, _data_enough: true },
     pipelineGate: { block: false }, analytics: {}, writerSystemPrompt: 'Промпт',
     client: { async complete() { calls++; return response({ ...judge, manager_mistakes: [
       { mistake: 'Ошибка', proof_type: 'crm_comment', proof_fact_ids: ['f001'] },
     ] }); } } });
-  assert.equal(calls, 1);
-  assert.equal(result.multi_agent_analysis, null);
-  assert.match(result.pipeline_error, /отказ клиента не подтверждён/);
+    assert.equal(calls, 1);
+    assert.equal(result.multi_agent_analysis, null);
+    assert.match(result.pipeline_error, /отказ клиента не подтверждён/);
+  }
 });
 
 test('непустая прямая реплика клиента допускает дальнейшую проверку судьёй', () => {
@@ -40,6 +42,31 @@ test('непустая прямая реплика клиента допуска
   assert.equal(managerCommentGuard(judge, [comment, { ...client, actor: 'unknown' }]).block, true);
   assert.equal(managerCommentGuard(judge, [comment, { ...client, content: '   ' }]).block, true);
   assert.equal(managerCommentGuard(judge, [comment, { ...client, source: 'crm_comment' }]).block, true);
+});
+
+test('одно лишь приветствие клиента не подтверждает отказ из комментария менеджера', () => {
+  for (const content of ['Здравствуйте', '  ЗДРАВСТВУЙТЕ!  ', 'Добрый день.', 'Добрый вечер', 'Доброе утро', 'Алло?', 'Привет…']) {
+    assert.deepEqual(managerCommentGuard(judge, [comment, { ...client, content }]),
+      { block: true, reason: 'client_refusal_without_client_words' }, content);
+  }
+  assert.equal(managerCommentGuard(judge, [comment, { ...client, content: 'Здравствуйте' },
+    { ...client, fact_id: 'f003', content: 'Добрый день!' }]).block, true);
+  for (const content of ['Нет', 'Дорого', 'Не надо', 'Я уже заказал', 'Здравствуйте, нет',
+    'Здравствуйте, подскажите цену', 'Алло, заказывать не буду']) {
+    assert.equal(managerCommentGuard(judge, [comment, { ...client, content }]).block, false, content);
+  }
+  assert.equal(managerCommentGuard(judge, [comment, { ...client, content: 'Привет' }, client]).block, false);
+});
+
+test('приветствие не меняет недозвон или подтверждённый технический отказ', () => {
+  const greeting = { ...client, content: 'Здравствуйте!' };
+  const unreachable = { ...judge, closure_reason_class: 'customer_unreachable',
+    verdict_reason_short: 'Клиент не отвечает на обращения', exact_reason: 'Попытки дозвона подтверждены метриками.' };
+  assert.equal(managerCommentGuard(unreachable, [comment, greeting]).block, false);
+  const factory = { ...comment, content: 'Производство отказало: технически невозможно изготовление.' };
+  const internal = { ...judge, closure_reason_class: 'other', verdict_reason_short: 'Технический отказ производства',
+    exact_reason: 'Производство не может изготовить конструкцию.' };
+  assert.equal(managerCommentGuard(internal, [factory, greeting]).block, false);
 });
 
 test('недозвон по метрикам и подтверждённый технический отказ завода не отсекаются', () => {
