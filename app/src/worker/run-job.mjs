@@ -27,7 +27,10 @@ export function toPersistenceResult(job, outcome, audioOriginHistoryId = null) {
     ...(outcome?.status === 'blocked' && outcome.pipelineGate?.final === true
       && ['author_ambiguous', 'chat_connector_unknown'].includes(outcome.pipelineGate.kind)
       ? { error_kind: outcome.pipelineGate.kind } : {}),
-    _error: outcome?.pipelineGate?.pipeline_error || outcome?.analysis?.pipeline_error || collection._error
+    _error: outcome?.pipelineGate?.pipeline_error || outcome?.analysis?.pipeline_error
+      || (collection._sources?.openlines?.reason === 'latest_session_link_unverified'
+        ? 'сбор неполный: обнаружена новая сессия чата, её связь со сделкой не подтверждена' : null)
+      || collection._error
       || (outcome?.status === 'source_incomplete' ? 'сбор неполный: не установлены данные для ожидания записи' : 'Сбой обработки сделки'),
   };
 }

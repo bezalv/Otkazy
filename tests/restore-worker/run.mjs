@@ -2,6 +2,15 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { runJob, toPersistenceResult } from '../../app/src/worker/run-job.mjs';
 
+test('причина непроверенной сессии сохраняется без идентификаторов и секретов', () => {
+  const job = { id:'job', deal_id:42, lease_token:'lease', silent:true };
+  const result = toPersistenceResult(job, { status:'error', collection:{
+    _error:'сбор неполный: открытые линии', _sources:{openlines:{reason:'latest_session_link_unverified'}} } });
+  assert.match(result._error, /новая сессия чата/);
+  assert.doesNotMatch(result._error, /42|lease/);
+  assert.equal(result._status,'error');
+});
+
 const job = { id: 'job', lease_token: 'lease', deal_id: 42, lose_date: '2026-11-01T00:00:00Z', silent: false, screenshots: true };
 function deps(overrides = {}) {
   const calls = [];

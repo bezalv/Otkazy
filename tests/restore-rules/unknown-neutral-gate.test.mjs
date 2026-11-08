@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { pgDecide, pgInitMarks, pgMarkComplete } from '../../app/src/rules/pipeline-gate.mjs';
 import { dsEvaluate } from '../../app/src/rules/data-sufficiency.mjs';
+import { trustNeutralReaction } from '../../app/src/analysis/chat-role-trust.mjs';
 
 function marks() {
   const sources = pgInitMarks();
@@ -12,9 +13,11 @@ const neutral = () => ({ type: 'chat', connector_id: 'wazzup', role: 'unknown', 
   text: '👍', _wazzup_author_ambiguous: true, _unknown_role_nonmaterial: 'semantic_inference' });
 
 test('разрешение неопределённого автора доступно только в явном эксперименте', () => {
-  const communications = [neutral(), { ...neutral(), text: 'Спасибо!' }];
+  const communications = [trustNeutralReaction(neutral()), trustNeutralReaction({ ...neutral(), text: 'Спасибо!' })];
   assert.equal(pgDecide({ sources: marks(), communications }).kind, 'author_ambiguous');
   assert.equal(pgDecide({ sources: marks(), communications, allowNonmaterialUnknown: true }).block, false);
+  const cloned = JSON.parse(JSON.stringify(communications));
+  assert.equal(pgDecide({ sources: marks(), communications: cloned, allowNonmaterialUnknown: true }).kind, 'author_ambiguous');
 });
 
 test('маркер не ослабляет защиту для содержательных или неверных записей', () => {
@@ -27,16 +30,16 @@ test('маркер не ослабляет защиту для содержат�
     { file_id: '7' }, { files: [] },
   ];
   for (const changes of variants) {
-    const item = { ...neutral(), ...changes };
+    const item = trustNeutralReaction({ ...neutral(), ...changes });
     assert.equal(pgDecide({ sources: marks(), communications: [item], allowNonmaterialUnknown: true }).block, true, JSON.stringify(changes));
   }
 });
 
 test('разрешённая реплика не отменяет неполные источники, сбой распознавания или неизвестный коннектор', () => {
-  assert.equal(pgDecide({ sources: pgInitMarks(), communications: [neutral()], allowNonmaterialUnknown: true }).kind, 'collect');
-  assert.equal(pgDecide({ sources: marks(), communications: [neutral()], allowNonmaterialUnknown: true,
+  assert.equal(pgDecide({ sources: pgInitMarks(), communications: [trustNeutralReaction(neutral())], allowNonmaterialUnknown: true }).kind, 'collect');
+  assert.equal(pgDecide({ sources: marks(), communications: [trustNeutralReaction(neutral())], allowNonmaterialUnknown: true,
     recognition: { calls: [{ technical_failure: true, error: 'error' }] } }).kind, 'recognition');
-  assert.equal(pgDecide({ sources: marks(), communications: [neutral(), { _chat_connector_unknown: true }],
+  assert.equal(pgDecide({ sources: marks(), communications: [trustNeutralReaction(neutral()), { _chat_connector_unknown: true }],
     allowNonmaterialUnknown: true }).kind, 'chat_connector_unknown');
 });
 

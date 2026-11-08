@@ -12,7 +12,7 @@ const ambiguous = pgDecide({ sources, communications: [{ _wazzup_author_ambiguou
 assert.equal(ambiguous.block, true);
 assert.equal(ambiguous.kind, 'author_ambiguous');
 assert.equal(ambiguous.final, true);
-assert.match(ambiguous.pipeline_error, /автор сообщения Wazzup/);
+assert.match(ambiguous.pipeline_error, /автор сообщения чата/);
 const unknownConnector = pgDecide({ sources, communications: [{ _chat_connector_unknown: true }] });
 assert.equal(unknownConnector.block, true);
 assert.equal(unknownConnector.kind, 'chat_connector_unknown');

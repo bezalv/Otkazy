@@ -143,6 +143,7 @@ function withChat(args, connector, messages) {
     if (method === 'crm.activity.list' && body.filter.PROVIDER_ID === 'IMOPENLINES_SESSION') return { result: [{ ASSOCIATED_ENTITY_ID: '80' }] };
     if (method === 'imopenlines.crm.chat.get') return { result: [{ CHAT_ID: 100, CONNECTOR_ID: connector, CONNECTOR_TITLE: connector }] };
     if (method === 'imopenlines.session.history.get') return { result: {
+      sessionId: 80, chatId: 100,
       chat: { 100: {} }, users: { 55: { connector: true, name: 'Wazzup App' } }, message: messages, files: {},
     } };
     return original(method, body);
@@ -167,7 +168,7 @@ test('неоднозначный автор Wazzup блокирует верди
   });
   assert.equal(outcome.status, 'error');
   assert.equal(stored._status, 'error');
-  assert.match(stored._error, /автор сообщения Wazzup/);
+  assert.match(stored._error, /автор сообщения чата/);
   assert.equal(llmCalls, 0);
   assert.equal(deliveries, 0);
 });

@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { chatMillisTimestamp } from '../time-precision.mjs';
 
 // Доказательство живёт только в памяти процесса; поля из ответа Битрикса и
 // сериализованной коммуникации сами по себе не дают права на классификацию.
@@ -70,7 +71,7 @@ function confirmedBitrixManager(user) {
     && user.externalAuthId.trim().toLowerCase() !== 'imconnector';
 }
 
-function roleForMessage(message, text, users, isWazzup, connectorUnknown, connectorConflict) {
+function roleForMessage(message, text, users, isWazzup, connectorUnknown, connectorConflict, isWappi = false) {
   const senderId = String(message.senderid || message.SENDER_ID || message.author_id || message.AUTHOR_ID || '0');
   const user = senderId !== '0' ? users?.[senderId] : null;
   if (connectorConflict) return { role: 'unknown', author: 'Участник чата' };
@@ -95,10 +96,16 @@ function roleForMessage(message, text, users, isWazzup, connectorUnknown, connec
     }
     return { role: 'unknown', author: 'Участник чата' };
   }
-  const author = text.match(/===\s*(?:Исходящее|Входящее)\s+сообщение,\s*автор:\s*[^(]*\(([^)]+)\)/);
+  // Формат заголовка Wazzup не является подтверждением направления Wappi.
+  const author = !isWappi && text.match(/===\s*(?:Исходящее|Входящее)\s+сообщение,\s*автор:\s*[^(]*\(([^)]+)\)/);
   if (author) return { role: 'Менеджер', author: author[1].trim() };
   if (user) {
     const role = userRole(user);
+    // У Wappi отсутствие признаков внешнего пользователя ещё не делает его
+    // сотрудником. Сохраняем неопределённость, пока сотрудник не подтверждён.
+    if (isWappi && role === 'Менеджер' && !confirmedBitrixManager(user)) {
+      return { role: 'unknown', author: 'Участник чата' };
+    }
     return { role, author: role === 'Клиент' ? 'Клиент' : (user.name || user.firstName || 'Менеджер') };
   }
   return { role: 'unknown', author: 'Участник чата' };
@@ -147,18 +154,7 @@ function safeId(value) {
 }
 
 function strictTime(value) {
-  if (typeof value !== 'string') return null;
-  const m = /^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2}):(\d{2})(?:\.\d{1,9})?(Z|[+-]\d{2}:?\d{2})$/i.exec(value);
-  if (!m) return null;
-  const [year, month, day, hour, minute, second] = m.slice(1, 7).map(Number);
-  if (!year || month < 1 || month > 12 || day < 1 || day > new Date(Date.UTC(year, month, 0)).getUTCDate()
-      || hour > 23 || minute > 59 || second > 59) return null;
-  if (m[7].toUpperCase() !== 'Z') {
-    const z = m[7].slice(1).replace(':', '');
-    if (Number(z.slice(0, 2)) > 23 || Number(z.slice(2)) > 59) return null;
-  }
-  const time = Date.parse(value);
-  return Number.isFinite(time) ? time : null;
+  return chatMillisTimestamp(value)?.getTime() ?? null;
 }
 
 function historySnapshot(history) {
@@ -178,11 +174,16 @@ function lineId(history, chat) {
 }
 
 async function verifyFallback({ collection, session, chatId, meta, verifyFallbackSession }) {
-  if (collection.silent !== true || typeof verifyFallbackSession !== 'function' || !meta.isWazzup
-      || session.session_id != null) return null;
+  if (collection.silent !== true || typeof verifyFallbackSession !== 'function'
+      || (!meta.isWazzup && !meta.isWappi) || (meta.isWazzup && session.session_id != null)) return null;
   const deal = safeId(collection.deal_id), chat = safeId(chatId), history = session.history;
   const sessionId = safeId(history?.sessionId), cutoff = strictTime(collection.deal_data?.lose_date);
   const line = chat && lineId(history, chat);
+  const explicitSession = session.session_id == null ? null : safeId(session.session_id);
+  const matchingSessions = () => collection.raw.sessions.filter(item => safeId(item?.history?.chatId) === chat
+    && safeId(item?.history?.sessionId) === sessionId);
+  if ((session.session_id != null && explicitSession !== sessionId)
+      || matchingSessions().length !== 1 || matchingSessions()[0] !== session) return null;
   if (!deal || !chat || !sessionId || cutoff === null || !line || safeId(history?.chatId) !== chat
       || safeId(session.chat_id) !== chat || collection.raw.chats.filter(item => safeId(item?.CHAT_ID) === chat).length !== 1) return null;
   const snapshot = historySnapshot(history);
@@ -211,10 +212,13 @@ async function verifyFallback({ collection, session, chatId, meta, verifyFallbac
       || JSON.stringify(collection.raw.chats.find(item => safeId(item?.CHAT_ID) === chat)) !== chatSnapshot
       || safeId(collection.deal_id) !== deal
       || strictTime(collection.deal_data?.lose_date) !== cutoff || safeId(session.chat_id) !== chat
-      || session.session_id != null || lineId(history, chat) !== line) return null;
+      || (session.session_id == null ? null : safeId(session.session_id)) !== explicitSession
+      || matchingSessions().length !== 1 || matchingSessions()[0] !== session
+      || lineId(history, chat) !== line) return null;
   // Это подтверждение ОДНОЙ сессии; полноту предыдущей истории и смен линий
   // оно не доказывает. Проверяющий — доверенная внутренняя зависимость.
-  return { deal, chat, sessionId, cutoff, history, sha256: snapshot.sha256 };
+  return { deal, chat, sessionId, cutoff, history, sha256: snapshot.sha256,
+    eventSession: explicitSession ?? `chat_${chat}`, matchingSessions, session, members: [] };
 }
 
 // Используется только классификатором в том же процессе. Копирование/JSON
@@ -225,13 +229,28 @@ export function verifiedInferenceSession(event, { dealId, cutoff, cache } = {}) 
   try { eventSnapshot = JSON.stringify(event); } catch { return null; }
   if (!binding || safeId(dealId) !== binding.deal || strictTime(cutoff) !== binding.cutoff
       || safeId(event.chat_id) !== binding.chat || safeId(event.inference_session_id) !== binding.sessionId
-      || event.session_id !== `chat_${binding.chat}` || eventSnapshot !== binding.eventSnapshot) return null;
+      || String(event.session_id) !== binding.eventSession || eventSnapshot !== binding.eventSnapshot
+      || binding.session.history !== binding.history
+      || binding.matchingSessions().length !== 1 || binding.matchingSessions()[0] !== binding.session) return null;
   let valid = cache?.get(binding.history);
   if (valid === undefined) {
     valid = historySnapshot(binding.history)?.sha256 === binding.sha256;
     cache?.set(binding.history, valid);
   }
   return valid ? binding.sessionId : null;
+}
+
+// Полный набор видимых событий той же подтверждённой сессии, включая поздние.
+// Одних корректных снимков отдельных элементов недостаточно: один можно удалить.
+export function verifiedInferenceGroup(events, { dealId, cutoff } = {}) {
+  if (!Array.isArray(events) || !events.length) return false;
+  const binding = verifiedFallbackEvents.get(events[0]);
+  if (!binding || !Array.isArray(binding.members) || binding.members.length !== events.length) return false;
+  const actual = new Set(events);
+  if (actual.size !== events.length || binding.members.some(item => !actual.has(item))) return false;
+  const cache = new Map();
+  return events.every(item => verifiedFallbackEvents.get(item)?.members === binding.members
+    && verifiedInferenceSession(item, { dealId, cutoff, cache }) === binding.sessionId);
 }
 
 function callEvent(call) {
@@ -325,6 +344,7 @@ export async function normalizeCommunications({ collection, resolveFile, transcr
     return [String(chat.CHAT_ID), {
       connector, title, connectorUnknown: connector.toLowerCase() === 'unknown' || conflict, connectorConflict: conflict,
       isWazzup: idIsWazzup && !conflict,
+      isWappi: !conflict && (connector.toLowerCase().includes('wappi') || titleIsWappi),
     }];
   }));
   const messages = [];
@@ -339,11 +359,37 @@ export async function normalizeCommunications({ collection, resolveFile, transcr
     const history = session.history;
     if (!history || typeof history !== 'object' || Array.isArray(history)) throw new Error('Некорректная история открытой линии');
     if (!history.message || typeof history.message !== 'object') throw new Error('В истории открытой линии нет списка сообщений');
-    const chatId = session.chat_id ?? Object.keys(history.chat || {})[0] ?? null;
+    const historyChatIds = Object.keys(history.chat || {});
+    const chatId = session.chat_id ?? history.chatId ?? (historyChatIds.length === 1 ? historyChatIds[0] : null);
+    if (session.chat_id != null && history.chatId != null && String(session.chat_id) !== String(history.chatId)) {
+      throw new Error('История открытой линии относится к другому чату');
+    }
+    if (chatId == null && (Object.keys(history.message).length || Object.keys(history.files || {}).length)) {
+      throw new Error('Не подтверждён чат истории открытой линии');
+    }
+    if (chatId != null && historyChatIds.length && !Object.hasOwn(history.chat, String(chatId))) {
+      throw new Error('Чат отсутствует в карте истории открытой линии');
+    }
     const sessionId = session.session_id ?? `chat_${chatId}`;
-    const meta = chatMeta.get(String(chatId)) || { connector: 'unknown', title: 'unknown', isWazzup: false, connectorUnknown: true };
-    const verified = await verifyFallback({ collection, session, chatId, meta, verifyFallbackSession });
+    const meta = chatMeta.get(String(chatId)) || { connector: 'unknown', title: 'unknown', isWazzup: false, isWappi: false, connectorUnknown: true };
     const users = history.users || {};
+    // Если все Wappi-авторы уже известны, вторая проверка истории и поиск
+    // сессии не нужны: семантический классификатор всё равно не вызывается.
+    const hasWappiCandidate = meta.isWappi && Object.values(history.message).some(message => {
+      if (!message || typeof message !== 'object') return false;
+      const text = message.text || message.TEXT || '';
+      const params = message.params || {};
+      const rawIds = params.FILE_ID || params.fileId || [];
+      const ids = (Array.isArray(rawIds) ? rawIds : [rawIds])
+        .filter(id => id != null && String(id) !== '' && String(id) !== '0');
+      const count = ids.length + (!ids.length && audioLink(text) ? 1 : 0);
+      if (systemMessage(message, text, count) || (!cleanChatText(text, false) && !count)) return false;
+      return roleForMessage(message, text, users, false, meta.connectorUnknown, meta.connectorConflict, true).role === 'unknown';
+    });
+    const verified = (!meta.isWappi || hasWappiCandidate)
+      ? await verifyFallback({ collection, session, chatId, meta, verifyFallbackSession }) : null;
+    const sessionMessageStart = messages.length;
+    const sessionFileRefs = new Set();
     const files = sessionFiles(history.files);
     const byId = new Map(files.filter(file => file && file.id != null).map(file => [String(file.id), file]));
     for (const [key, message] of Object.entries(history.message || {})) {
@@ -372,7 +418,7 @@ export async function normalizeCommunications({ collection, resolveFile, transcr
       const link = ids.length ? null : audioLink(text);
       const count = ids.length + (link ? 1 : 0);
       if (systemMessage(message, text, count)) { systemDropped++; continue; }
-      const { role, author } = roleForMessage(message, text, users, meta.isWazzup, meta.connectorUnknown, meta.connectorConflict);
+      const { role, author } = roleForMessage(message, text, users, meta.isWazzup, meta.connectorUnknown, meta.connectorConflict, meta.isWappi);
       const cleaned = link ? '' : cleanChatText(text, meta.isWazzup);
       if (!cleaned && !count) continue;
       const msgKey = `${sessionId}_${messageId}`;
@@ -382,19 +428,32 @@ export async function normalizeCommunications({ collection, resolveFile, transcr
         author_id: message.author_id || message.AUTHOR_ID || 0, author_name: author,
         role, direction: role === 'Менеджер' ? 'outgoing' : role === 'Клиент' ? 'incoming' : 'unknown',
         ...(meta.isWazzup && role === 'unknown' ? { _wazzup_author_ambiguous: true } : {}),
+        ...(meta.isWappi ? { connector_family: 'wappi' } : {}),
+        ...(meta.isWappi && role === 'unknown' ? { _wappi_author_ambiguous: true } : {}),
         ...(meta.connectorUnknown && role === 'unknown' ? { _chat_connector_unknown: true } : {}),
         text: cleaned, is_system: false, _has_audio: count > 0, _has_files: count > 0,
       };
       if (verified) {
         event.inference_session_id = verified.sessionId;
+        verified.members.push(event);
         verifiedFallbackEvents.set(event, { ...verified, eventSnapshot: JSON.stringify(event) });
       }
       messages.push(event);
       for (const id of ids) {
         referencedFiles.add(id);
+        sessionFileRefs.add(id);
         audioItems.push({ event, fileId: id, fileMeta: byId.get(id) || null });
       }
       if (link) audioItems.push({ event, fileId: null, link });
+    }
+    // Непривязанный image/video остаётся частью истории, даже если отдельного
+    // сообщения у него нет. Без его содержания текстовый контекст неполон.
+    if (files.some(file => file?.id == null || (!sessionFileRefs.has(String(file.id)) && knownNonAudio(file)))) {
+      for (const event of messages.slice(sessionMessageStart)) {
+        event._session_unreferenced_files = true;
+        const binding = verifiedFallbackEvents.get(event);
+        if (binding) binding.eventSnapshot = JSON.stringify(event);
+      }
     }
     for (const file of files) {
       if (!audioMetadata(file)) {
@@ -415,7 +474,8 @@ export async function normalizeCommunications({ collection, resolveFile, transcr
     const user = authorId !== '0' ? orphan.users[authorId] : null;
     const role = orphan.meta.connectorConflict ? 'unknown' : orphan.meta.isWazzup || orphan.meta.connectorUnknown
       ? (confirmedBitrixManager(user) ? 'Менеджер' : 'unknown')
-      : (user ? userRole(user) : 'Клиент');
+      : (user ? (orphan.meta.isWappi && userRole(user) === 'Менеджер' && !confirmedBitrixManager(user) ? 'unknown' : userRole(user))
+        : (orphan.meta.isWappi ? 'unknown' : 'Клиент'));
     const author = role === 'Менеджер' ? (user.name || user.firstName || 'Менеджер') : role === 'Клиент' ? 'Клиент' : 'Участник чата';
     const event = {
       type: 'chat', channel: orphan.meta.title, connector_id: orphan.meta.connector,
@@ -423,11 +483,14 @@ export async function normalizeCommunications({ collection, resolveFile, transcr
       date: orphan.file.date || null, author_id: authorId, author_name: author,
       role, direction: role === 'Менеджер' ? 'outgoing' : role === 'Клиент' ? 'incoming' : 'unknown', text: '',
       ...(orphan.meta.isWazzup && role === 'unknown' ? { _wazzup_author_ambiguous: true } : {}),
+      ...(orphan.meta.isWappi ? { connector_family: 'wappi' } : {}),
+      ...(orphan.meta.isWappi && role === 'unknown' ? { _wappi_author_ambiguous: true } : {}),
       ...(orphan.meta.connectorUnknown && role === 'unknown' ? { _chat_connector_unknown: true } : {}),
       is_system: false, _has_audio: true, _has_files: true,
     };
     if (orphan.verified) {
       event.inference_session_id = orphan.verified.sessionId;
+      orphan.verified.members.push(event);
       verifiedFallbackEvents.set(event, { ...orphan.verified, eventSnapshot: null });
     }
     messages.push(event);

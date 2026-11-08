@@ -24,6 +24,7 @@ function fixture(withAudio) {
     if (method === 'crm.activity.list' && body.filter.PROVIDER_ID === 'IMOPENLINES_SESSION') return { result: [{ ASSOCIATED_ENTITY_ID: '80' }] };
     if (method === 'imopenlines.crm.chat.get') return { result: [{ CHAT_ID: 100, CONNECTOR_ID: 'wazzup' }] };
     if (method === 'imopenlines.session.history.get') return { result: {
+      sessionId: 80, chatId: 100,
       chat: { 100: {} }, users: { 55: { connector: true } }, files: {},
       message: { 1: { id: 1, senderid: 55, text: '=== Исходящее сообщение ===\nХорошо' } },
     } };

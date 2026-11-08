@@ -114,7 +114,7 @@ test('собираются все страницы и уникальные се�
       }
       if (method === 'imopenlines.crm.chat.get') return { result: [{ CHAT_ID: '25' }] };
       if (method === 'imopenlines.session.history.get') {
-        return { result: { message: { 1: { senderid: 0, text: '', params: { FILE_ID: [7] } } }, chat: { 25: {} }, files: { 7: attachment } } };
+        return { result: { sessionId: 99, chatId: 25, message: { 1: { senderid: 0, text: '', params: { FILE_ID: [7] } } }, chat: { 25: {} }, files: { 7: attachment } } };
       }
     },
   });
@@ -126,7 +126,7 @@ test('собираются все страницы и уникальные се�
   assert.equal(result.raw.sessions.length, 1);
   assert.deepEqual(result.raw.sessions[0].history.files[7], attachment);
   assert.deepEqual(result.raw.sessions[0].history.message[1].params.FILE_ID, [7]);
-  assert.equal(calls.filter(call => call.method === 'imopenlines.session.history.get').length, 1);
+  assert.equal(calls.filter(call => call.method === 'imopenlines.session.history.get').length, 2);
   assert.ok(Object.values(result._sources).every(source => source.complete));
 });
 
@@ -137,7 +137,7 @@ test('при отсутствии сообщений в сессии вызыв�
         return { result: [{ ASSOCIATED_ENTITY_ID: '99' }] };
       }
       if (method === 'imopenlines.crm.chat.get') return { result: [{ CHAT_ID: '25' }] };
-      if (method === 'imopenlines.session.history.get') return { result: { message: {}, files: {} } };
+      if (method === 'imopenlines.session.history.get') return { result: { sessionId: 99, chatId: 25, message: {}, files: {} } };
     },
   });
   const result = await collectDeal({ client, dealId: 42, now: NOW, wait });

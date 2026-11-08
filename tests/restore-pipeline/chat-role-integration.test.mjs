@@ -18,7 +18,7 @@ function fixture({ messages = baseMessages(), enabled = true, response = 'ok', i
     if (method === 'crm.stagehistory.list') return { result: { items: [{ ID: '101', STAGE_ID: 'C23:LOSE', CREATED_TIME: LOSE }] } };
     if (method === 'crm.activity.list' && body.filter.PROVIDER_ID === 'IMOPENLINES_SESSION') return { result: [{ ASSOCIATED_ENTITY_ID: '80' }] };
     if (method === 'imopenlines.crm.chat.get') return { result: [{ CHAT_ID: 100, CONNECTOR_ID: 'wazzup', CONNECTOR_TITLE: 'wazzup' }] };
-    if (method === 'imopenlines.session.history.get') return { result: { chat: { 100: {} }, users: { 55: { connector: true } }, message: messages, files: {} } };
+    if (method === 'imopenlines.session.history.get') return { result: { sessionId: 80, chatId: 100, chat: { 100: {} }, users: { 55: { connector: true } }, message: messages, files: {} } };
     if (method === 'crm.activity.list') return { result: [] };
     if (method === 'crm.timeline.comment.list') { if (incomplete) throw new Error('source incomplete'); return { result: [] }; }
     if (method === 'tasks.task.list') return { result: { tasks: [] } };

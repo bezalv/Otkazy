@@ -179,7 +179,10 @@ if (nonmaterialUnknownCount > 0) {
   // уверенностью. Общее число чатов и число unknown по-прежнему известны.
   var unknownAffectedMetrics = ['chats_manager', 'chats_client', 'chats_last_client_msg',
     'chats_last_client_days_before_lose', 'chats_last_manager_msg', 'chats_last_manager_days_before_lose',
-    'initiative_manager_pct', 'initiative_client_pct', 'max_gap_who'];
+    'initiative_manager_pct', 'initiative_client_pct', 'max_gap_who',
+    // Реакция может разделить разрыв или изменить распределение событий во
+    // времени. Неизвестно, является ли она содержательным контактом.
+    'max_gap_days', 'max_gap_period', 'trend'];
   for (var uai = 0; uai < unknownAffectedMetrics.length; uai++) analytics[unknownAffectedMetrics[uai]] = null;
   if (lastChat && (lastChat.data.role === 'unknown' || lastChat.data.direction === 'unknown')) {
     analytics.chats_unanswered_by_manager = null;
@@ -216,9 +219,10 @@ if (chats.length > 0) { var cp = nonmaterialUnknownCount > 0 ? ['авторы с
 L.push('Dynamics:');
 if (firstContact) L.push('  First contact: ' + formatDateRu(firstContact));
 if (lastContact) L.push('  Last contact: ' + formatDateRu(lastContact) + ' (' + daysAgo(lastContact) + ' days before lose)');
-if (maxGapDays > 0 && maxGapStart) L.push('  Max gap: ' + maxGapDays + ' days (' + formatDateRu(maxGapStart) + ' - ' + formatDateRu(maxGapEnd) + ', ' + (!nonmaterialUnknownCount && maxGapWho === 'manager' ? 'manager silent' : !nonmaterialUnknownCount && maxGapWho === 'client' ? 'client silent' : '?') + ')');
+if (nonmaterialUnknownCount) L.push('  Max gap: неизвестно (влияние реакции не определено)');
+else if (maxGapDays > 0 && maxGapStart) L.push('  Max gap: ' + maxGapDays + ' days (' + formatDateRu(maxGapStart) + ' - ' + formatDateRu(maxGapEnd) + ', ' + (maxGapWho === 'manager' ? 'manager silent' : maxGapWho === 'client' ? 'client silent' : '?') + ')');
 L.push(nonmaterialUnknownCount ? '  Initiative: неизвестно (часть авторов сообщений не установлена)' : '  Initiative: manager ' + initiativeManagerPct + '% / client ' + initiativeClientPct + '%');
-L.push('  Trend: ' + trend);
+L.push(nonmaterialUnknownCount ? '  Trend: неизвестно (влияние реакции не определено)' : '  Trend: ' + trend);
 L.push('  Pause cycles: ' + pauseCycles);
 if (preferredChannel !== 'mixed') L.push('  Channel: ' + preferredChannel);
 L.push('');

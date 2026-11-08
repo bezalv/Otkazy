@@ -66,8 +66,9 @@ test('только silent и явный callback; boolean, ошибочные и
 });
 
 test('дата, привязки, изменение снимка и подмена события не дают использовать подтверждение', async () => {
-  for (const change of [c => c.raw.sessions[0].history.chatId = 13,
-    c => c.raw.sessions[0].history.sessionId = 0,
+  const wrongChat = sample(); wrongChat.raw.sessions[0].history.chatId = 13;
+  await assert.rejects(normalize(wrongChat, async i => proof(i)), /другому чату/);
+  for (const change of [c => c.raw.sessions[0].history.sessionId = 0,
     c => c.raw.sessions[0].history.chat[12].entityId = 'invalid',
     c => c.deal_data.lose_date = '2026-11-05', c => c.raw.chats.push({...c.raw.chats[0]})]) {
     const c = sample(); change(c); let calls = 0;
@@ -88,7 +89,7 @@ test('дата, привязки, изменение снимка и подме�
   assert.equal((await infer(original)).calls.length, 0);
 });
 
-test('разные сессии не объединяются; Wappi и вложения не обрабатываются классификатором', async () => {
+test('разные сессии не объединяются; Wappi отдельно проверяется, вложения блокируют классификатор', async () => {
   const c = sample(); const other = sample({chat: 13, session: 35, messageId: 51});
   c.raw.chats.push(...other.raw.chats); c.raw.sessions.push(...other.raw.sessions);
   const messages = await normalize(c, async i => proof(i));
@@ -96,7 +97,7 @@ test('разные сессии не объединяются; Wappi и влож
   assert.equal(result.calls.length, 2);
   assert.ok(result.calls.every(call => JSON.parse(call.messages[1].content).messages.length === 1));
   let checks = 0; const wappi = await normalize(sample({connector: 'wappi'}), async i => { checks++; return proof(i); });
-  assert.equal(checks, 0); assert.equal(wappi[0].inference_session_id, undefined);
+  assert.equal(checks, 1); assert.equal(wappi[0].inference_session_id, '34');
   const voice = sample(); voice.raw.sessions[0].history.message[50].params = { FILE_ID: [77] };
   voice.raw.sessions[0].history.files = { 77: { id: 77, name: 'voice.ogg', type: 'audio' } };
   voice.raw.sessions[0].history.message[51] = { id: 51, text: 'Текст рядом с голосовым', date: '2026-11-04T00:01:00Z' };
@@ -107,4 +108,11 @@ test('разные сессии не объединяются; Wappi и влож
   const withOrphan = await normalize(orphan, async i => proof(i));
   assert.equal(withOrphan.length, 2);
   assert.equal((await infer(withOrphan)).calls.length, 0);
+});
+
+
+test('fallback Wazzup не допускает модель при исключении части проверенной истории', async () => {
+ const c=sample();c.raw.sessions[0].history.message[51]={id:51,text:'Ещё одна реплика',date:'2026-11-04T00:01:00Z'};
+ const messages=await normalize(c,async i=>proof(i));assert.equal(messages.length,2);
+ messages.pop();assert.equal((await infer(messages)).calls.length,0);
 });

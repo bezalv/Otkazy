@@ -1,3 +1,4 @@
+import { copyNeutralReactionTrust } from '../analysis/chat-role-trust.mjs';
 import { pgSafeReason } from '../rules/pipeline-gate.mjs';
 
 function pickAudioUrl(call) {
@@ -183,7 +184,7 @@ export async function transcribeCalls({ dealData, transcribe }) {
 
   const byId = new Map(results.map(result => [String(result.activity_id), result]));
   const communications = dealData.communications.map(call => call?.type === 'call' && call.activity_id
-    ? mergeTranscript(call, byId.get(String(call.activity_id))) : { ...call });
+    ? mergeTranscript(call, byId.get(String(call.activity_id))) : copyNeutralReactionTrust(call, { ...call }));
   const stats = {
     calls_total: calls.length,
     calls_with_audio: candidates.length,

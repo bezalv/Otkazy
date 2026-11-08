@@ -16,8 +16,15 @@ export async function processDeal({
   dealId, bitrix, llm, resolveFile, downloadFile, transcribe,
   judgeSystemPrompt, writerSystemPrompt, audioWaitEnabledAt, savedAudioWait = null,
   silent = false, screenshots = true, nowMs = null, clock = Date.now, expectedLoseDate = null, expectedHistoryId = null, wait,
-  semanticChatRoles = false, verifyFallbackSession,
+  semanticChatRoles = false, verifyFallbackSession, verifyLatestSession, repairProofErrors = false,
 }) {
+  if (typeof repairProofErrors !== 'boolean' || (repairProofErrors && (silent !== true || semanticChatRoles !== true))) {
+    throw new Error('Исправление доказательств доступно только в тихом ручном эксперименте');
+  }
+  if (verifyLatestSession !== undefined && (typeof verifyLatestSession !== 'function' || semanticChatRoles !== true
+      || silent !== true || expectedHistoryId === null || expectedLoseDate === null)) {
+    throw new Error('Подтверждение новой сессии доступно только для закреплённого тихого эксперимента');
+  }
   if (verifyFallbackSession !== undefined && (semanticChatRoles !== true || silent !== true)) {
     throw new Error('Проверка сессии доступна только в тихом ручном эксперименте');
   }
@@ -33,7 +40,8 @@ export async function processDeal({
   if (typeof clock !== 'function') throw new TypeError('Не заданы часы обработки');
   const startedAt = nowMs ?? clock();
   if (!Number.isFinite(startedAt)) throw new TypeError('Некорректное время обработки');
-  const collected = await collectDeal({ client: bitrix, dealId, silent, now: startedAt, wait, expectedLoseDate, expectedHistoryId, requireCurrentHistory: true });
+  const collected = await collectDeal({ client: bitrix, dealId, silent, now: startedAt, wait, expectedLoseDate, expectedHistoryId,
+    requireCurrentHistory: true, verifyLatestSession });
   if (collected.deal_data && expectedLoseDate != null) {
     const expected = new Date(expectedLoseDate).getTime();
     const actual = new Date(collected.deal_data.lose_date).getTime();
@@ -109,6 +117,7 @@ export async function processDeal({
     prepared, pipelineGate, analytics: screenshotResult.output,
     screenshotStats: screenshotResult.output.screenshot_stats,
     writerSystemPrompt, client: llm, now: evaluatedAt, rejectUnknownRoleProof: semanticChatRoles === true,
+    repairProofErrors, silent, semanticChatRoles,
   });
   return {
     status: analysis.pipeline_error ? 'error' : 'processed',

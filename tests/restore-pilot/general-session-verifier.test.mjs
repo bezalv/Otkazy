@@ -53,6 +53,38 @@ test('одна сессия привязана к сделке, переходу
     assert.equal('history_complete' in proof,false);
   }
 });
+test('identity Wappi с непрозрачным кодом подтверждает сессию, но default не подтверждает авторство',async()=>{
+ const f=fixture();f.state.connector='opaque_connector';f.state.title='Wappi WhatsApp';
+ f.input.history.chat[12].entityId='opaque_connector|9|client|user';
+ f.input.history_sha256=createHash('sha256').update(JSON.stringify(f.input.history)).digest('hex');
+ assert.equal(await f.verifier(f.input),null);
+ const identity=createGeneralSessionVerifier({client:f.client,lookupSession:f.lookup,dealId:'127114',transitionId:'321',purpose:'session_identity'});
+ assert.equal((await identity(f.input))?.checks.session_crm_matches_deal,true);
+ assert.equal('history_complete' in await identity(f.input),false);
+ for(const change of [()=>f.state.connector='different',()=>{f.state.connector='opaque_connector';f.state.title='Другой';},
+  ()=>{f.state.connector='unknown';f.state.title='Wappi';},()=>{f.state.connector='wz_test';f.state.title='Wappi';}]){
+  change();assert.equal(await identity(f.input),null);
+ }
+ assert.throws(()=>createGeneralSessionVerifier({client:f.client,lookupSession:f.lookup,dealId:'127114',transitionId:'321',purpose:'invalid'}));
+});
+test('identity проверка Wazzup требует точного совпадения кода с entityId',async()=>{
+ const f=fixture(),identity=createGeneralSessionVerifier({client:f.client,lookupSession:f.lookup,dealId:'127114',transitionId:'321',purpose:'session_identity'});
+ assert.equal((await identity(f.input))?.kind,'verified_fallback_session_v1');
+ f.state.connector='wz_other';assert.equal(await identity(f.input),null);
+});
+test('role_inference требует точный код коннектора исходного снимка и проверяет его повторно',async()=>{
+  for(const change of [f=>{f.state.connector='wz_other';}, f=>{f.state.connector='';},
+    f=>{f.state.connector='unknown';},f=>{f.state.title='Wappi';}]) {
+    const f=fixture();change(f);
+    assert.equal(await f.verifier(f.input),null);
+    assert.equal(f.state.lookupCalls,0);
+  }
+  const f=fixture();
+  const lookup=async scope=>{const proof=await f.lookup(scope);f.state.connector='wz_other';return proof;};
+  const verifier=createGeneralSessionVerifier({client:f.client,lookupSession:lookup,dealId:'127114',transitionId:'321'});
+  assert.equal(await verifier(f.input),null);
+  assert.equal(f.state.lookupCalls,1); // Совпадение обязательно и после lookup.
+});
 test('границы и входной снимок до чтения: чужая сделка, неверная дата, ID, линия или hash', async () => {
   for (const change of [f=>f.input.deal_id='2',f=>f.input.chat_id='0',f=>f.input.session_id='01',
     f=>f.input.line_id='10',f=>f.input.cutoff='2026-02-30T00:00:00Z',f=>f.input.history_sha256='a'.repeat(64),

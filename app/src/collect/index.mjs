@@ -1,4 +1,6 @@
 import { exactMillisTimestamp } from '../time-precision.mjs';
+import { isDeepStrictEqual } from 'node:util';
+import { createHash } from 'node:crypto';
 
 const SOURCE_LABELS = {
   calls: 'звонки',
@@ -6,6 +8,18 @@ const SOURCE_LABELS = {
   comments: 'комментарии',
   tasks: 'задачи',
 };
+
+// Подтверждаем ID и сопоставляем только содержимое, используемое при разборе.
+// Прочие поля chat могут меняться между последовательными чтениями.
+function openlineId(value) {
+  const text = String(value ?? '');
+  return /^[1-9]\d{0,15}$/.test(text) && Number.isSafeInteger(Number(text)) ? text : null;
+}
+function sameOpenlineHistory(first, second, chatId) {
+  const sameField = key => isDeepStrictEqual(first?.[key], second?.[key]);
+  return ['message', 'users', 'files'].every(sameField)
+    && isDeepStrictEqual(first?.chat?.[chatId]?.entityId, second?.chat?.[chatId]?.entityId);
+}
 
 const STAGE_NAMES = {
   'C23:NEW': 'Технический этап',
@@ -200,14 +214,21 @@ function mapDeal(deal, reasons, history, now) {
 }
 
 /** Собирает первичные данные. Нормализация чатов и распознавание выполняются отдельно. */
-export async function collectDeal({ client, dealId, silent = false, now = Date.now(), wait = defaultWait, expectedHistoryId = null, expectedLoseDate = null, requireCurrentHistory = false }) {
+export async function collectDeal({ client, dealId, silent = false, now = Date.now(), wait = defaultWait, expectedHistoryId = null, expectedLoseDate = null, requireCurrentHistory = false, verifyLatestSession }) {
   if (!client || typeof client.request !== 'function') throw new TypeError('Нужен client.request');
   const id = Number(dealId);
   if (!Number.isSafeInteger(id) || id <= 0) throw new TypeError('Некорректный ID сделки');
   if (expectedHistoryId !== null && (typeof expectedHistoryId !== 'string' || !/^[1-9]\d{0,29}$/.test(expectedHistoryId))) throw new TypeError('Некорректный ID перехода');
+  if (verifyLatestSession !== undefined && (typeof verifyLatestSession !== 'function' || silent !== true
+      || requireCurrentHistory !== true || expectedHistoryId === null || !exactMillisTimestamp(expectedLoseDate))) {
+    throw new TypeError('Подтверждение новой сессии доступно только для закреплённого тихого перехода');
+  }
   const sources = Object.fromEntries(Object.entries(SOURCE_LABELS).map(([key, label]) => [
     key, { label, complete: false, error: null, attempts: 0 },
   ]));
+  // Завершённые вызовы API не доказывают, что обнаружены все прошлые сессии.
+  sources.openlines.history_coverage = 'unverified';
+  sources.openlines.history_scope = 'activity_and_latest';
   const result = { deal_id: id, silent: silent === true, _sources: sources, ready_for_analysis: false };
 
   let deal;
@@ -323,6 +344,9 @@ export async function collectDeal({ client, dealId, silent = false, now = Date.n
       sources[key].attempts = attempts;
     } catch (error) {
       sources[key].error = safeError(error);
+      if (key === 'openlines' && error?.code === 'OPENLINES_LATEST_SESSION_UNVERIFIED') {
+        sources[key].reason = 'latest_session_link_unverified';
+      }
       sources[key].attempts = attempts;
     }
   }
@@ -349,7 +373,48 @@ export async function collectDeal({ client, dealId, silent = false, now = Date.n
       select: ['ID', 'ASSOCIATED_ENTITY_ID'], order: { CREATED: 'ASC' },
     }, page => page, wait, onAttempts);
     const sessionIds = new Set();
-    const loadedChatIds = new Set();
+    const loadedSessions = new Map();
+    const sessionsByChat = new Map();
+    async function recoverLatest(chatId, latest) {
+      if (typeof verifyLatestSession !== 'function') return false;
+      const chat = openlineId(chatId), session = openlineId(latest?.sessionId);
+      const cutoff = exactMillisTimestamp(dealData.lose_date), expected = exactMillisTimestamp(expectedLoseDate);
+      const entity = chat && latest?.chat?.[chat]?.entityId;
+      const parts = typeof entity === 'string' && entity.length <= 1024 ? entity.split('|') : [];
+      const line = parts.length === 4 && parts.every(x => x && x.trim() === x) ? openlineId(parts[1]) : null;
+      if (!chat || !session || openlineId(latest?.chatId) !== chat || !line || !cutoff || !expected
+          || cutoff.getTime() !== expected.getTime() || String(history[0]?.ID) !== expectedHistoryId) return false;
+      let serialized, chatSnapshot, stagesSnapshot;
+      try {
+        serialized = JSON.stringify(latest); chatSnapshot = JSON.stringify(raw.chats); stagesSnapshot = JSON.stringify(history);
+        if (typeof serialized !== 'string' || serialized.length > 5_000_000) return false;
+      } catch { return false; }
+      const hash = createHash('sha256').update(serialized).digest('hex');
+      const input = Object.freeze({ deal_id:String(id), chat_id:chat, session_id:session, line_id:line,
+        transition_id:expectedHistoryId, cutoff:cutoff.toISOString(), history_sha256:hash, history:JSON.parse(serialized) });
+      let proof;
+      try { proof = await verifyLatestSession(input); } catch { return false; }
+      const proofCutoff = exactMillisTimestamp(proof?.cutoff), created = exactMillisTimestamp(proof?.session_created_at);
+      const checks = proof?.checks;
+      const keys = ['kind','deal_id','chat_id','session_id','line_id','cutoff','history_sha256','session_created_at','checks'];
+      const checkKeys = ['chat_bound_to_deal','session_matches_chat','session_matches_line','session_crm_matches_deal',
+        'direct_session_history_matches','current_chat_history_matches'];
+      if (!proof || typeof proof !== 'object' || Array.isArray(proof) || Object.keys(proof).length !== keys.length
+          || !keys.every(key => Object.hasOwn(proof,key)) || proof.kind !== 'verified_fallback_session_v1'
+          || openlineId(proof.deal_id) !== String(id) || openlineId(proof.chat_id) !== chat
+          || openlineId(proof.session_id) !== session || openlineId(proof.line_id) !== line
+          || !proofCutoff || proofCutoff.getTime() !== cutoff.getTime() || proof.history_sha256 !== hash
+          || !created || created.getTime() > cutoff.getTime() || !checks || typeof checks !== 'object'
+          || Array.isArray(checks) || Object.keys(checks).length !== checkKeys.length
+          || !checkKeys.every(key => checks[key] === true)
+          || JSON.stringify(latest) !== serialized || JSON.stringify(input.history) !== serialized
+          || JSON.stringify(raw.chats) !== chatSnapshot || JSON.stringify(history) !== stagesSnapshot
+          || exactMillisTimestamp(dealData.lose_date)?.getTime() !== cutoff.getTime()
+          || String(history[0]?.ID) !== expectedHistoryId) return false;
+      // Используем прежний fallback ID сообщения; право на доставку не выдаётся.
+      raw.sessions.push({ chat_id:Number(chat), history:latest });
+      return true;
+    }
     for (const activity of raw.openline_activities) {
       // Без ID нельзя доказать, что в альтернативном списке найден именно этот чат.
       if (!activity.ASSOCIATED_ENTITY_ID) throw new Error('Отсутствует ID сессии открытой линии');
@@ -359,19 +424,79 @@ export async function collectDeal({ client, dealId, silent = false, now = Date.n
       sessionIds.add(sessionId);
       const response = await request(client, 'imopenlines.session.history.get', { SESSION_ID: sessionId }, wait, onAttempts);
       if (!hasHistoryMessages(response.result)) throw new Error('Некорректная история сессии');
-      raw.sessions.push({ session_id: sessionId, history: response.result });
-      if (response.result.message && Object.keys(response.result.message).length) {
-        for (const chatId of Object.keys(response.result.chat || {})) loadedChatIds.add(String(chatId));
-      }
+      const returnedSessionId = openlineId(response.result.sessionId);
+      const returnedChatId = openlineId(response.result.chatId);
+      if (returnedSessionId !== String(sessionId) || !returnedChatId) throw new Error('Не подтверждены ID истории сессии');
+      const saved = { session_id: sessionId, history: response.result };
+      raw.sessions.push(saved);
+      loadedSessions.set(returnedSessionId, { chatId: returnedChatId, saved });
+      if (!sessionsByChat.has(returnedChatId)) sessionsByChat.set(returnedChatId, new Set());
+      sessionsByChat.get(returnedChatId).add(returnedSessionId);
     }
+    const checkedChatIds = new Set();
     for (const chat of raw.chats) {
       const chatId = Number(chat.CHAT_ID);
       if (!Number.isSafeInteger(chatId) || chatId <= 0) throw new Error('Некорректный ID чата');
-      if (loadedChatIds.has(String(chatId))) continue;
+      if (checkedChatIds.has(String(chatId))) throw new Error('Повтор ID чата открытой линии');
+      checkedChatIds.add(String(chatId));
       const response = await request(client, 'imopenlines.session.history.get', { CHAT_ID: chatId }, wait, onAttempts);
       if (!hasHistoryMessages(response.result)) throw new Error('Некорректная история чата');
+      const returnedChatId = openlineId(response.result.chatId);
+      const returnedSessionId = openlineId(response.result.sessionId);
+      if (returnedChatId !== String(chatId) || !returnedSessionId) throw new Error('Не подтверждены ID последней сессии чата');
+      const existing = loadedSessions.get(returnedSessionId);
+      if (existing) {
+        if (existing.chatId !== returnedChatId) throw new Error('Истории одной сессии открытой линии расходятся');
+        if (!sameOpenlineHistory(existing.saved.history, response.result, returnedChatId)) {
+          // Приход нового сообщения между чтениями не означает повреждение.
+          // До двух дополнительных пар; используем только согласованный снимок.
+          let stable = false;
+          for (let attempt = 0; attempt < 2; attempt++) {
+            const bySession = await request(client, 'imopenlines.session.history.get',
+              { SESSION_ID: Number(returnedSessionId) }, wait, onAttempts);
+            const byChat = await request(client, 'imopenlines.session.history.get', { CHAT_ID: chatId }, wait, onAttempts);
+            if (!hasHistoryMessages(bySession.result) || !hasHistoryMessages(byChat.result)
+                || openlineId(bySession.result.sessionId) !== returnedSessionId
+                || openlineId(bySession.result.chatId) !== returnedChatId
+                || openlineId(byChat.result.chatId) !== returnedChatId) {
+              throw new Error('Не подтверждены ID повторной истории сессии');
+            }
+            const latestId = openlineId(byChat.result.sessionId);
+            if (!latestId) throw new Error('Не подтверждены ID повторной истории сессии');
+            if (latestId !== returnedSessionId) {
+              if (sameOpenlineHistory(existing.saved.history, bySession.result, returnedChatId)
+                  && await recoverLatest(chatId, byChat.result)) { stable = true; break; }
+              const error = new Error('Последняя сессия чата отсутствует в activity: привязка к сделке не подтверждена');
+              error.code = 'OPENLINES_LATEST_SESSION_UNVERIFIED';
+              throw error;
+            }
+            if (sameOpenlineHistory(bySession.result, byChat.result, returnedChatId)) {
+              existing.saved.history = bySession.result;
+              stable = true;
+              break;
+            }
+          }
+          if (!stable) throw new Error('Истории одной сессии открытой линии нестабильны');
+        }
+        continue;
+      }
+      if (sessionsByChat.has(returnedChatId)) {
+        if (await recoverLatest(chatId, response.result)) continue;
+        // CHAT_ID возвращает текущую последнюю сессию. Без отдельной сверки
+        // её связи со сделкой и отказом нельзя считать её коммуникацией сделки.
+        const error = new Error('Последняя сессия чата отсутствует в activity: привязка к сделке не подтверждена');
+        error.code = 'OPENLINES_LATEST_SESSION_UNVERIFIED';
+        throw error;
+      }
+      // Сохраняем прежний fallback для чата, для которого activity отсутствует;
+      // получение последней сессии не доказывает полноту исторических сессий.
+      if (typeof verifyLatestSession === 'function') {
+        if (await recoverLatest(chatId, response.result)) continue;
+        const error = new Error('Связь последней сессии со сделкой не подтверждена');
+        error.code = 'OPENLINES_LATEST_SESSION_UNVERIFIED';
+        throw error;
+      }
       raw.sessions.push({ chat_id: chatId, history: response.result });
-      loadedChatIds.add(String(chatId));
     }
   });
   await source('tasks', async onAttempts => {

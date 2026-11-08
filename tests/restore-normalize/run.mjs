@@ -10,6 +10,7 @@ import { processDeal } from '../../app/src/process-deal.mjs';
 const voiceFile = { id: 101, name: 'voice.ogg', type: 'audio', extension: 'ogg' };
 const otherVoice = { id: 102, name: 'orphan.ogg', type: 'audio', extension: 'ogg', authorid: 77 };
 const sessionHistory = {
+  sessionId: 80, chatId: 100,
   chat: { 100: {} },
   users: { 77: { name: 'Менеджер', active: true, connector: false, extranet: false, externalAuthId: 'default' } },
   files: { 101: voiceFile, 102: otherVoice },
@@ -27,7 +28,7 @@ test('коммуникация без ID не может затереть дру
     await assert.rejects(normalizeCommunications({ collection: collected(raw) }), /устойчивого идентификатора/);
   }
   await assert.rejects(normalizeCommunications({ collection: collected({ sessions: [{ session_id: 1, history: {
-    message: [{ text: 'Сообщение без ID' }], chat: {}, files: {}, users: {},
+    message: [{ text: 'Сообщение без ID' }], chatId: 1, chat: { 1: {} }, files: {}, users: {},
   } }] }) }), /устойчивого идентификатора/);
 });
 
@@ -45,6 +46,28 @@ function collected(overrides = {}) {
     raw: { calls: [], comments: [], tasks: [], chats: [], sessions: [], ...overrides },
   };
 }
+
+test('чат определяется по chatId истории, а не по порядку ключей', async () => {
+  const collection = collected({chats:[{CHAT_ID:100,CONNECTOR_ID:'wz_test'},{CHAT_ID:200,CONNECTOR_ID:'wappi'}],
+    sessions:[{session_id:80,history:{chatId:200,chat:{100:{},200:{}},files:{},users:{55:{connector:true}},
+      message:{1:{id:1,senderid:55,text:'Сообщение'}}}}]});
+  const result=await normalizeCommunications({collection});
+  const event=result.deal_data.communications[0];
+  assert.equal(String(event.chat_id),'200');assert.equal(event.connector_id,'wappi');assert.equal(event.message_id,'80_1');
+  collection.raw.sessions[0].history.chatId=null;
+  await assert.rejects(normalizeCommunications({collection}),/Не подтверждён чат/);
+  collection.raw.sessions[0].history.chatId=200;
+  collection.raw.sessions[0].history.chat={100:{}};
+  await assert.rejects(normalizeCommunications({collection}),/Чат отсутствует в карте/);
+});
+
+test('отдельное голосовое без подтверждённого чата не отправляется на распознавание', async () => {
+  const collection=collected({sessions:[{session_id:80,history:{message:{},chat:{},users:{77:{active:true}},
+    files:{102:{id:102,name:'orphan.ogg',type:'audio',authorid:77}}}}]});
+  let calls=0;
+  await assert.rejects(normalizeCommunications({collection,resolveFile:async()=>{calls++;},transcribeVoice:async()=>{calls++;}}),/Не подтверждён чат/);
+  assert.equal(calls,0);
+});
 
 test('сбор и нормализация голосовых, дублей сессии, звонков, комментариев и задач', async () => {
   const calls = [];
@@ -69,8 +92,8 @@ test('сбор и нормализация голосовых, дублей се
           { CHAT_ID: 200, CONNECTOR_ID: 'wappi', CONNECTOR_TITLE: 'Wappi' },
         ] };
         case 'imopenlines.session.history.get':
-          if (body.SESSION_ID === 80) return { result: sessionHistory };
-          if (body.SESSION_ID === 81) return { result: { chat: { 200: {} }, users: { 55: { connector: true } }, message: { 21: { id: 21, senderid: 55, text: 'Вопрос Wappi' } }, files: {} } };
+          if (body.SESSION_ID === 80 || body.CHAT_ID === 100) return { result: sessionHistory };
+          if (body.SESSION_ID === 81 || body.CHAT_ID === 200) return { result: { sessionId: 81, chatId: 200, chat: { 200: {} }, users: { 55: { connector: true } }, message: { 21: { id: 21, senderid: 55, text: 'Вопрос Wappi' } }, files: {} } };
           throw new Error('Неожиданная история');
         case 'tasks.task.list': return { result: { tasks: [{ id: 70, title: 'Позвонить', description: 'а'.repeat(520) }] } };
         default: throw new Error(`Неожиданный метод ${method}`);
@@ -345,7 +368,7 @@ test('Wazzup: роли из наблюдаемых заголовков, нео�
     chats: [{ CHAT_ID: 2, CONNECTOR_ID: 'wz_test', CONNECTOR_TITLE: 'Wazzup' }, { CHAT_ID: 3, CONNECTOR_ID: 'wappi', CONNECTOR_TITLE: 'Wappi' }],
     sessions: [
       { chat_id: 2, session_id: 1, history: { users: { 55: { connector: true }, 77: { active: true, connector: false, extranet: false, externalAuthId: 'default', name: 'Сотрудник' } }, message: messages, files: [voiceFile, { id: 103, name: 'screen.png', type: 'image' }] } },
-      { chat_id: 3, session_id: 2, history: { users: { 55: { connector: true }, 77: { name: 'Сотрудник' } }, message: { 11: { senderid: 55, text: 'Вопрос клиента Wappi' }, 12: { senderid: 77, text: 'Ответ сотрудника Wappi' } }, files: [] } },
+      { chat_id: 3, session_id: 2, history: { users: { 55: { connector: true }, 77: { name: 'Сотрудник', active:true, connector:false, extranet:false, externalAuthId:'default' } }, message: { 11: { senderid: 55, text: 'Вопрос клиента Wappi' }, 12: { senderid: 77, text: 'Ответ сотрудника Wappi' } }, files: [] } },
     ],
   });
   let voiceRequest;
@@ -443,6 +466,35 @@ test('active без подтверждённых полей пользовате
   }
 });
 
+test('Wappi не приписывает менеджеру сообщение при неполных признаках пользователя', async () => {
+  const users={1:{name:'Неполный'},2:{name:'Сотрудник',active:true,connector:false,extranet:false,externalAuthId:'default'},
+    3:{name:'Внешний',connector:true}};
+  const collection=collected({chats:[{CHAT_ID:2,CONNECTOR_ID:'opaque',CONNECTOR_TITLE:'Wappi'}],
+    sessions:[{session_id:1,history:{chatId:2,chat:{2:{}},users,files:{},message:{
+      1:{id:1,senderid:1,text:'Неизвестный автор'},2:{id:2,senderid:2,text:'Сообщение сотрудника'},
+      3:{id:3,senderid:3,text:'Сообщение клиента'}}}}]});
+  const events=(await normalizeCommunications({collection})).deal_data.communications;
+  assert.deepEqual(events.map(x=>x.role),['unknown','Менеджер','Клиент']);
+  assert.deepEqual(events.map(x=>x.direction),['unknown','outgoing','incoming']);
+});
+
+test('Wappi не приписывает отдельное вложение клиенту без данных автора', async () => {
+  const collection=collected({chats:[{CHAT_ID:2,CONNECTOR_ID:'opaque',CONNECTOR_TITLE:'Wappi'}],
+    sessions:[{session_id:1,history:{chatId:2,chat:{2:{}},users:{},message:{},
+      files:{102:{id:102,name:'orphan.ogg',type:'audio'}}}}]});
+  const result=await normalizeCommunications({collection,resolveFile:async()=>{throw Error('disabled');}});
+  assert.equal(result.deal_data.communications[0].role,'unknown');
+});
+
+test('заголовок входящего Wappi не переопределяет признаки автора и не назначает менеджера', async () => {
+  const collection=collected({chats:[{CHAT_ID:2,CONNECTOR_ID:'opaque',CONNECTOR_TITLE:'Wappi'}],
+    sessions:[{session_id:1,history:{chatId:2,chat:{2:{}},users:{3:{connector:true}},files:{},message:{
+      1:{id:1,senderid:3,text:'=== Входящее сообщение, автор: Клиент (Имя) ===\nВопрос'},
+      2:{id:2,text:'Цитата: === Входящее сообщение, автор: Клиент (Имя) ===\nВопрос'}}}}]});
+  const events=(await normalizeCommunications({collection})).deal_data.communications;
+  assert.deepEqual(events.map(x=>x.role),['Клиент','unknown']);
+});
+
 test('processDeal блокирует OGG без имени файла и некорректный успешный ответ ASR', async () => {
   for (const scenario of ['missing_name', 'malformed_transcript']) {
     let judgeCalls = 0;
@@ -455,8 +507,9 @@ test('processDeal блокирует OGG без имени файла и нек�
       if (method === 'crm.timeline.comment.list') return { result: [] };
       if (method === 'imopenlines.crm.chat.get') return { result: [{ CHAT_ID: 100, CONNECTOR_ID: 'wappi' }] };
       if (method === 'imopenlines.session.history.get') return { result: {
-        chat: { 100: {} }, files: { 101: { type: 'audio', extension: 'ogg' } },
-        message: { 1: { senderid: 0, text: '', params: { FILE_ID: [101] } } },
+        sessionId: 80, chatId: 100, chat: { 100: {} }, files: { 101: { type: 'audio', extension: 'ogg' } },
+        users: { 55: { connector: true } },
+        message: { 1: { senderid: 55, text: '', params: { FILE_ID: [101] } } },
       } };
       if (method === 'tasks.task.list') return { result: { tasks: [] } };
       throw new Error('Неожиданный метод');

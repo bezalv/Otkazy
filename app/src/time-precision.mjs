@@ -19,3 +19,10 @@ export function exactMillisTimestamp(value) {
   const date = new Date(value);
   return Number.isFinite(date.getTime()) && date.getUTCFullYear() >= 1 && date.getUTCFullYear() <= 9999 ? date : null;
 }
+
+/** Форматы истории чатов: пробел вместо T и смещение +0700 также допустимы. */
+export function chatMillisTimestamp(value) {
+  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:?\d{2})$/i.test(value)) return null;
+  const canonical = value.replace(' ', 'T').replace(/([+-]\d{2})(\d{2})$/, '$1:$2');
+  return exactMillisTimestamp(canonical);
+}

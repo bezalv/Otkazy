@@ -26,13 +26,24 @@ function line(history, chat) {
   const config = numeric(parts[1]);
   return config ? { config, entity: value } : null;
 }
-function expectedChat(result, chat) {
+function expectedChat(result, chat, purpose, entity) {
   if (!Array.isArray(result)) return false;
   const matches = result.filter(item => numeric(item?.CHAT_ID) === chat);
   if (matches.length !== 1) return false;
   const connector = typeof matches[0].CONNECTOR_ID === 'string' ? matches[0].CONNECTOR_ID.trim() : '';
   const title = typeof matches[0].CONNECTOR_TITLE === 'string' ? matches[0].CONNECTOR_TITLE.trim() : '';
-  return (/^wz_/i.test(connector) || /wazzup/i.test(connector)) && !/wappi/i.test(title);
+  // Совпадающее имя семейства интеграции не доказывает, что это тот же
+  // коннектор, который указан в снимке истории. Сверяем точный код перед
+  // обоими режимами и на каждом повторном чтении чата.
+  const parts = typeof entity === 'string' ? entity.split('|') : [];
+  const matchingCode = connector && connector.toLowerCase() !== 'unknown' && parts.length === 4 && parts[0] === connector;
+  if (!matchingCode) return false;
+  const wazzup = (/^wz_/i.test(connector) || /wazzup/i.test(connector)) && !/wappi/i.test(title);
+  if (purpose === 'role_inference') return wazzup;
+  // Identity отдельно от авторства: название Wappi и код в полном entityId
+  // подтверждают тип текущего чата, но не направление сообщений или историю.
+  const wappi = /wappi/i.test(title) && !/^wz_/i.test(connector) && !/wazzup/i.test(connector);
+  return wazzup || wappi;
 }
 function stageMatches(deal, rows, dealId, stageId, transitionId, cutoff) {
   if (numeric(deal?.result?.ID) !== dealId || deal?.result?.STAGE_ID !== stageId) return false;
@@ -60,10 +71,11 @@ function stageMatches(deal, rows, dealId, stageId, transitionId, cutoff) {
  * доказательства полноты истории, ни включения обработки здесь нет.
  */
 export function createGeneralSessionVerifier({ client, lookupSession, dealId, transitionId,
-  stageId = 'C23:LOSE' } = {}) {
+  stageId = 'C23:LOSE', purpose = 'role_inference' } = {}) {
   const boundDeal = numeric(dealId), boundTransition = numeric(transitionId);
   if (!client || typeof client.request !== 'function' || typeof lookupSession !== 'function'
-      || !boundDeal || !boundTransition || typeof stageId !== 'string' || !/^C\d+:LOSE$/.test(stageId)) {
+      || !boundDeal || !boundTransition || typeof stageId !== 'string' || !/^C\d+:LOSE$/.test(stageId)
+      || !['role_inference','session_identity'].includes(purpose)) {
     throw new TypeError('Неполные ограничения проверки сессии');
   }
   // Клиент не передаётся lookupSession: ему доступна только фиксированная
@@ -129,7 +141,7 @@ export function createGeneralSessionVerifier({ client, lookupSession, dealId, tr
       const stages = await stageHistory();
       if (!stageMatches(currentDeal, stages, boundDeal, stageId, boundTransition, cutoff)) return null;
       const chatList = await read('imopenlines.crm.chat.get', chatBody);
-      if (!expectedChat(chatList?.result, chat)) return null;
+      if (!expectedChat(chatList?.result, chat, purpose, originalLine.entity)) return null;
       const current = (await history({ CHAT_ID: Number(chat) }, 'CHAT_ID', chat))?.result;
       if (line(current, chat)?.entity !== originalLine.entity || !historiesMatch(input.history, current, chat, session)) return null;
 
@@ -153,7 +165,7 @@ export function createGeneralSessionVerifier({ client, lookupSession, dealId, tr
       const finalChats = await read('imopenlines.crm.chat.get', chatBody);
       const finalDeal = await read('crm.deal.get', dealBody);
       const finalStages = await stageHistory();
-      if (!expectedChat(finalChats?.result, chat) || !stageMatches(finalDeal, finalStages, boundDeal, stageId, boundTransition, cutoff)
+      if (!expectedChat(finalChats?.result, chat, purpose, originalLine.entity) || !stageMatches(finalDeal, finalStages, boundDeal, stageId, boundTransition, cutoff)
           || snapshot(input.history) !== hash) return null;
 
       return { kind: 'verified_fallback_session_v1', deal_id: deal, chat_id: chat, session_id: session,

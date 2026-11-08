@@ -1,4 +1,6 @@
-import { verifiedInferenceSession } from '../collect/normalize.mjs';
+import { verifiedInferenceSession, verifiedInferenceGroup } from '../collect/normalize.mjs';
+import { trustNeutralReaction } from './chat-role-trust.mjs';
+import { chatMillisTimestamp } from '../time-precision.mjs';
 
 // Экспериментальное определение авторов текстовых реплик Wazzup по контексту.
 // Результат — гипотеза, а не подтверждённое коннектором авторство.
@@ -43,25 +45,16 @@ function bitrixId(value) {
 // Время должно быть однозначным: дата без времени или без часового пояса
 // не позволяет доказать, что реплика была доступна на момент отказа.
 function parseTime(value) {
-  if (typeof value !== 'string') return null;
-  const match = /^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2}):(\d{2})(?:\.\d{1,9})?(Z|[+-]\d{2}:?\d{2})$/i.exec(value);
-  if (!match) return null;
-  const year = Number(match[1]), month = Number(match[2]), day = Number(match[3]);
-  const hours = Number(match[4]), minutes = Number(match[5]), seconds = Number(match[6]);
-  const zone = match[7];
-  if (!year || month < 1 || month > 12 || day < 1 || day > new Date(Date.UTC(year, month, 0)).getUTCDate()
-      || hours > 23 || minutes > 59 || seconds > 59) return null;
-  if (zone.toUpperCase() !== 'Z') {
-    const parts = zone.slice(1).replace(':', '');
-    if (Number(parts.slice(0, 2)) > 23 || Number(parts.slice(2)) > 59) return null;
-  }
-  const timestamp = Date.parse(value);
-  return Number.isFinite(timestamp) ? timestamp : null;
+  return chatMillisTimestamp(value)?.getTime() ?? null;
 }
 
 function hasAttachment(item) {
   return item._has_audio === true || item._has_files === true || item._has_audio_transcript === true
     || item.transcript != null || item.attachments != null || item.files != null || item.file_id != null;
+}
+
+function ambiguous(item) {
+  return item?._wazzup_author_ambiguous === true || item?._wappi_author_ambiguous === true;
 }
 
 function observedRole(item) {
@@ -170,21 +163,28 @@ export async function inferChatRoles({ communications, client, cutoff, dealId } 
   const cutoffTime = parseTime(cutoff);
   if (cutoffTime === null) {
     stats.invalid_cutoff = true;
-    stats.unresolved = communications.filter(item => item?.type === 'chat' && item._wazzup_author_ambiguous === true).length;
+    stats.unresolved = communications.filter(item => item?.type === 'chat' && ambiguous(item)).length;
     return { communications: result, stats, evidence };
   }
-  const sessions = new Map(), verifiedHistoryCache = new Map();
+  const sessions = new Map(), verifiedHistoryCache = new Map(), unverifiedWappiChats = new Set();
+  // Нельзя выкинуть непроверенную реплику того же Wappi-чата из контекста.
+  for (const item of communications) {
+    if (item?.type !== 'chat' || item.connector_family !== 'wappi') continue;
+    const chat = bitrixId(item.chat_id);
+    if (chat && !verifiedInferenceSession(item, { dealId, cutoff, cache: verifiedHistoryCache })) unverifiedWappiChats.add(chat);
+  }
   for (let index = 0; index < communications.length; index++) {
     const item = communications[index];
     if (!item || item.type !== 'chat') continue;
     // Синтетический session_id сам по себе границ сессии не доказывает.
     // Исключение — только подтверждение нормализатора в памяти этого процесса,
     // явно связанное с той же сделкой, временем и снимком истории.
-    const chat = bitrixId(item.chat_id), session = bitrixId(item.session_id)
-      || verifiedInferenceSession(item, { dealId, cutoff, cache: verifiedHistoryCache });
+    const chat = bitrixId(item.chat_id), proof = verifiedInferenceSession(item, { dealId, cutoff, cache: verifiedHistoryCache });
+    const session = item.connector_family === 'wappi' ? (proof || bitrixId(item.session_id))
+      : (bitrixId(item.session_id) || proof);
     // Неизвестные границы недопустимо считать общей перепиской.
     if (!chat || !session) {
-      if (item._wazzup_author_ambiguous === true) stats.unresolved++;
+      if (ambiguous(item)) stats.unresolved++;
       continue;
     }
     const key = JSON.stringify([chat, session]);
@@ -192,7 +192,7 @@ export async function inferChatRoles({ communications, client, cutoff, dealId } 
     sessions.get(key).push({ item, index });
   }
   for (const group of sessions.values()) {
-    const candidates = group.filter(({ item }) => item._wazzup_author_ambiguous === true);
+    const candidates = group.filter(({ item }) => ambiguous(item));
     if (!candidates.length) continue;
     stats.candidate_sessions++;
     // Если дата любой реплики неизвестна, она может быть после отказа или
@@ -202,11 +202,11 @@ export async function inferChatRoles({ communications, client, cutoff, dealId } 
       stats.skipped_sessions++; stats.unresolved += candidates.length; continue;
     }
     const afterCutoff = dated.filter(entry => entry.timestamp > cutoffTime);
-    const afterCandidates = afterCutoff.filter(({ item }) => item._wazzup_author_ambiguous === true);
+    const afterCandidates = afterCutoff.filter(({ item }) => ambiguous(item));
     stats.excluded_after_cutoff += afterCutoff.length;
     stats.unresolved += afterCandidates.length;
     const eligible = dated.filter(entry => entry.timestamp <= cutoffTime);
-    const eligibleCandidates = eligible.filter(({ item }) => item._wazzup_author_ambiguous === true);
+    const eligibleCandidates = eligible.filter(({ item }) => ambiguous(item));
     // Поздние сообщения не попадают в модель и остаются неизменными.
     if (!eligibleCandidates.length) continue;
     // Сведения из другой интеграции, файла или неустановленного коннектора не должны
@@ -214,16 +214,24 @@ export async function inferChatRoles({ communications, client, cutoff, dealId } 
     const connectors = new Set(eligible.map(({ item }) => id(item.connector_id)));
     const connector = connectors.size === 1 ? [...connectors][0] : null;
     const isWazzup = connector && (/^wz_/i.test(connector) || /wazzup/i.test(connector));
+    const isWappi = connector && eligible.every(({item}) => item.connector_family === 'wappi')
+      && eligible.every(({item}) => !unverifiedWappiChats.has(bitrixId(item.chat_id))
+        && verifiedInferenceSession(item, { dealId, cutoff, cache: verifiedHistoryCache }) === bitrixId(item.inference_session_id));
+    const hasVerifiedMember = group.some(({item}) => verifiedInferenceSession(item, { dealId, cutoff, cache: verifiedHistoryCache }));
+    const completeVerifiedGroup = !(isWappi || hasVerifiedMember)
+      || verifiedInferenceGroup(group.map(x => x.item), { dealId, cutoff });
     const seen = new Set(), entries = [];
-    let invalid = !isWazzup || eligible.length > MAX_MESSAGES || !client || typeof client.complete !== 'function';
+    let invalid = !completeVerifiedGroup || (!isWazzup && !isWappi)
+      || (isWazzup && eligible.some(({item}) => item.connector_family === 'wappi' || item._wappi_author_ambiguous === true))
+      || (isWappi && eligible.some(({item}) => item._wazzup_author_ambiguous === true)) || eligible.length > MAX_MESSAGES || !client || typeof client.complete !== 'function';
     let chars = 0;
     for (const { item, index, timestamp } of eligible) {
       const message = id(item.message_id);
       const known = observedRole(item);
       if (!message || seen.has(message) || !Number.isFinite(timestamp) || known === 'conflict'
-          || item._chat_connector_unknown === true || hasAttachment(item)
+          || item._chat_connector_unknown === true || item._session_unreferenced_files === true || hasAttachment(item)
           || typeof item.text !== 'string' || !item.text.trim() || item.text.length > MAX_MESSAGE_CHARS
-          || (item._wazzup_author_ambiguous === true && known)) invalid = true;
+          || (ambiguous(item) && known)) invalid = true;
       seen.add(message); chars += typeof item.text === 'string' ? item.text.length : MAX_CHARS + 1;
       entries.push({ index, timestamp, text: item.text, observed: known });
     }
@@ -237,11 +245,21 @@ export async function inferChatRoles({ communications, client, cutoff, dealId } 
     }
     entries.forEach((entry, i) => { entry.localId = `m${String(i + 1).padStart(3, '0')}`; });
     let roles, response;
+    const originalItems = (isWappi || hasVerifiedMember) ? communications.slice() : null;
     // Учитываем попытку до вызова: исключение клиента не освобождает бюджет.
     stats.model_calls++;
     try {
       response = await client.complete(buildRequest(entries), { role: 'chat-role-inference' });
       roles = parseResponse(response, entries);
+      // Запрос асинхронный: за время ожидания нельзя подменить вход или снимок.
+      if (originalItems) {
+        const freshCache = new Map();
+        if (communications.length !== originalItems.length
+            || communications.some((item, i) => item !== originalItems[i])
+            || !verifiedInferenceGroup(group.map(x => x.item), { dealId, cutoff })
+            || group.some(({item}) => verifiedInferenceSession(item, { dealId, cutoff, cache: freshCache }) !== bitrixId(item.inference_session_id)))
+          throw new Error('stale_context');
+      }
     } catch {
       collectMetadata(response); stats.failed_sessions++; stats.unresolved += eligibleCandidates.length; continue;
     }
@@ -257,17 +275,17 @@ export async function inferChatRoles({ communications, client, cutoff, dealId } 
         : inferred === 'unknown' ? 'unknown' : ROLE_SOURCE;
       return { id: entry.localId, ts: new Date(entry.timestamp).toISOString(),
         predicted_role: inferred, effective_role: effectiveRole, source,
-        impact: decision.impact, nonmaterial_unknown: original._wazzup_author_ambiguous === true && neutralContext(entries,roles,index) };
+        impact: decision.impact, nonmaterial_unknown: ambiguous(original) && neutralContext(entries,roles,index) };
     });
     evidence.push({ session: `session_${evidence.length + 1}`, messages: evidenceMessages });
     for (const [index,entry] of entries.entries()) {
       const original = communications[entry.index];
-      if (original._wazzup_author_ambiguous !== true) continue;
+      if (!ambiguous(original)) continue;
       const inferred = roles.get(entry.localId).role;
       if (inferred === 'unknown') {
         stats.unresolved++;
         if (neutralContext(entries,roles,index)) {
-          result[entry.index] = { ...original, _unknown_role_nonmaterial: ROLE_SOURCE };
+          result[entry.index] = trustNeutralReaction({ ...original, _unknown_role_nonmaterial: ROLE_SOURCE });
           stats.nonmaterial_unknown++;
         }
         continue;
@@ -275,7 +293,8 @@ export async function inferChatRoles({ communications, client, cutoff, dealId } 
       result[entry.index] = { ...original, role: inferred === 'client' ? 'Клиент' : 'Менеджер',
         direction: inferred === 'client' ? 'incoming' : 'outgoing',
         author_name: inferred === 'client' ? 'Клиент' : 'Менеджер',
-        _role_source: ROLE_SOURCE, _wazzup_author_ambiguous: false };
+        _role_source: ROLE_SOURCE, ...(original._wazzup_author_ambiguous === true ? { _wazzup_author_ambiguous: false } : {}),
+        ...(original._wappi_author_ambiguous === true ? { _wappi_author_ambiguous: false } : {}) };
       stats.resolved++;
     }
   }

@@ -1,3 +1,5 @@
+import { isTrustedNeutralReaction } from '../analysis/chat-role-trust.mjs';
+
 // Создано bench/build-restore-rules.mjs из prototype/lib/pipeline-gate.js.
 // Полнота данных: отметки по источникам и решение, можно ли выносить вердикт.
 //
@@ -233,13 +235,14 @@ function pgSourcesReason(marks, incomplete) {
 // короткую реплику. Маркер — оценка модели, НЕ доказательство стороны.
 function pgAllowedNonmaterialUnknown(item, enabled) {
   if (enabled !== true || !item || item.type !== 'chat'
-      || item._wazzup_author_ambiguous !== true || item._chat_connector_unknown === true
-      || item._unknown_role_nonmaterial !== 'semantic_inference'
+      || (item._wazzup_author_ambiguous !== true && item._wappi_author_ambiguous !== true) || item._chat_connector_unknown === true
+      || item._unknown_role_nonmaterial !== 'semantic_inference' || !isTrustedNeutralReaction(item)
       || item.role !== 'unknown' || item.direction !== 'unknown') return false;
   if (item._has_audio === true || item._has_files === true || item._has_audio_transcript === true
       || item.transcript != null || item.attachments != null || item.files != null || item.file_id != null) return false;
   var connector = String(item.connector_id || '');
-  if (!/^(?:wz_|.*wazzup)/i.test(connector)) return false;
+  if (!(item._wazzup_author_ambiguous === true && /^(?:wz_|.*wazzup)/i.test(connector))
+      && !(item._wappi_author_ambiguous === true && item.connector_family === 'wappi' && connector && connector !== 'unknown')) return false;
   var text = typeof item.text === 'string' ? item.text.trim() : '';
   return /^(?:👍\uFE0F?|спасибо[!.…]*)$/iu.test(text);
 }
@@ -264,14 +267,14 @@ function pgDecide(state) {
   // после исправления источника/разбора оператором, а не как автоматический verdict.
   var communications = Array.isArray(s.communications) ? s.communications : [];
   var ambiguous = communications.filter(function (item) {
-    return item && item._wazzup_author_ambiguous === true
+    return item && (item._wazzup_author_ambiguous === true || item._wappi_author_ambiguous === true)
       && !pgAllowedNonmaterialUnknown(item, s.allowNonmaterialUnknown);
   });
   if (ambiguous.length) {
     return {
       block: true,
       kind: 'author_ambiguous',
-      pipeline_error: 'не определён автор сообщения Wazzup: требуется проверка источника (' + ambiguous.length + ')',
+      pipeline_error: 'не определён автор сообщения чата: требуется проверка источника (' + ambiguous.length + ')',
       final: true
     };
   }
