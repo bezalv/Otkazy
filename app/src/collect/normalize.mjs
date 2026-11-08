@@ -242,7 +242,7 @@ async function verifyFallback({ collection, session, chatId, meta, verifyFallbac
       || lineId(history, chat) !== line) return null;
   // Это подтверждение ОДНОЙ сессии; полноту предыдущей истории и смен линий
   // оно не доказывает. Проверяющий — доверенная внутренняя зависимость.
-  return { deal, chat, sessionId, cutoff, history, sha256: snapshot.sha256,
+  return { deal, chat, sessionId, cutoff, history, sha256: snapshot.sha256, verifier:verifyFallbackSession,
     eventSession: explicitSession ?? `chat_${chat}`, explicitSession, explicitChat, matchingSessions, chatStillMatches, session, members: [] };
 }
 
@@ -279,6 +279,13 @@ export function verifiedInferenceGroup(events, { dealId, cutoff } = {}) {
   const cache = new Map();
   return events.every(item => verifiedFallbackEvents.get(item)?.members === binding.members
     && verifiedInferenceSession(item, { dealId, cutoff, cache }) === binding.sessionId);
+}
+
+// Ограниченный клиент связывает все события с конкретным verifier перехода,
+// а не только с совпадающей датой и номером сделки.
+export function verifiedInferenceGroupForVerifier(events, scope, verifier) {
+  if (typeof verifier !== 'function' || !verifiedInferenceGroup(events, scope)) return false;
+  return events.every(event => verifiedFallbackEvents.get(event)?.verifier === verifier);
 }
 
 export function verifiedInferenceVoice(event, { dealId, cutoff, cache } = {}) {

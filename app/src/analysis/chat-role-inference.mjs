@@ -81,6 +81,14 @@ function buildRequest(entries) {
   };
 }
 
+// Используется ограниченным транспортом для сверки всей структуры запроса,
+// включая системную инструкцию и provider, с проверенной сессией. Данные
+// передаются только сравнением и не выводятся при ошибке.
+export function isCanonicalRoleInferenceRequest(body, entries) {
+  if (!Array.isArray(entries) || !entries.length || entries.length > MAX_MESSAGES) return false;
+  try { return JSON.stringify(body) === JSON.stringify(buildRequest(entries)); } catch { return false; }
+}
+
 function parseResponse(response, entries) {
   const choice = response?.choices?.[0], content = choice?.message?.content;
   if (choice?.finish_reason !== 'stop' || typeof content !== 'string' || content.length > MAX_RESPONSE_CHARS) throw new Error('bad_response');
@@ -101,6 +109,12 @@ function parseResponse(response, entries) {
     if (entry.observed && inferred !== 'unknown' && inferred !== entry.observed) throw new Error('anchor_conflict');
   }
   return roles;
+}
+
+// Адаптер с долговечным резервом независимо проверяет ответ перед отметкой
+// завершения. true означает только корректную схему и совместимость якорей.
+export function isValidRoleInferenceResponse(response, entries) {
+  try { parseResponse(response, entries); return true; } catch { return false; }
 }
 
 // Даже явная оценка модели недостаточна сама по себе. Разрешаем её только
@@ -148,7 +162,7 @@ export async function inferChatRoles({ communications, client, cutoff, dealId } 
     excluded_after_cutoff: 0, invalid_cutoff: false, model_calls: 0, budget_exhausted_sessions: 0,
     actual_models: null, model_unavailable_calls: 0, usage: null, usage_complete: null, nonmaterial_unknown: 0 };
   const models = new Set(), totals = Object.fromEntries(USAGE_FIELDS.map(key => [key, 0]));
-  let usageComplete = true;
+  let usageComplete = true, scopedTransportStopped = false;
   function collectMetadata(response) {
     const modelName = safeModel(response?.model);
     if (modelName) models.add(modelName); else stats.model_unavailable_calls++;
@@ -218,7 +232,10 @@ export async function inferChatRoles({ communications, client, cutoff, dealId } 
       && eligible.every(({item}) => !unverifiedWappiChats.has(bitrixId(item.chat_id))
         && verifiedInferenceSession(item, { dealId, cutoff, cache: verifiedHistoryCache }) === bitrixId(item.inference_session_id));
     const hasVerifiedMember = group.some(({item}) => verifiedInferenceSession(item, { dealId, cutoff, cache: verifiedHistoryCache }));
-    const completeVerifiedGroup = !(isWappi || hasVerifiedMember)
+    // Подготовленный durable-клиент вправе отправлять текст только после
+    // независимого подтверждения той же сессии — включая Wazzup с явным ID.
+    const requireVerified = client?.requireVerifiedSession === true;
+    const completeVerifiedGroup = !(isWappi || hasVerifiedMember || requireVerified)
       || verifiedInferenceGroup(group.map(x => x.item), { dealId, cutoff });
     const seen = new Set(), entries = [];
     let invalid = !completeVerifiedGroup || (!isWazzup && !isWappi)
@@ -241,27 +258,41 @@ export async function inferChatRoles({ communications, client, cutoff, dealId } 
     // Одновременно пришедшие сообщения не образуют проверенного порядка.
     if (entries.some((entry, i) => i && entry.timestamp === entries[i - 1].timestamp)) invalid = true;
     if (invalid) { stats.skipped_sessions++; stats.unresolved += eligibleCandidates.length; continue; }
+    // Опциональный ограниченный транспорт запечатывается при неизвестном или
+    // некорректном результате. Не продолжать другие сессии этой же попытки:
+    // иначе новое логическое обращение могло бы стать ещё одним платным POST.
+    if (scopedTransportStopped) { stats.skipped_sessions++; stats.unresolved += eligibleCandidates.length; continue; }
     if (stats.model_calls >= MAX_MODEL_CALLS) {
       stats.budget_exhausted_sessions++; stats.unresolved += eligibleCandidates.length; continue;
     }
     entries.forEach((entry, i) => { entry.localId = `m${String(i + 1).padStart(3, '0')}`; });
     let roles, response;
-    const originalItems = (isWappi || hasVerifiedMember) ? communications.slice() : null;
+    const originalItems = (isWappi || hasVerifiedMember || requireVerified) ? communications.slice() : null;
+    const unchangedContext = () => {
+      if (!originalItems) return true;
+      const freshCache = new Map();
+      return communications.length === originalItems.length
+        && !communications.some((item, i) => item !== originalItems[i])
+        && verifiedInferenceGroup(group.map(x => x.item), { dealId, cutoff })
+        && !group.some(({item}) => verifiedInferenceSession(item, { dealId, cutoff, cache: freshCache }) !== bitrixId(item.inference_session_id));
+    };
     // Учитываем попытку до вызова: исключение клиента не освобождает бюджет.
     stats.model_calls++;
     try {
-      response = await client.complete(buildRequest(entries), { role: 'chat-role-inference' });
+      response = await client.complete(buildRequest(entries), { role: 'chat-role-inference',
+        ...(requireVerified ? { verifiedGroup:group.map(x => x.item) } : {}) });
       roles = parseResponse(response, entries);
       // Запрос асинхронный: за время ожидания нельзя подменить вход или снимок.
-      if (originalItems) {
-        const freshCache = new Map();
-        if (communications.length !== originalItems.length
-            || communications.some((item, i) => item !== originalItems[i])
-            || !verifiedInferenceGroup(group.map(x => x.item), { dealId, cutoff })
-            || group.some(({item}) => verifiedInferenceSession(item, { dealId, cutoff, cache: freshCache }) !== bitrixId(item.inference_session_id)))
-          throw new Error('stale_context');
-      }
+      if (!unchangedContext()) throw new Error('stale_context');
+      // Новый ограниченный адаптер подтверждает запись только после проверки
+      // схемы, ролей и неизменности контекста. Прежние клиенты не меняются.
+      if (typeof client.confirmValidated === 'function') await client.confirmValidated();
+      if (!unchangedContext()) throw new Error('stale_context');
     } catch {
+      if (typeof client?.failClosed === 'function') {
+        scopedTransportStopped = true;
+        try { await client.failClosed(); } catch { /* сессия уже остаётся неразрешённой */ }
+      }
       collectMetadata(response); stats.failed_sessions++; stats.unresolved += eligibleCandidates.length; continue;
     }
     collectMetadata(response);
