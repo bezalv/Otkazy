@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { persistResult, lookupOperation, loadResumableResult, CommitOutcomeUnknownError } from '../../app/src/persistence/index.mjs';
+import { toPersistenceResult } from '../../app/src/worker/run-job.mjs';
 import { existsSync, readFileSync } from 'node:fs';
 
 function mockPool({ failAt, emptyQueue = false, invalidLease = false, expiredAtFinish = false, existing = null, lookup = null, resumable = null, silent = true, triggerType = 'batch', requestKey = 'test-key' } = {}) {
@@ -76,6 +77,100 @@ test('анализ и коммуникации записываются пара
   assert.equal(statements.some((text) => text.includes('COALESCE(EXCLUDED.lose_date, lost_deals.lose_date)')), true);
   assert.equal(statements.some((text) => text.includes('COALESCE(EXCLUDED.transcript_engine, lost_deal_communications.transcript_engine)')), true);
   assert.equal(mock.released(), null);
+});
+
+function insertedValues(calls) {
+  const query = calls.find(call => typeof call !== 'string' && call.text.includes('INSERT INTO public.lost_deal_analyses'));
+  const columns = query.text.match(/lost_deal_analyses \(([^)]+)\)/)[1].split(', ');
+  return Object.fromEntries(columns.map((column, index) => [column, query.values[index]]));
+}
+
+test('неизвестная статистика повтора не превращается при записи в нули', async () => {
+  const mock = mockPool();
+  await persistResult(mock.pool, { ...processed,
+    llm_meta: { usage_complete: false, judge_usage_complete: false, prompt_tokens: null, completion_tokens: null, total_tokens: null },
+    multi_agent_analysis: { ...processed.multi_agent_analysis, judge_usage: null,
+      judge_usage_known: { prompt_tokens: 10, completion_tokens: 3, total_tokens: 13 },
+      writer_usage: { prompt_tokens: 4, completion_tokens: 5 } },
+  });
+  const row = insertedValues(mock.calls);
+  assert.equal(row.llm_prompt_tokens, null);
+  assert.equal(row.llm_completion_tokens, null);
+  assert.equal(row.llm_total_tokens, null);
+  assert.equal(row.judge_prompt_tokens, null);
+  assert.equal(row.judge_completion_tokens, null);
+  assert.equal(row.writer_prompt_tokens, 4);
+  assert.equal(row.writer_completion_tokens, 5);
+  assert.deepEqual(JSON.parse(row.ai_judge_json).judge_usage_known, { prompt_tokens: 10, completion_tokens: 3, total_tokens: 13 });
+});
+
+test('отсутствующая статистика писателя остаётся неизвестной при неполном usage', async () => {
+  for (const writerUsage of [{}, {prompt_tokens: 4}]) {
+    const mock = mockPool();
+    await persistResult(mock.pool, { ...processed,
+      llm_meta: { usage_complete: false, judge_usage_complete: true, prompt_tokens: null, completion_tokens: null, total_tokens: null },
+      multi_agent_analysis: { ...processed.multi_agent_analysis, judge_usage: { prompt_tokens: 8, completion_tokens: 2 }, writer_usage: writerUsage },
+    });
+    const row = insertedValues(mock.calls);
+    assert.equal(row.judge_prompt_tokens, 8);
+    assert.equal(row.writer_prompt_tokens, writerUsage.prompt_tokens ?? null);
+    assert.equal(row.writer_completion_tokens, null);
+  }
+});
+
+test('явный пропуск писателя сохраняется как нулевой расход писателя', async () => {
+  const mock = mockPool();
+  await persistResult(mock.pool, { ...processed,
+    llm_meta: { usage_complete: false, judge_usage_complete: false, prompt_tokens: null, completion_tokens: null, total_tokens: null },
+    multi_agent_analysis: { ...processed.multi_agent_analysis, judge_usage: null, writer_model: null, writer_usage: null },
+  });
+  const row = insertedValues(mock.calls);
+  assert.equal(row.writer_prompt_tokens, 0);
+  assert.equal(row.writer_completion_tokens, 0);
+  assert.equal(row.judge_prompt_tokens, null);
+});
+
+test('ошибка повтора сохраняет только безопасный учёт через worker и SQL', async () => {
+  for (const complete of [true, false]) {
+    const mock = mockPool();
+    const meta = { model: 'SECRET-MODEL', prompt_tokens: 5, completion_tokens: 6, total_tokens: 11,
+      judge_usage_complete: complete, warnings: ['SECRET-INPUT'],
+      proof_repair: { attempted: true, judge_calls: 2, status: 'failed', initial_errors: 1, initial_warnings: ['SECRET-FACT'] } };
+    const result = toPersistenceResult({ id: operationId, lease_token: leaseToken, deal_id: 42, silent: true },
+      { status: 'error', analysis: { pipeline_error: 'Сбой', llm_meta: meta } });
+    await persistResult(mock.pool, result);
+    const row = insertedValues(mock.calls);
+    assert.equal(row.llm_prompt_tokens, complete ? 5 : null);
+    assert.equal(row.llm_completion_tokens, complete ? 6 : null);
+    assert.equal(row.llm_total_tokens, complete ? 11 : null);
+    assert.deepEqual(JSON.parse(row.ai_judge_json), { proof_repair: { attempted: true, judge_calls: 2, status: 'failed', initial_errors: 1 },
+      judge_usage: complete ? {prompt_tokens: 5, completion_tokens: 6, total_tokens: 11} : null, judge_usage_known: null,
+      judge_usage_complete: complete, usage_complete: complete });
+    assert.equal(JSON.stringify(row).includes('SECRET'), false);
+    assert.equal('ai_verdict' in row, false);
+  }
+});
+
+test('частичный расход остаётся частичным, известный расход судьи не выдаётся за полный расход', async () => {
+  for (const complete of [false, true]) {
+    const mock = mockPool();
+    const judge = { prompt_tokens: 10, completion_tokens: 3, total_tokens: 13, secret: 'SECRET' };
+    const result = toPersistenceResult({ id: operationId, lease_token: leaseToken, deal_id: 42, silent: true },
+      { status: 'error', analysis: { pipeline_error: 'Сбой', llm_meta: {
+        prompt_tokens: null, completion_tokens: null, total_tokens: null, usage_complete: false,
+        judge_usage_complete: complete, judge_usage: complete ? judge : null, judge_usage_known: judge,
+        proof_repair: { attempted: true, judge_calls: 2, status: complete ? 'corrected' : 'failed', initial_errors: 1 },
+      } } });
+    await persistResult(mock.pool, result);
+    const row = insertedValues(mock.calls), metadata = JSON.parse(row.ai_judge_json);
+    assert.equal(row.llm_total_tokens, null);
+    assert.equal(row.judge_prompt_tokens, complete ? 10 : null);
+    assert.equal(row.judge_completion_tokens, complete ? 3 : null);
+    assert.deepEqual(metadata.judge_usage_known, { prompt_tokens: 10, completion_tokens: 3, total_tokens: 13 });
+    assert.equal(metadata.judge_usage_complete, complete);
+    assert.equal(metadata.usage_complete, false);
+    assert.equal(JSON.stringify(row).includes('SECRET'), false);
+  }
 });
 
 test('наборы сохраняемых колонок совпадают с выгрузкой n8n', {

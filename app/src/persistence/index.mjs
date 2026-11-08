@@ -1,5 +1,5 @@
 import { pgSafeReason } from '../rules/pipeline-gate.mjs';
-import { baseDealRow, processedRows, communicationRow } from './rows.mjs';
+import { baseDealRow, processedRows, communicationRow, safeErrorUsageMeta } from './rows.mjs';
 import { inTransaction, CommitOutcomeUnknownError } from './transaction.mjs';
 
 export { CommitOutcomeUnknownError };
@@ -369,10 +369,17 @@ export async function persistResult(pool, result) {
     }
     if (status === 'error') {
       const message = pgSafeReason(result._error || result.pipeline_error || result._reason || 'неизвестная ошибка').slice(0, 1000);
+      const meta = safeErrorUsageMeta(result.llm_meta);
       const inserted = await connection.query(insertStatement('lost_deal_analyses', {
         deal_id: id, pipeline_error: message, prompt_version: result.prompt_version || 'v2.8-sol',
         trigger_type: 'batch', processing_time_sec: Number(result.processing_time_sec) || 0,
         pipeline_operation_id: operation,
+        ...(meta ? { llm_prompt_tokens: meta.prompt_tokens, llm_completion_tokens: meta.completion_tokens,
+          llm_total_tokens: meta.total_tokens, judge_prompt_tokens: meta.judge_usage?.prompt_tokens ?? null,
+          judge_completion_tokens: meta.judge_usage?.completion_tokens ?? null,
+          ai_judge_json: JSON.stringify({ proof_repair: meta.proof_repair, judge_usage: meta.judge_usage,
+            judge_usage_known: meta.judge_usage_known, judge_usage_complete: meta.judge_usage_complete,
+            usage_complete: meta.usage_complete }) } : {}),
       }, { returning: ' RETURNING id' }));
       if (inserted.rowCount !== 1 || !inserted.rows?.[0]?.id) throw new Error('Не удалось сохранить сбой');
       if (job.trigger_type === 'audio_wait') {

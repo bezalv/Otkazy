@@ -10,7 +10,7 @@ function providerFailure(error) {
     : 'ошибка вызова модели';
 }
 
-// Только для явно выбранного ручного опыта. Модель видит тот же facts_packet и
+// Модель видит тот же facts_packet и
 // свой предыдущий ответ, но не может менять исходные факты. Проверка ссылок
 // остаётся формальной: она не доказывает смысловую верность свободного текста.
 const REPAIR_INSTRUCTION = 'В предыдущем ответе найдены формальные ошибки ссылок на доказательства. '
@@ -32,11 +32,15 @@ function addUsage(responses) {
   }
   return total;
 }
+function knownUsage(responses) {
+  const known = responses.filter(response => addUsage([response]) !== null);
+  return known.length ? addUsage(known) : null;
+}
 function repairInfo(initial, status) {
   return { attempted:true, judge_calls:2, status, initial_errors:initial.proof_errors_count,
     initial_warnings:initial.proof_warnings || [], limitations:['formal_checks_only','free_text_not_validated'] };
 }
-// Дополнительные формальные проверки действуют только в ручном опыте.
+// Формальные проверки действуют до писателя и не оценивают смысл утверждения.
 // Для absence разрешены смешанные ссылки на факты и метрики: это прямо
 // предусмотрено промптом. Эти проверки не оценивают смысл утверждения.
 function strictProofChecks(parsed, prepared) {
@@ -85,6 +89,8 @@ function repairFailure(reason, prepared, initial, responses, corrected = null) {
   const usage = addUsage(responses);
   result.llm_meta.proof_repair = repairInfo(initial, 'failed');
   result.llm_meta.judge_usage_complete = usage !== null && responses.length === 2;
+  result.llm_meta.judge_usage = result.llm_meta.judge_usage_complete ? usage : null;
+  result.llm_meta.judge_usage_known = knownUsage(responses);
   // Не считаем отсутствующий ответ бесплатным: попытка могла быть оплачена.
   if (!result.llm_meta.judge_usage_complete) for (const key of USAGE_FIELDS) result.llm_meta[key] = null;
   else for (const key of USAGE_FIELDS) result.llm_meta[key] = usage[key];
@@ -95,6 +101,8 @@ function afterRepairFailure(reason, prepared, options, repaired) {
   if (repaired) {
     result.llm_meta.proof_repair = repairInfo(repaired.initial, 'corrected');
     result.llm_meta.judge_usage_complete = repaired.usage !== null;
+    result.llm_meta.judge_usage = repaired.usage;
+    result.llm_meta.judge_usage_known = knownUsage(repaired.responses);
     result.llm_meta.usage_complete = false;
     for (const key of USAGE_FIELDS) result.llm_meta[key] = null;
   }
@@ -200,8 +208,11 @@ export async function runAgents({ prepared, pipelineGate, analytics, screenshotS
   }
 
   if (parsed.error) return pipelineError(`Сбой судьи: ${parsed.message}`, prepared, { judgeResponse });
-  if (repairProofErrors === true) parsed = strictProofChecks(parsed, prepared);
-  if (repairProofErrors === true && parsed.proof_errors_count > 0) {
+  parsed = strictProofChecks(parsed, prepared);
+  // Ручные сценарии с семантическими ролями имеют бюджет на второй вызов
+  // только при явно включённом repairProofErrors.
+  const repairAllowed = repairProofErrors === true || !(silent === true && semanticChatRoles === true);
+  if (repairAllowed && parsed.proof_errors_count > 0) {
     if (!prepared._data_enough || !judgeResponse || !Array.isArray(prepared.judge_request_body?.messages)) {
       return pipelineError('Сбой анализа: неподтверждённые ссылки судьи', prepared, { parsed, judgeResponse });
     }
@@ -232,6 +243,12 @@ export async function runAgents({ prepared, pipelineGate, analytics, screenshotS
   if (rejectUnknownRoleProof === true && (parsed.proof_warnings || []).some((warning) =>
     ['unknown_nonmaterial_as_statement', 'unknown_nonmaterial_metric_as_proof'].includes(warning.code))) {
     return afterRepairFailure('Сбой анализа: судья использовал данные с неизвестным автором как подтверждённое доказательство',
+      prepared, { parsed, judgeResponse }, repaired);
+  }
+  // Если повтор запрещён бюджетом ручного сценария, останавливаемся без
+  // публикации формально неподтверждённого вердикта.
+  if (parsed.proof_errors_count > 0) {
+    return afterRepairFailure('Сбой анализа: ссылки судьи не прошли формальную проверку',
       prepared, { parsed, judgeResponse }, repaired);
   }
   // CRM-комментарий остаётся в материалах, но не превращается в доказанное
@@ -270,6 +287,8 @@ export async function runAgents({ prepared, pipelineGate, analytics, screenshotS
   if (repaired) {
     output.multi_agent_analysis.proof_repair = repairInfo(repaired.initial, 'corrected');
     output.multi_agent_analysis.judge_usage = repaired.usage;
+    output.multi_agent_analysis.judge_usage_known = knownUsage(repaired.responses);
+    output.multi_agent_analysis.judge_usage_complete = repaired.usage !== null;
     output.llm_meta.judge_usage_complete = repaired.usage !== null;
     // Учитываем отсутствие статистики писателя, если он действительно вызывался.
     const writerCalled = shouldRunWriter(parsed.judge);

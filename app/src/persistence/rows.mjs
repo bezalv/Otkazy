@@ -9,6 +9,35 @@ const VOICEMAIL_PATTERNS = [
 const emptyToNull = (value) => value == null || value === '' || value === 'null' || value === 'undefined' ? null : value;
 const json = (value) => value == null ? null : JSON.stringify(value, (_, part) => typeof part === 'string' ? part.replace(/\0/g, '') : part);
 const numeric = (value) => Number.isFinite(Number(value)) ? Number(value) : 0;
+// Отсутствующая статистика платного вызова не означает нулевой расход.
+const usageNumeric = (value, unknown = false) => unknown || value === null ? null : numeric(value);
+
+// В строку ошибки разрешено попадать только заранее определённым меткам и
+// числам. Предупреждения судьи могут содержать текст сделки и не копируются.
+export function safeErrorUsageMeta(meta) {
+  const repair = meta?.proof_repair;
+  if (repair?.attempted !== true || repair?.judge_calls !== 2
+      || !['failed', 'corrected'].includes(repair.status)) return null;
+  const validCount = value => Number.isSafeInteger(value) && value >= 0 && value <= 2147483647;
+  const fields = ['prompt_tokens', 'completion_tokens', 'total_tokens'];
+  const safeUsage = input => input && fields.every(field => validCount(input[field]))
+    ? Object.fromEntries(fields.map(field => [field, input[field]])) : null;
+  const complete = (meta.usage_complete === true
+    || (repair.status === 'failed' && meta.judge_usage_complete === true))
+    && fields.every(field => validCount(meta[field]));
+  const judgeUsage = meta.judge_usage_complete === true
+    ? safeUsage(meta.judge_usage) || (repair.status === 'failed' ? safeUsage(meta) : null) : null;
+  const value = field => complete && validCount(meta[field]) ? meta[field] : null;
+  return {
+    proof_repair: { attempted: true, judge_calls: 2, status: repair.status,
+      initial_errors: validCount(repair.initial_errors) ? repair.initial_errors : null },
+    judge_usage_complete: judgeUsage !== null,
+    judge_usage: judgeUsage, judge_usage_known: safeUsage(meta.judge_usage_known),
+    usage_complete: complete,
+    prompt_tokens: value('prompt_tokens'), completion_tokens: value('completion_tokens'),
+    total_tokens: value('total_tokens'),
+  };
+}
 
 function cleanHtml(text) {
   return String(text || '').replace(/\[img\][^\[]*\[\/img\]/gi, '')
@@ -52,6 +81,8 @@ export function processedRows(result, deal, comms) {
   const screenshots = result.screenshot_stats || {};
   const judgeUsage = analysis.judge_usage || {};
   const writerUsage = analysis.writer_usage || {};
+  // В успешном результате этот явный маркер ставится только при обходе писателя.
+  const writerSkipped = analysis.writer_model === null && analysis.writer_usage === null;
   const calls = comms.filter((comm) => comm.type === 'call');
   const transcribed = calls.filter((comm) => comm.transcript && String(comm.transcript).length > 0).length;
   const failed = calls.filter((comm) => !comm.transcript && comm._needs_transcription).length;
@@ -86,8 +117,8 @@ export function processedRows(result, deal, comms) {
     ai_manager_script: classification.manager_script || '', ai_key_signals: json(classification.key_signals || []),
     ai_risk_factors: json(classification.risk_factors || []), ai_misplaced: !!classification.misplaced_stage,
     ai_correct_stage: emptyToNull(classification.correct_stage), llm_model: meta.model || '',
-    llm_prompt_tokens: numeric(meta.prompt_tokens), llm_completion_tokens: numeric(meta.completion_tokens),
-    llm_total_tokens: numeric(meta.total_tokens), llm_warnings: json(meta.warnings || []),
+    llm_prompt_tokens: usageNumeric(meta.prompt_tokens, meta.usage_complete === false), llm_completion_tokens: usageNumeric(meta.completion_tokens, meta.usage_complete === false),
+    llm_total_tokens: usageNumeric(meta.total_tokens, meta.usage_complete === false), llm_warnings: json(meta.warnings || []),
     comm_total_at_run: numeric(stats.total_events), full_prompt_text: fullPrompt, journal_text: journal,
     prompt_chars: fullPrompt.length, prompt_approx_tokens: Math.round(fullPrompt.length / 3.5),
     processing_time_sec: numeric(result.processing_time_sec), prompt_version: result.prompt_version || 'v2.8-sol',
@@ -98,9 +129,9 @@ export function processedRows(result, deal, comms) {
     ai_final_comment: analysis.final_comment || '', ai_recovery_script: '', ai_facts_json: json(analysis.facts_packet || {}),
     ai_judge_json: json(analysis), ai_proof_warnings: json(analysis.proof_warnings || []),
     ai_facts_count: analysis.facts_packet?.facts?.length || 0, judge_model: emptyToNull(analysis.judge_model),
-    judge_prompt_tokens: numeric(judgeUsage.prompt_tokens), judge_completion_tokens: numeric(judgeUsage.completion_tokens),
-    writer_model: emptyToNull(analysis.writer_model), writer_prompt_tokens: numeric(writerUsage.prompt_tokens),
-    writer_completion_tokens: numeric(writerUsage.completion_tokens), screenshots_total: numeric(screenshots.screenshots_total),
+    judge_prompt_tokens: usageNumeric(judgeUsage.prompt_tokens, analysis.judge_usage === null || meta.judge_usage_complete === false), judge_completion_tokens: usageNumeric(judgeUsage.completion_tokens, analysis.judge_usage === null || meta.judge_usage_complete === false),
+    writer_model: emptyToNull(analysis.writer_model), writer_prompt_tokens: writerSkipped ? 0 : usageNumeric(writerUsage.prompt_tokens, analysis.writer_usage === null || (meta.usage_complete === false && writerUsage.prompt_tokens == null)),
+    writer_completion_tokens: writerSkipped ? 0 : usageNumeric(writerUsage.completion_tokens, analysis.writer_usage === null || (meta.usage_complete === false && writerUsage.completion_tokens == null)), screenshots_total: numeric(screenshots.screenshots_total),
     screenshots_extracted: numeric(screenshots.screenshots_extracted), screenshots_failed: numeric(screenshots.screenshots_failed),
   };
   if (result.audio_wait_expired === true) {

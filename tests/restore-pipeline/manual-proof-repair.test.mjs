@@ -58,7 +58,8 @@ test('неисправленный или повреждённый ответ и
     assert.match(result.pipeline_error,/Сбой анализа/);assert.deepEqual(h.seen.map(x=>x.role),['judge','judge']);
     assert.equal(result.classification,null);assert.equal(result.multi_agent_analysis,null);
     assert.equal(result.llm_meta.proof_repair.status,'failed');assert.equal(result.llm_meta.proof_repair.initial_errors,1);
-    if(second instanceof Error){assert.equal(result.llm_meta.judge_usage_complete,false);assert.equal(result.llm_meta.total_tokens,null);}
+    if(second instanceof Error){assert.equal(result.llm_meta.judge_usage_complete,false);assert.equal(result.llm_meta.total_tokens,null);
+      assert.equal(result.llm_meta.judge_usage,null);assert.deepEqual(result.llm_meta.judge_usage_known,usage(2));}
   }
 });
 
@@ -103,12 +104,15 @@ test('лимит ручного адаптера блокирует лишние
 });
 
 test('неполная статистика модели не превращается в нулевые токены',async()=>{
-  for(const responses of [[response(verdict('f001'),null),response(verdict('f002'))],
-    [response(verdict('f001')),response(verdict('f002'),null)]]) {
+  for(const responses of [[response(verdict('f001'),null),response(verdict('f002'),usage(4))],
+    [response(verdict('f001'),usage(3)),response(verdict('f002'),null)]]) {
+    const known = responses.find(item => item.usage)?.usage;
     const h=harness(responses);const result=await runAgents(h.options);
     assert.equal(result.multi_agent_analysis.proof_repair.status,'corrected');
     assert.equal(result.llm_meta.judge_usage_complete,false);assert.equal(result.llm_meta.usage_complete,false);
     assert.equal(result.llm_meta.total_tokens,null);assert.equal(result.multi_agent_analysis.judge_usage,null);
+    assert.deepEqual(result.multi_agent_analysis.judge_usage_known,known);
+    assert.equal(result.multi_agent_analysis.judge_usage_complete,false);
   }
 });
 
@@ -131,12 +135,78 @@ test('сбой писателя после исправления не теря�
   const result=await runAgents(h.options);
   assert.match(result.pipeline_error,/писателя/);assert.equal(result.llm_meta.proof_repair.status,'corrected');
   assert.equal(result.llm_meta.usage_complete,false);assert.equal(result.llm_meta.total_tokens,null);
+  assert.deepEqual(result.llm_meta.judge_usage,{prompt_tokens:4,completion_tokens:6,total_tokens:10});
+  assert.deepEqual(result.llm_meta.judge_usage_known,result.llm_meta.judge_usage);
 });
 
-test('обычный режим сохраняет прежнее поведение с формальной ошибкой',async()=>{
-  const h=harness([response(verdict('f001'))]);const result=await runAgents({...h.options,repairProofErrors:false,silent:false,semanticChatRoles:false});
-  assert.deepEqual(h.seen.map(x=>x.role),['judge','writer']);assert.equal(result.multi_agent_analysis.proof_errors_count,1);
-  assert.equal(result.multi_agent_analysis.proof_repair,undefined);
+test('при неполной статистике повторной проверки известная часть не выдаётся за полную сумму судьи',async()=>{
+  const h=harness([response(verdict('f001'),usage(3)),response(verdict('f002'),null)]);const original=h.options.client;
+  h.options.client={async complete(body,options){if(options.role==='writer')throw Error('failure');return original.complete(body,options);}};
+  const result=await runAgents(h.options);
+  assert.equal(result.llm_meta.judge_usage_complete,false);
+  assert.equal(result.llm_meta.judge_usage,null);
+  assert.deepEqual(result.llm_meta.judge_usage_known,usage(3));
+  assert.equal(result.llm_meta.total_tokens,null);
+});
+
+test('обычный режим один раз исправляет формальную ошибку и повторно проверяет результат до писателя',async()=>{
+  const h=harness([response(verdict('f001')),response(verdict('f002'))]);
+  const result=await runAgents({...h.options,repairProofErrors:false,silent:false,semanticChatRoles:false});
+  assert.deepEqual(h.seen.map(x=>x.role),['judge','judge','writer']);
+  assert.equal(result.multi_agent_analysis.proof_errors_count,0);
+  assert.equal(result.multi_agent_analysis.proof_repair.status,'corrected');
+});
+
+test('обычный режим не выдаёт вердикт при неисправленных доказательствах',async()=>{
+  for (const second of [response(verdict('f001')),new Error('failure')]) {
+    const h=harness([response(verdict('f001')),second]);
+    const result=await runAgents({...h.options,repairProofErrors:false,silent:false,semanticChatRoles:false});
+    assert.deepEqual(h.seen.map(x=>x.role),['judge','judge']);
+    assert.match(result.pipeline_error,/Сбой анализа/);
+    assert.equal(result.classification,null);assert.equal(result.multi_agent_analysis,null);
+  }
+});
+
+test('строгие проверки действуют в обычном режиме без лишнего вызова при корректных ссылках',async()=>{
+  for(const invalid of [
+    {proof_type:'client_statement',proof_fact_ids:['missing']},
+    {proof_type:'client_statement',proof_fact_ids:['f001']},
+    {proof_type:'client_statement',proof_fact_ids:['metric:count']},
+    {proof_type:'metric',proof_fact_ids:['f002']},
+    {proof_type:'metric',proof_fact_ids:['metric:unknown']},
+    {proof_type:'metric',proof_fact_ids:['metric:constructor']},
+    {proof_type:'client_statement',proof_fact_ids:['f003']},
+    {proof_type:'client_statement',proof_fact_ids:[]},
+  ]) {
+    const first=verdict('f002');Object.assign(first.key_signals[0],invalid);
+    const h=harness([response(first),response(verdict('f002'))]);
+    h.options.prepared.facts_packet.metrics={count:1,unknown:null};
+    h.options.prepared.facts_packet.facts.push({fact_id:'f003',actor:'unknown',source:'chat'});
+    const result=await runAgents({...h.options,repairProofErrors:false,silent:false,semanticChatRoles:false});
+    assert.deepEqual(h.seen.map(x=>x.role),['judge','judge','writer']);
+    assert.equal(result.multi_agent_analysis.proof_repair.status,'corrected');
+  }
+  for (const refs of [[],['f002','metric:count']]) {
+    const v=verdict('f002');Object.assign(v.key_signals[0],{proof_type:'absence',proof_fact_ids:refs});
+    const h=harness([response(v)]);h.options.prepared.facts_packet.metrics={count:1};
+    const result=await runAgents({...h.options,repairProofErrors:false,silent:false,semanticChatRoles:false});
+    assert.deepEqual(h.seen.map(x=>x.role),['judge','writer']);assert.equal(result.multi_agent_analysis.proof_errors_count,0);
+  }
+});
+
+test('ручной опыт без включённой коррекции не превышает лимит судьи',async()=>{
+  const h=harness([response(verdict('f001'))]);
+  const result=await runAgents({...h.options,repairProofErrors:false});
+  assert.deepEqual(h.seen.map(x=>x.role),['judge']);
+  assert.match(result.pipeline_error,/ссылки судьи не прошли/);
+  assert.equal(result.multi_agent_analysis,null);
+});
+
+test('недостаток данных не вызывает судью и писателя',async()=>{
+  const h=harness([]);h.options.prepared._data_enough=false;
+  h.options.prepared.judge={...verdict('f002'),verdict:'недостаточно_данных',key_signals:[]};
+  const result=await runAgents({...h.options,repairProofErrors:false,silent:false,semanticChatRoles:false});
+  assert.equal(result.pipeline_error,undefined);assert.deepEqual(h.seen,[]);
 });
 
 test('нельзя включить исправление вне тихого семантического режима',async()=>{

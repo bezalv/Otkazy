@@ -1,4 +1,5 @@
 import { processDeal } from '../process-deal.mjs';
+import { safeErrorUsageMeta } from '../persistence/rows.mjs';
 
 // Входом служит только уже захваченное задание. Ошибки сохранения или потери
 // аренды не превращаются в результат сделки и оставляются очереди на восстановление.
@@ -22,6 +23,7 @@ export function toPersistenceResult(job, outcome, audioOriginHistoryId = null) {
   if (outcome?.status === 'skipped' || outcome?.status === 'skip' || collection._reason === 'not_in_lost_stage') return { ...base, _status: 'skipped' };
   return {
     ...base, _status: 'error',
+    ...(safeErrorUsageMeta(outcome?.analysis?.llm_meta) ? { llm_meta: safeErrorUsageMeta(outcome.analysis.llm_meta) } : {}),
     // Только блокировка с известной непоправимой без ручной проверки причиной
     // завершает конкретное ожидание аудио. Сетевые ошибки остаются повторяемыми.
     ...(outcome?.status === 'blocked' && outcome.pipelineGate?.final === true
