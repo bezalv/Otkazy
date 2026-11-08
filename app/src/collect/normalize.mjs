@@ -2,6 +2,11 @@ import { createHash } from 'node:crypto';
 import { chatMillisTimestamp } from '../time-precision.mjs';
 import { explicitNonAudio, voiceFileSnapshot } from '../voice-file-metadata.mjs';
 import { verifiedAudioOnly } from '../stt-client.mjs';
+import { ambiguousProcessingOnly } from '../calls/transcript-quality.mjs';
+
+export class TemporalScopeError extends Error {
+  constructor(source, reason) { super(reason); this.source = source; }
+}
 
 // Доказательство живёт только в памяти процесса; поля из ответа Битрикса и
 // сериализованной коммуникации сами по себе не дают права на классификацию.
@@ -281,6 +286,12 @@ export function verifiedInferenceVoice(event, { dealId, cutoff, cache } = {}) {
 }
 
 function callEvent(call) {
+  if (call._historical_plan_only === true) return {
+    type: 'task', date: call.CREATED,
+    title: 'Запланированный звонок: ' + (call.SUBJECT || 'без темы') + ' (текущий срок: ' + call.START_TIME + ')',
+    status: null, closed_date: null, responsible_id: call.RESPONSIBLE_ID,
+    task_id: 'activity:' + call.ID, _historical_task_state_unknown: true, _historical_plan_only: true,
+  };
   const audioUrl = call.SETTINGS?.RECORD_URL || null;
   const files = fileList(call.FILES).map(file => ({
     name: file.name || file.NAME,
@@ -291,7 +302,7 @@ function callEvent(call) {
   const scheduled = created && call.START_TIME
     && Math.abs(new Date(call.START_TIME).getTime() - new Date(created).getTime()) > 600000;
   return {
-    type: 'call', date: created, direction: call.DIRECTION === '2' ? 'outgoing' : 'incoming',
+    type: 'call', date: call._historical_event_time || created, direction: call.DIRECTION === '2' ? 'outgoing' : 'incoming',
     subject: call.SUBJECT || '', duration_start: call.START_TIME,
     duration_end: scheduled ? call.START_TIME : call.END_TIME,
     responsible_id: call.RESPONSIBLE_ID, description: call.DESCRIPTION || '',
@@ -326,21 +337,31 @@ function commentEvent(comment, screenshots) {
   return event;
 }
 
-function taskEvent(task) {
+function taskEvent(task, historicalScope) {
   return {
     type: 'task', date: task.createdDate || task.CREATED_DATE, title: task.title || task.TITLE,
     description: String(task.description || task.DESCRIPTION || '').substring(0, 500),
-    status: task.status || task.STATUS, responsible_id: task.responsibleId || task.RESPONSIBLE_ID,
-    created_by: task.createdBy || task.CREATED_BY, closed_date: task.closedDate || task.CLOSED_DATE,
+    status: historicalScope ? null : (task.status || task.STATUS), responsible_id: task.responsibleId || task.RESPONSIBLE_ID,
+    created_by: task.createdBy || task.CREATED_BY, closed_date: historicalScope ? null : (task.closedDate || task.CLOSED_DATE),
+    ...(historicalScope ? { _historical_task_state_unknown: true } : {}),
     task_id: task.id || task.ID,
   };
 }
 
 /** Подготовка коммуникаций из результата collectDeal. Все внешние действия внедряются вызывающим кодом. */
-export async function normalizeCommunications({ collection, resolveFile, transcribeVoice, screenshots = true, verifyFallbackSession }) {
+export async function normalizeCommunications({ collection, resolveFile, transcribeVoice, screenshots = true, verifyFallbackSession, temporalCutoff = null }) {
   if (collection?._status !== 'pending_normalization' || !collection.raw || !collection.deal_data) {
     throw new TypeError('Нужен полный результат первичного сбора');
   }
+  const cutoff = temporalCutoff === null ? null : strictTime(temporalCutoff);
+  if (temporalCutoff !== null && cutoff === null) throw new TemporalScopeError('openlines', 'Не подтверждена дата отказа');
+  const withinCutoff = value => {
+    if (cutoff === null) return true;
+    const timestamp = strictTime(value);
+    if (timestamp === null) throw new TemporalScopeError('openlines', 'Неизвестно время сообщения или файла');
+    if (timestamp === cutoff) throw new TemporalScopeError('openlines', 'Порядок сообщения или файла и отказа не подтверждён');
+    return timestamp < cutoff;
+  };
   if (['calls', 'openlines', 'comments', 'tasks'].some(key => collection._sources?.[key]?.complete !== true)) {
     throw new Error('Источники сделки прочитаны не полностью');
   }
@@ -478,6 +499,18 @@ export async function normalizeCommunications({ collection, resolveFile, transcr
       const { role, author } = roleForMessage(message, text, users, meta.isWazzup, meta.connectorUnknown, meta.connectorConflict, meta.isWappi);
       const cleaned = link ? '' : cleanChatText(text, meta.isWazzup);
       if (!cleaned && !count) continue;
+      // Ссылки на файлы регистрируются выше, даже когда сообщение позднее
+      // отказа: иначе вложение станет orphan и попадёт на транскрибацию.
+      if (!withinCutoff(message.date || message.DATE || null)) continue;
+      if (cutoff !== null) {
+        if (link) throw new TemporalScopeError('openlines', 'Историческая версия аудиоссылки не подтверждена');
+        for (const id of ids) {
+          const file = byId.get(id);
+          if (!file || !withinCutoff(file.date || file.DATE || null)) {
+            throw new TemporalScopeError('openlines', 'Дата вложения не подтверждает его наличие до отказа');
+          }
+        }
+      }
       const msgKey = `${sessionId}_${messageId}`;
       const event = {
         type: 'chat', channel: meta.title, connector_id: meta.connector, chat_id: chatId,
@@ -504,7 +537,12 @@ export async function normalizeCommunications({ collection, resolveFile, transcr
     }
     // Непривязанный image/video остаётся частью истории, даже если отдельного
     // сообщения у него нет. Без его содержания текстовый контекст неполон.
-    if (files.some(file => file?.id == null || (!sessionFileRefs.has(String(file.id)) && knownNonAudio(file)))) {
+    const scopedFiles = files.filter(file => file?.id != null && sessionFileRefs.has(String(file.id))
+      || withinCutoff(file?.date || file?.DATE || null));
+    if (scopedFiles.some(file => file?.id == null || (!sessionFileRefs.has(String(file.id)) && knownNonAudio(file)))) {
+      if (cutoff !== null && messages.length === sessionMessageStart) {
+        throw new TemporalScopeError('openlines', 'Вложение истории не связано с сообщением до отказа');
+      }
       for (const event of messages.slice(sessionMessageStart)) {
         event._session_unreferenced_files = true;
         const binding = verifiedFallbackEvents.get(event);
@@ -512,7 +550,7 @@ export async function normalizeCommunications({ collection, resolveFile, transcr
       }
     }
     for (const key of sessionFileRefs) registerSessionFile(key, sessionScope, true);
-    for (const file of files) {
+    for (const file of scopedFiles) {
       if (file.id != null && !sessionFileRefs.has(String(file.id))) {
         registerSessionFile(String(file.id), sessionScope, false);
       }
@@ -634,6 +672,7 @@ export async function normalizeCommunications({ collection, resolveFile, transcr
       const response = await transcribeVoice(voiceRequest);
       if (!response || response.success !== true) throw new Error('Распознавание завершилось ошибкой');
       if (typeof response.formatted_dialog !== 'string') throw new Error('Некорректный результат распознавания');
+      if (ambiguousProcessingOnly(response)) throw new Error('Неоднозначный результат распознавания');
       if (!response.formatted_dialog.trim()) { markUnrecognized(item.event); continue; }
       const list = transcripts.get(item.event) || [];
       list.push(response);
@@ -682,14 +721,14 @@ export async function normalizeCommunications({ collection, resolveFile, transcr
   const chatEvents = messages.filter(message => message.text || message._has_audio_transcript || message._has_files);
   const commentEvents = raw.comments.map(comment => commentEvent(comment, screenshots));
   const calls = raw.calls.map(callEvent);
-  const events = [...calls, ...commentEvents, ...chatEvents, ...raw.tasks.map(taskEvent)];
+  const events = [...calls, ...commentEvents, ...chatEvents, ...raw.tasks.map(task => taskEvent(task, cutoff !== null))];
   events.sort((a, b) => (a.date ? new Date(a.date).getTime() : 0) - (b.date ? new Date(b.date).getTime() : 0));
   const stats = {
-    total_events: events.length, calls: calls.length, calls_with_audio: calls.filter(call => call._needs_transcription).length,
+    total_events: events.length, calls: calls.filter(call => call.type === 'call').length, calls_with_audio: calls.filter(call => call._needs_transcription).length,
     comments: commentEvents.length, chat_messages: chatEvents.length, chat_messages_raw: messages.length,
     chat_files_skipped: messages.length - chatEvents.length, chat_audio_transcribed: audioTranscribed,
     chat_audio_files_found: audioFound, chat_system_dropped: systemDropped,
-    chat_voice_unrecognized: unrecognizedCount, tasks: raw.tasks.length, chats_count: raw.chats.length,
+    chat_voice_unrecognized: unrecognizedCount, tasks: raw.tasks.length + calls.filter(call => call.type === 'task').length, chats_count: raw.chats.length,
     screenshots_found: commentEvents.reduce((total, comment) => total + (comment.screenshots?.length || 0), 0),
   };
   const dealData = {

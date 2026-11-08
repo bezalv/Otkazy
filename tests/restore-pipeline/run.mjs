@@ -65,8 +65,8 @@ test('ожидание поздней записи останавливает р
   args.bitrix.request = async (method, body) => {
     if (method === 'crm.activity.list' && body.filter.TYPE_ID) return { result: [{
       ID: '99', PROVIDER_ID: 'VOXIMPLANT_CALL', COMPLETED: 'Y',
-      CREATED: '2026-11-04T00:01:00Z', START_TIME: '2026-11-04T00:01:00Z',
-      END_TIME: '2026-11-04T00:02:00Z', FILES: [],
+      CREATED: '2026-11-03T23:56:00Z', START_TIME: '2026-11-03T23:56:00Z',
+      END_TIME: '2026-11-03T23:57:00Z', FILES: [],
     }] };
     return original(method, body);
   };
@@ -76,7 +76,7 @@ test('ожидание поздней записи останавливает р
   assert.equal(result.analysis, undefined);
 });
 
-test('звонок, завершившийся во время сбора, оценивается по актуальному времени', async () => {
+test('звонок после отказа не создаёт новое ожидание аудио', async () => {
   const initial = Date.parse('2026-11-05T00:00:00Z');
   let clockCalls = 0;
   const args = fixture({ nowMs: null, clock: () => clockCalls++ === 0 ? initial : initial + 180000 });
@@ -90,9 +90,22 @@ test('звонок, завершившийся во время сбора, оц�
     return original(method, body);
   };
   const result = await processDeal(args);
-  assert.equal(result.status, 'waiting');
-  assert.deepEqual(result.audioWait.queue.pending_calls, ['99']);
-  assert.equal(result.audioWait.queue.first_seen_at, '2026-11-05T00:03:00.000Z');
+  assert.equal(result.status, 'processed');
+  assert.equal(result.audioWait.action, 'analyze');
+  assert.equal(result.dealData.communications.length, 0);
+});
+
+test('прежнее ожидание позднего звонка сохраняет отслеженный ID до завершения очереди', async () => {
+  const args = fixture({ savedAudioWait: { state:'waiting', lose_date:'2026-11-04T00:00:00Z',
+    first_seen_at:'2026-11-04T12:00:00Z', deadline_at:'2026-11-05T12:00:00Z',
+    next_check_at:'2026-11-04T12:05:00Z', pending_calls:['99'], observations:{99:{activity_id:'99'}} } });
+  const original=args.bitrix.request;
+  args.bitrix.request=async(method,body)=>method==='crm.activity.list' && body.filter.TYPE_ID
+    ? { result:[{ID:'99',PROVIDER_ID:'VOXIMPLANT_CALL',COMPLETED:'Y',CREATED:'2026-11-04T00:01:00Z',
+      START_TIME:'2026-11-04T00:01:00Z',END_TIME:'2026-11-04T00:02:00Z',FILES:[]}] } : original(method,body);
+  const result=await processDeal(args);
+  assert.equal(result.status,'waiting');assert.deepEqual(result.audioWait.queue.pending_calls,['99']);
+  assert.equal(result.analysis,undefined);
 });
 
 test('ошибка скриншота блокирует судью', async () => {
@@ -145,7 +158,9 @@ function withChat(args, connector, messages) {
     if (method === 'imopenlines.crm.chat.get') return { result: [{ CHAT_ID: 100, CONNECTOR_ID: connector, CONNECTOR_TITLE: connector }] };
     if (method === 'imopenlines.session.history.get') return { result: {
       sessionId: 80, chatId: 100,
-      chat: { 100: {} }, users: { 55: { connector: true, name: 'Wazzup App' } }, message: messages, files: {},
+      chat: { 100: {} }, users: { 55: { connector: true, name: 'Wazzup App' } },
+      message: Object.fromEntries(Object.entries(messages).map(([key, message]) => [key, { date: '2026-11-03T00:00:00Z', ...message }])),
+      files: Object.fromEntries(Object.values(messages).flatMap(message => (message.params?.FILE_ID || []).map(id => [id, { id, type: 'audio', name: 'voice.ogg', date: '2026-11-03T00:00:00Z' }]))),
     } };
     return original(method, body);
   };
@@ -230,7 +245,7 @@ test('противоречивый тип известного голосово�
   args.bitrix.request=async(method,body)=>{
     const response=await original(method,body);
     if(method==='imopenlines.session.history.get')return {...response,result:{...response.result,
-      files:{7:{id:7,type:'audio',name:'voice.ogg'}}}};
+      files:{7:{id:7,type:'audio',name:'voice.ogg',date:'2026-11-03T00:00:00Z'}}}};
     return response;
   };
   args.llm={async complete(){llmCalls++;throw Error('Модель не должна вызываться');}};

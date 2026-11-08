@@ -2,6 +2,7 @@
 // Битрикса; функция не запускает обработчик сделки и не пишет в CRM или БД.
 import { createHash } from 'node:crypto';
 import { exactMillisTimestamp } from '../time-precision.mjs';
+import { ambiguousProcessingOnly } from '../calls/transcript-quality.mjs';
 import { createGeneralSessionVerifier } from './general-session-verifier.mjs';
 import { createSessionLookup } from './general-session-lookup.mjs';
 
@@ -201,6 +202,7 @@ export async function runVoiceMessagePilot({ dealId, transitionId, chatId, sessi
     signal.throwIfAborted();
     if (!transcript || transcript.success !== true || typeof transcript.formatted_dialog !== 'string'
         || !transcript.formatted_dialog.trim()) throw new Error('Голосовое не распознано');
+    if (ambiguousProcessingOnly(transcript)) throw new Error('Содержание голосового требует повторной проверки');
     return { status: 'unverified', delivery_permitted: false, history_complete: null,
       duration_sec: inspected.duration_sec, channels: inspected.channels, audio_sha256: digest,
       transcript, limitations: ['one_session_not_full_history', 'historical_file_identity_unverified',

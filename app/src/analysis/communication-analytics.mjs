@@ -60,7 +60,9 @@ if (cutoffTs === null) { cutoffTs = lastEventTs; cutoffSource = 'last_event'; }
 if (cutoffTs === null) { cutoffTs = parseDate(input.date_modify); cutoffSource = 'date_modify'; }
 if (cutoffTs === null) { cutoffTs = now.getTime(); cutoffSource = 'now'; }
 var cutoffShiftedDays = 0;
-if (lastEventTs !== null && cutoffTs < lastEventTs) { cutoffShiftedDays = daysBetween(cutoffTs, lastEventTs); cutoffTs = lastEventTs; }
+if (input._historical_scope_checked === true && cutoffSource !== 'lose_date') throw new Error('Не подтверждена дата отказа');
+if (input._historical_scope_checked === true && lastEventTs !== null && cutoffTs <= lastEventTs) throw new Error('Событие вне исторической границы');
+if (input._historical_scope_checked !== true && lastEventTs !== null && cutoffTs < lastEventTs) { cutoffShiftedDays = daysBetween(cutoffTs, lastEventTs); cutoffTs = lastEventTs; }
 var daysSinceLose = Math.max(0, Math.round((now.getTime() - cutoffTs) / 86400000));
 // daysAgo теперь означает «за сколько дней до закрытия», а не «сколько дней назад от сегодня»
 function daysAgo(ts) { return daysBetween(ts, cutoffTs); }

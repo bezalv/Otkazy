@@ -528,9 +528,9 @@ test('processDeal блокирует OGG без имени файла и нек�
       if (method === 'crm.timeline.comment.list') return { result: [] };
       if (method === 'imopenlines.crm.chat.get') return { result: [{ CHAT_ID: 100, CONNECTOR_ID: 'wappi' }] };
       if (method === 'imopenlines.session.history.get') return { result: {
-        sessionId: 80, chatId: 100, chat: { 100: {} }, files: { 101: { type: 'audio', extension: 'ogg' } },
+        sessionId: 80, chatId: 100, chat: { 100: {} }, files: { 101: { type: 'audio', extension: 'ogg', date: '2026-11-03T00:00:00Z' } },
         users: { 55: { connector: true } },
-        message: { 1: { senderid: 55, text: '', params: { FILE_ID: [101] } } },
+        message: { 1: { senderid: 55, date: '2026-11-03T00:00:00Z', text: '', params: { FILE_ID: [101] } } },
       } };
       if (method === 'tasks.task.list') return { result: { tasks: [] } };
       throw new Error('Неожиданный метод');

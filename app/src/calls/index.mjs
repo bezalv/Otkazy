@@ -1,5 +1,6 @@
 import { copyNeutralReactionTrust } from '../analysis/chat-role-trust.mjs';
 import { pgSafeReason } from '../rules/pipeline-gate.mjs';
+import { ambiguousProcessingOnly } from './transcript-quality.mjs';
 
 function pickAudioUrl(call) {
   for (const file of call.audio_files || []) {
@@ -139,6 +140,10 @@ export async function transcribeCalls({ dealData, transcribe }) {
       fail('pass1_stereo', 'Некорректный текст транскрипции');
       continue;
     }
+    if (result?.success === true && ambiguousProcessingOnly(result)) {
+      fail('pass1_stereo', 'Содержание распознавания неоднозначно: обнаружена только фраза ожидания обработки');
+      continue;
+    }
     if (result?.success === true && String(result.formatted_dialog || '').trim()) {
       const mode = transcriptMode(result, 2);
       const managerText = String(result.manager_text || '').trim();
@@ -167,7 +172,9 @@ export async function transcribeCalls({ dealData, transcribe }) {
       fail('pass2_mono', 'Ответ относится к другому звонку');
       continue;
     }
-    if (result?.success === true && typeof result.formatted_dialog === 'string') {
+    if (result?.success === true && ambiguousProcessingOnly(result)) {
+      fail('pass2_mono', 'Содержание распознавания неоднозначно: обнаружена только фраза ожидания обработки');
+    } else if (result?.success === true && typeof result.formatted_dialog === 'string') {
       results.push({ ...result, activity_id: activityId, comm_index: index, _transcript_mode: 'mono' });
     } else {
       let message = result?.success === true ? 'Некорректный текст транскрипции' : errorText(result, 'Моно-проход не дал результата');

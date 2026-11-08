@@ -1,5 +1,6 @@
 import { collectDeal } from './collect/index.mjs';
-import { normalizeCommunications } from './collect/normalize.mjs';
+import { normalizeCommunications, TemporalScopeError } from './collect/normalize.mjs';
+import { scopeCollectionAtLose } from './collect/temporal-scope.mjs';
 import { planAudioWait } from './audio-wait/index.mjs';
 import { transcribeCalls } from './calls/index.mjs';
 import { buildJournal } from './analysis/journal.mjs';
@@ -10,6 +11,11 @@ import { processScreenshots } from './screenshots/process.mjs';
 import { pgDecide } from './rules/pipeline-gate.mjs';
 import { dsEvaluate, dsInsufficientJudge } from './rules/data-sufficiency.mjs';
 import { runAgents } from './agents/index.mjs';
+
+function blockedTemporalScope(collection, audioWait, source, reason) {
+  const sources = { ...collection._sources, [source]: { ...collection._sources[source], complete: false, error: reason } };
+  return { status: 'blocked', collection, audioWait, pipelineGate: pgDecide({ sources }) };
+}
 
 /** Обрабатывает одну сделку без записи в БД и без внешних уведомлений. */
 export async function processDeal({
@@ -57,10 +63,18 @@ export async function processDeal({
   // завершения звонка с моментом начала сбора означало бы терять новые звонки.
   const evaluatedAt = nowMs ?? clock();
   if (!Number.isFinite(evaluatedAt)) throw new TypeError('Некорректное время обработки');
+  // Новый переход не должен ждать записи разговоров, которые начались после
+  // отказа. Сохранённые очереди читают прежний набор до отдельной миграции,
+  // чтобы ранее отслеженный звонок не был ошибочно признан исчезнувшим.
+  let temporal = null;
+  if (savedAudioWait === null) {
+    temporal = scopeCollectionAtLose(collected, { screenshots });
+    if (temporal.error) return blockedTemporalScope(collected, null, temporal.error.source, temporal.error.reason);
+  }
   const audioWait = planAudioWait({
     stageId: collected.deal_data.stage_id,
     callsComplete: collected._sources.calls.complete,
-    calls: collected.raw.calls,
+    calls: temporal ? temporal.collection.raw.calls : collected.raw.calls,
     loseDate: collected.deal_data.lose_date,
     enabledAt: audioWaitEnabledAt,
     saved: savedAudioWait,
@@ -71,9 +85,22 @@ export async function processDeal({
   if (audioWait.queue) audioWait.queue.origin_stage_history_id = String(collected.stage_history[0].ID);
   if (audioWait.action !== 'analyze') return { status: audioWait.action, collection: collected, audioWait };
 
-  const normalized = await normalizeCommunications({
-    collection: collected, resolveFile, transcribeVoice: transcribe, screenshots, verifyFallbackSession,
-  });
+  // audio-wait получает неизменённый полный набор, чтобы не повредить уже
+  // сохранённые ожидания. Судье и распознаванию — только события до отказа.
+  temporal ||= scopeCollectionAtLose(collected, { screenshots });
+  if (temporal.error) return blockedTemporalScope(collected, audioWait, temporal.error.source, temporal.error.reason);
+  let normalized;
+  try {
+    normalized = await normalizeCommunications({
+      collection: temporal.collection, resolveFile, transcribeVoice: transcribe, screenshots, verifyFallbackSession,
+      temporalCutoff: collected.deal_data.lose_date,
+    });
+  } catch (error) {
+    if (error instanceof TemporalScopeError) return blockedTemporalScope(collected, audioWait, error.source, error.message);
+    throw error;
+  }
+  normalized.deal_data.comm_stats.excluded_after_cutoff = temporal.excluded;
+  normalized.deal_data._historical_scope_checked = true;
   let chatRoleInferenceStats = null;
   let chatRoleInferenceEvidence = null;
   // Только явный ручной режим для проверки текста. Обычная обработка по умолчанию

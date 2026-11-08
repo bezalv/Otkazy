@@ -70,7 +70,7 @@ for (var j = 0; j < events.length; j++) {
     if (d.transcript && d.transcript.length > 0) { summary.has_voice_transcript = true; }
     summary.channel = ch;
   } else if (evt.type === 'task') {
-    var taskStatus = d.status === '5' ? 'закрыта' : (d.status === '2' ? 'в работе' : 'статус ' + d.status);
+    var taskStatus = d._historical_task_state_unknown ? 'статус на момент отказа не подтверждён' : (d.status === '5' ? 'закрыта' : (d.status === '2' ? 'в работе' : 'статус ' + d.status));
     line = '[' + dateStr + '] ЗАДАЧА: ' + (d.title || 'Без названия') + ' (' + taskStatus + ')';
     if (d.closed_date) { line += ' — закрыта ' + formatDateShort(d.closed_date); }
     summary.title = d.title; summary.status = taskStatus;
@@ -88,6 +88,7 @@ if (input.comm_stats) { var cs = input.comm_stats; dealSummary += '\n=== СТА�
 if (input.transcription_stats) { var ts2 = input.transcription_stats; dealSummary += '\n=== ТРАНСКРИПЦИЯ ЗВОНКОВ ===\nТранскрибировано: ' + ts2.calls_transcribed + ' из ' + ts2.calls_with_audio + '\n'; if (ts2.calls_failed > 0) { dealSummary += 'Ошибки: ' + ts2.calls_failed + '\n'; } }
 var fullPromptText = dealSummary + '\n\n=== ХРОНОЛОГИЧЕСКИЙ ЖУРНАЛ СОБЫТИЙ ===\n\n' + journalText;
 var output = {};
+if (input._historical_scope_checked === true) output._historical_scope_checked = true;
 var passFields = ['deal_id','title','assigned_by_id','stage_id','stage_name','category_id','opportunity','currency','date_create','date_modify','pause_reason_id','pause_reason','deferred_until','days_until_deferred','pause_flag','department','product_type','client_type','source','source_description','contact_id','company_id','previous_stage_id','previous_stage_name','pause_date','days_from_pause_to_deferred','stage_history_count','comm_stats','communications','transcription_stats',
   'lose_reason_id','lose_reason','lose_date','days_in_lost','lead_id'];
 for (var fi = 0; fi < passFields.length; fi++) { var fn = passFields[fi]; if (input[fn] !== undefined) output[fn] = input[fn]; }

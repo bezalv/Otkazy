@@ -9,9 +9,9 @@ import { runManualVoicePipeline } from '../../app/src/pilot/manual-voice-pipelin
 const cutoff='2026-11-04T12:00:00.000Z',from='2026-01-01T00:00:00.000Z';
 async function fixture() {
   const calls=[], counts={uploads:0,downloads:0,roles:0,judge:0,writer:0,judgeInput:null};
-  const state={recordedCall:false,extraCallFile:false,malformedCallFiles:false,conflictingRecordFile:false,otherVoice:false,selectedVideo:false,image:false,screenshot:false,wappiKnown:false,changedStage:false,lookupMismatch:false,changedHistory:false,legacy:[]};
+  const state={recordedCall:false,extraCallFile:false,malformedCallFiles:false,conflictingRecordFile:false,otherVoice:false,selectedVideo:false,image:false,screenshot:false,wappiKnown:false,changedStage:false,lookupMismatch:false,changedHistory:false,missingFileDate:false,legacy:[]};
   const h={chatId:100,sessionId:80,chat:{100:{entityId:'wazzup|71|client|external'}},users:{55:{connector:true}},
-    files:{'200':{id:200,type:'audio',name:'voice.ogg'}},message:{
+    files:{'200':{id:200,type:'audio',name:'voice.ogg',date:'2026-11-04T10:01:00Z'}},message:{
       1:{id:1,senderid:55,date:'2026-11-04T10:00:00Z',text:'=== Исходящее сообщение ===\nМожем предложить вам замену окна.'},
       2:{id:2,senderid:55,date:'2026-11-04T10:01:00Z',text:'',params:{FILE_ID:[200]}}}};
   let histories=0,disk=0;
@@ -23,15 +23,16 @@ async function fixture() {
     if(method==='imopenlines.crm.chat.get')return {result:[{CHAT_ID:100,CONNECTOR_ID:state.wappiKnown?'opaque':'wazzup',CONNECTOR_TITLE:state.wappiKnown?'Wappi':'wazzup'}]};
     if(method==='imopenlines.session.history.get'){
       histories++;const copy=structuredClone(h);if(state.changedHistory&&histories>1)copy.message[2].params.FILE_ID=[201];
+      if(state.missingFileDate)delete copy.files['200'].date;
       if(state.wappiKnown){copy.chat[100].entityId='opaque|71|client|external';copy.message[1].text='Нам нужны условия по замене окон.';}
       if(state.selectedVideo){copy.files['200'].type='video';copy.files['200'].name='video.mp4';}
       if(state.otherVoice){copy.message[3]={id:3,senderid:55,date:'2026-11-04T10:02:00Z',text:'',params:{FILE_ID:[201]}};
-        copy.files['201']={id:201,type:'audio',name:'other.ogg'};}
+        copy.files['201']={id:201,type:'audio',name:'other.ogg',date:'2026-11-04T10:02:00Z'};}
       if(state.image){copy.message[3]={id:3,senderid:55,date:'2026-11-04T10:02:00Z',text:'',params:{FILE_ID:[201]}};
-        copy.files['201']={id:201,type:'image',name:'photo.png'};}
+        copy.files['201']={id:201,type:'image',name:'photo.png',date:'2026-11-04T10:02:00Z'};}
       for(const entry of state.legacy){
         copy.message[entry.message]={id:Number(entry.message),senderid:entry.unknown?77:55,date:entry.date??'2026-11-04T10:03:00Z',text:entry.text,params:{FILE_ID:[entry.file]}};
-        copy.files[String(entry.file)]={id:Number(entry.file),type:entry.type,name:entry.name,...(entry.mime?{mimeType:entry.mime}:{}),
+        copy.files[String(entry.file)]={id:Number(entry.file),type:entry.type,name:entry.name,date:'2026-11-04T10:03:00Z',...(entry.mime?{mimeType:entry.mime}:{}),
           ...(entry.extension?{extension:entry.extension}:{})};
         if(entry.unknown)copy.users[77]={name:'Автор неизвестен'};
       }
@@ -94,6 +95,13 @@ test('одно распознанное голосовое попадает в �
     assert.equal(facts.filter(x=>x.source==='chat_voice_transcript').length,1);
     assert.ok(f.calls.filter(x=>x.method==='disk.file.get').every(x=>String(x.body.id)==='200'));
     assert.ok(f.calls.every(x=>!/(?:update|add|delete|send)/i.test(x.method)));
+  } finally {await f.close();}
+});
+
+test('голосовое без подтверждённой даты файла блокируется до загрузки и вызова STT',async()=>{
+  const f=await fixture();f.state.missingFileDate=true;
+  try {const result=await runManualVoicePipeline(f.args);
+    assert.equal(result.status,'blocked');assert.equal(f.counts.uploads,0);assert.equal(f.counts.downloads,0);assert.equal(f.counts.judge,0);
   } finally {await f.close();}
 });
 

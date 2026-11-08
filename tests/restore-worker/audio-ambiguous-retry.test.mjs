@@ -17,8 +17,8 @@ function fixture(withAudio) {
     if (method === 'crm.deal.get') return { result: { ID: '42', STAGE_ID: 'C23:LOSE', ASSIGNED_BY_ID: '65', UF_CRM_1584703948317: '1' } };
     if (method === 'crm.stagehistory.list') return { result: { items: [{ ID: '101', STAGE_ID: 'C23:LOSE', CREATED_TIME: lose }] } };
     if (method === 'crm.activity.list' && body.filter.TYPE_ID) return { result: [{
-      ID: '99', PROVIDER_ID: 'VOXIMPLANT_CALL', COMPLETED: 'Y', CREATED: '2026-11-04T00:01:00Z',
-      START_TIME: '2026-11-04T00:01:00Z', END_TIME: '2026-11-04T00:02:00Z',
+      ID: '99', PROVIDER_ID: 'VOXIMPLANT_CALL', COMPLETED: 'Y', CREATED: '2026-11-03T23:55:00Z',
+      START_TIME: '2026-11-03T23:55:00Z', END_TIME: '2026-11-03T23:56:00Z',
       FILES: withAudio ? [{ url: 'https://example.test/audio?fileId=99' }] : [],
     }] };
     if (method === 'crm.activity.list' && body.filter.PROVIDER_ID === 'IMOPENLINES_SESSION') return { result: [{ ASSOCIATED_ENTITY_ID: '80' }] };
@@ -26,7 +26,7 @@ function fixture(withAudio) {
     if (method === 'imopenlines.session.history.get') return { result: {
       sessionId: 80, chatId: 100,
       chat: { 100: {} }, users: { 55: { connector: true } }, files: {},
-      message: { 1: { id: 1, senderid: 55, text: '=== Исходящее сообщение ===\nХорошо' } },
+      message: { 1: { id: 1, senderid: 55, date: '2026-11-03T20:00:00Z', text: '=== Исходящее сообщение ===\nХорошо' } },
     } };
     if (method === 'crm.activity.list' || method === 'crm.timeline.comment.list') return { result: [] };
     if (method === 'tasks.task.list') return { result: { tasks: [] } };

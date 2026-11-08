@@ -55,6 +55,20 @@ test('один подтверждённый файл скачивается и �
   assert.ok(f.state.calls.filter(x => x.method === 'disk.file.get').every(x => x.body.id === 88));
 });
 
+test('диагностика не выдаёт фразу ожидания обработки за распознанное голосовое', async () => {
+  const f = fixture();
+  f.state.result = { success: true, formatted_dialog: 'Участник чата: Пожалуйста, подождите завершения обработки.' };
+  await assert.rejects(runVoiceMessagePilot(f.args), /требует повторной проверки/);
+  assert.equal(f.state.stt, 1); assert.ok(f.state.borrowed.every(x => x === 0));
+});
+
+test('диагностика сохраняет фразу ожидания, если в голосовом есть и другие слова', async () => {
+  const f = fixture();
+  f.state.result = { success: true, formatted_dialog: 'Участник чата: Пожалуйста, подождите завершения обработки. Я пришлю документы.' };
+  const result = await runVoiceMessagePilot(f.args);
+  assert.equal(result.status, 'unverified'); assert.match(result.transcript.formatted_dialog, /документы/);
+});
+
 test('чужие сделка, переход, чат, сессия, сообщение или файл не приводят к скачиванию', async () => {
   for (const change of [a => a.dealId = '1', a => a.transitionId = '1', a => a.chatId = '13',
     a => a.sessionId = '35', a => a.messageId = '51', a => a.fileId = '89']) {

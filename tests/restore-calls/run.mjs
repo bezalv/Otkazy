@@ -41,6 +41,58 @@ test('стерео сохраняет исходные поля, роли, дв�
   assert.equal(result.ready_for_analysis, false);
 });
 
+test('фраза ожидания обработки как единственный результат требует перепроверки', async () => {
+  for (const mono of [false, true]) {
+    const requests = [];
+    const result = await transcribeCalls({ dealData: deal, async transcribe(req) {
+      requests.push(req.channel_count);
+      if (mono && req.channel_count === 2) return { success: true, formatted_dialog: '' };
+      return output(req, {
+        formatted_dialog: `${mono ? 'Говорящий' : 'Клиент'}: Пожалуйста, подождите завершения обработки.`,
+        conversation: [{ text: 'Пожалуйста, подождите завершения обработки.' }],
+        manager_text: mono ? 'Пожалуйста, подождите завершения обработки.' : '',
+        client_text: mono ? '' : 'Пожалуйста, подождите завершения обработки.',
+      });
+    } });
+    assert.deepEqual(requests, mono ? [2, 1] : [2]);
+    assert.equal(result.transcription_errors.length, 1);
+    assert.equal(result.transcription_errors[0].step, mono ? 'pass2_mono' : 'pass1_stereo');
+    assert.equal(result.transcription_errors[0].retryable, true);
+    assert.equal(result.transcription_stats.calls_transcribed, 0);
+    assert.equal(result.communications[0]._transcribed, undefined);
+    assert.equal(pgDecide({ sources: sourceMarks, recognition: { calls: result.transcription_errors } }).block, true);
+  }
+});
+
+test('фраза в разговоре или дополнительный текст другой стороны не отбрасываются', async () => {
+  for (const response of [
+    { formatted_dialog: 'Клиент: Пожалуйста, подождите завершения обработки заказа, я уточню.', client_text: 'Пожалуйста, подождите завершения обработки заказа, я уточню.', manager_text: '', conversation: [] },
+    { formatted_dialog: 'Клиент: Пожалуйста, подождите завершения обработки.\nМенеджер: Хорошо.', client_text: 'Пожалуйста, подождите завершения обработки.', manager_text: 'Хорошо.', conversation: [] },
+    { formatted_dialog: 'Клиент: Пожалуйста, подождите завершения обработки.', client_text: 'Пожалуйста, подождите завершения обработки.', manager_text: 'Подождём.', conversation: [] },
+    { formatted_dialog: 'Клиент: Подождите.', client_text: 'Подождите.', manager_text: '', conversation: [] },
+  ]) {
+    const result = await transcribeCalls({ dealData: deal, async transcribe(req) { return output(req, response); } });
+    assert.equal(result.transcription_errors.length, 0);
+    assert.equal(result.communications[0]._transcribed, true);
+    assert.equal(result.communications[0].transcript, response.formatted_dialog);
+  }
+});
+
+test('повторы фразы ожидания в отдельных каналах и сегментах остаются неоднозначными', async () => {
+  const phrase = 'Пожалуйста, подождите завершения обработки.';
+  for (const response of [
+    { formatted_dialog: `Менеджер: ${phrase}\nКлиент: ${phrase}`, manager_text: phrase, client_text: phrase,
+      conversation: [{ speaker: 'Менеджер', text: phrase }, { speaker: 'Клиент', text: phrase }] },
+    { formatted_dialog: `Говорящий: ${phrase} ${phrase}`, manager_text: `${phrase} ${phrase}`, client_text: '',
+      conversation: [{ speaker: 'Говорящий', text: `${phrase} ${phrase}` }] },
+  ]) {
+    const result = await transcribeCalls({ dealData: deal, async transcribe(req) { return output(req, response); } });
+    assert.equal(result.transcription_errors.length, 1);
+    assert.equal(result.communications[0]._transcribed, undefined);
+    assert.equal(pgDecide({ sources: sourceMarks, recognition: { calls: result.transcription_errors } }).block, true);
+  }
+});
+
 test('несовпадение каналов или пустой стерео вызывает моно, текст остаётся без назначения стороны', async () => {
   for (const stereo of [
     { success: false, error: 'Audio has 1 channel, but 2 requested', retryable: false },

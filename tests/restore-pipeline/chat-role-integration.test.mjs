@@ -18,7 +18,8 @@ function fixture({ messages = baseMessages(), enabled = true, response = 'ok', i
     if (method === 'crm.stagehistory.list') return { result: { items: [{ ID: '101', STAGE_ID: 'C23:LOSE', CREATED_TIME: LOSE }] } };
     if (method === 'crm.activity.list' && body.filter.PROVIDER_ID === 'IMOPENLINES_SESSION') return { result: [{ ASSOCIATED_ENTITY_ID: '80' }] };
     if (method === 'imopenlines.crm.chat.get') return { result: [{ CHAT_ID: 100, CONNECTOR_ID: 'wazzup', CONNECTOR_TITLE: 'wazzup' }] };
-    if (method === 'imopenlines.session.history.get') return { result: { sessionId: 80, chatId: 100, chat: { 100: {} }, users: { 55: { connector: true } }, message: messages, files: {} } };
+    if (method === 'imopenlines.session.history.get') return { result: { sessionId: 80, chatId: 100, chat: { 100: {} }, users: { 55: { connector: true } }, message: messages,
+      files: Object.fromEntries(Object.values(messages).flatMap(message => (message.params?.FILE_ID || []).map(id => [id, {id,type:'audio',name:'voice.ogg',date:'2026-11-04T10:00:00Z'}]))) } };
     if (method === 'crm.activity.list') return { result: [] };
     if (method === 'crm.timeline.comment.list') { if (incomplete) throw new Error('source incomplete'); return { result: [] }; }
     if (method === 'tasks.task.list') return { result: { tasks: [] } };
@@ -162,11 +163,12 @@ test('неполный источник не вызывает модель ро�
   assert.notEqual(result.status, 'processed'); assert.equal(calls.roles, 0); assert.equal(calls.judge, 0);
 });
 
-test('текст после даты отказа не передаётся модели и оставляет защиту', async () => {
+test('текст после даты отказа не передаётся модели и не блокирует известное прошлое', async () => {
   const messages = baseMessages(); messages[3] = { id: 3, senderid: 55, date: '2026-11-04T13:00:00Z', text: 'ПОЗДНЕЕ_СООБЩЕНИЕ' };
   const { args, calls } = fixture({ messages }); const result = await processDeal(args);
   assert.equal(calls.roles, 1); assert.doesNotMatch(JSON.stringify(calls.roleBody), /ПОЗДНЕЕ_СООБЩЕНИЕ/);
-  assert.equal(result.status, 'blocked'); assert.equal(result.pipelineGate.kind, 'author_ambiguous'); assert.equal(calls.judge, 0);
+  assert.equal(result.status, 'processed'); assert.equal(calls.judge, 1);
+  assert.doesNotMatch(JSON.stringify(calls.judgeBody), /ПОЗДНЕЕ_СООБЩЕНИЕ/);
 });
 
 test('эксперимент не запускается через очередь, записывающее хранилище или доставку', async () => {
