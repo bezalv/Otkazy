@@ -3,6 +3,7 @@ import { chatMillisTimestamp } from '../time-precision.mjs';
 import { explicitNonAudio, voiceFileSnapshot } from '../voice-file-metadata.mjs';
 import { verifiedAudioOnly } from '../stt-client.mjs';
 import { ambiguousProcessingOnly } from '../calls/transcript-quality.mjs';
+import { isMissedCallSystemMessage } from '../system-chat.mjs';
 
 export class TemporalScopeError extends Error {
   constructor(source, reason) { super(reason); this.source = source; }
@@ -62,7 +63,7 @@ function systemMessage(message, text, fileCount) {
   const header = /=== (?:Исходящее|Входящее) сообщение/.test(text) || WAZZUP_PREFIX.test(String(text || ''));
   if (hasSender && String(message.senderid) === '0' && !header) return true;
   const clean = stripBbCodes(text);
-  return SYSTEM_PATTERNS.some(pattern => clean.includes(pattern));
+  return isMissedCallSystemMessage(clean) || SYSTEM_PATTERNS.some(pattern => clean.includes(pattern));
 }
 
 function isAiComment(comment) {

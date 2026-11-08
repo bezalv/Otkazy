@@ -1,5 +1,6 @@
 import { detectNoConversation } from './no-conversation.mjs';
 import { hasChatAttachments } from './chat-attachments.mjs';
+import { isMissedCallSystemMessage } from '../system-chat.mjs';
 
 // Перенос детерминированной ноды из выгрузки n8n от 19.10.2026.
 export function buildCommunicationAnalytics(input, referenceTime = new Date()) {
@@ -32,6 +33,7 @@ function isSystemChat(c) {
   // strip Bitrix tags like [USER=12345 REPLACE] and [/USER]
   var cleanText = text.replace(/\[\/?\w[\w= ]*\]/g, '').trim();
   if (!cleanText) return true;
+  if (isMissedCallSystemMessage(cleanText)) return true;
   for (var sp = 0; sp < SYSTEM_CHAT_PATTERNS.length; sp++) {
     if (cleanText.indexOf(SYSTEM_CHAT_PATTERNS[sp]) !== -1) return true;
   }

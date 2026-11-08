@@ -1,5 +1,6 @@
 import { detectNoConversation } from './no-conversation.mjs';
 import { hasChatAttachments } from './chat-attachments.mjs';
+import { isMissedCallSystemMessage } from '../system-chat.mjs';
 
 // Перенос детерминированной ноды из выгрузки n8n от 19.10.2026.
 export function assembleFacts(input, judgeSystemPrompt) {
@@ -84,7 +85,7 @@ function detectVoicemail(clientText, managerText, durationSec) {
 
 // Служебные сообщения Открытых линий — тот же список, что в сборщике (подстрока после вырезания BB-кодов)
 var SYSTEM_CHAT_PATTERNS = ['Начат новый диалог','Сделка прикреплена к диалогу','Контактная информация сохранена','Переданы дополнительные данные','Обращение направлено на','Обращение перенаправлено на','работу с диалогом','отказался от диалога','отказалась от диалога','присоединился к диалогу','покинул диалог','Диалог переведен на','Оценка диалога','Сессия закрыта','Сессия завершена','Автоматическое завершение диалога','Создан новый лид','Создана новая сделка','Создан новый контакт','=== SYSTEM WZ ===','Сообщение изменено','Доп. объект','Wazzup App','app.wazzup24.ru','по правилам очереди','Диалог снят с оператора','Обращение возвращено в очередь','К чату присоединил'];
-function isSystemChatText(t) { var clean = String(t || '').replace(/\[\/?\w[\w= ]*\]/g, '').trim(); if (!clean) return false; for (var sp = 0; sp < SYSTEM_CHAT_PATTERNS.length; sp++) { if (clean.indexOf(SYSTEM_CHAT_PATTERNS[sp]) !== -1) return true; } return false; }
+function isSystemChatText(t) { var clean = String(t || '').replace(/\[\/?\w[\w= ]*\]/g, '').trim(); if (!clean) return false; if (isMissedCallSystemMessage(clean)) return true; for (var sp = 0; sp < SYSTEM_CHAT_PATTERNS.length; sp++) { if (clean.indexOf(SYSTEM_CHAT_PATTERNS[sp]) !== -1) return true; } return false; }
 
 // === МОНО-ЗАПИСЬ ЗВОНКА ===
 // Источник с пояснениями: prototype/lib/mono-transcript.js. Править ТАМ, здесь — сборка.
