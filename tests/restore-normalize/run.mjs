@@ -229,6 +229,27 @@ test('неопределённый тип вложения разрешаетс�
   assert.equal(bad.ready_for_analysis, false);
 });
 
+test('расхождение аудиометаданных истории и Диска блокирует разбор; обычные картинки пропускаются', async () => {
+  for (const disk of [{TYPE:'video',NAME:'voice.ogg'},{MIME_TYPE:'image/jpeg',NAME:'voice.ogg'},{NAME:'photo.jpg'}]) {
+    const collection=collected({chats:[{CHAT_ID:2,CONNECTOR_ID:'wappi'}],sessions:[{session_id:1,history:{
+      chat:{2:{}},users:{55:{connector:true}},files:{101:{id:101,type:'audio',name:'voice.ogg'}},
+      message:{1:{senderid:55,text:'Сообщение клиента',params:{FILE_ID:[101]}}}}}]});
+    let sttCalls=0;
+    const result=await normalizeCommunications({collection,resolveFile:async()=>({...disk,DOWNLOAD_URL:'https://example.test/file'}),
+      transcribeVoice:async()=>{sttCalls++;return {success:true,formatted_dialog:'не вызывать'};}});
+    assert.equal(sttCalls,0);
+    assert.equal(result.voice_failures.length,1);
+    assert.equal(result.voice_failures[0].retryable,true);
+    assert.equal(result.voice_failures[0].step,'disk_file_get');
+  }
+  const collection=collected({chats:[{CHAT_ID:2,CONNECTOR_ID:'wappi'}],sessions:[{session_id:1,history:{
+    chat:{2:{}},users:{55:{connector:true}},files:{101:{id:101,type:'image',name:'photo.jpg'}},
+    message:{1:{senderid:55,text:'Посмотрите изображение',params:{FILE_ID:[101]}}}}}]});
+  let fileCalls=0;
+  const result=await normalizeCommunications({collection,resolveFile:async()=>{fileCalls++;throw Error('Не вызывать');}});
+  assert.equal(fileCalls,0);assert.equal(result.voice_failures.length,0);
+});
+
 test('файлы истории с ID в ключе объекта и расширением с точкой не теряются', async () => {
   const collection = collected({
     chats: [{ CHAT_ID: 2 }],

@@ -22,18 +22,23 @@ const VERSION = '1.3.0';
 const POLZA = 'https://api.polza.ai/api/v1';
 const MODELS = { gigaam: 'ai-sage/gigaam-v3', aiesa: 'aiesa/transcribe' };
 const E = process.env;
+// Только явный ручной запуск с приватным каналом родительского процесса.
+// Сам сервис не получает ключ Polza и не может обойти бюджетный транспорт.
+const BUDGET_IPC = E.STT_BUDGET_IPC === '1';
+if (BUDGET_IPC && typeof process.send !== 'function') { console.error('нет приватного IPC для ручного STT'); process.exit(2); }
 const CFG = {
   key: String(E.STT_KEY || ''), polza: String(E.POLZA_API_KEY || ''), bind: E.STT_BIND || '127.0.0.1', port: Number(E.STT_PORT || 8790),
   model: E.RESERVE_MODEL || 'gigaam', maxTasks: Number(E.MAX_TASKS || 3), queueMax: Number(E.QUEUE_MAX || 20), timeoutSec: Number(E.REQUEST_TIMEOUT_SEC || 600),
   maxBytes: Number(E.MAX_FILE_MB || 50) * 1024 * 1024, work: E.WORK_DIR || E.CACHE_DIRECTORY || path.join(os.tmpdir(), 'otkazy-stt'),
   log: E.LOG_FILE || (E.LOGS_DIRECTORY ? path.join(E.LOGS_DIRECTORY, 'stt-reserve.log') : path.join(os.tmpdir(), 'otkazy-stt', 'stt-reserve.log')),
   ffmpeg: E.STT_FFMPEG_PATH || 'ffmpeg', ffprobe: E.STT_FFPROBE_PATH || 'ffprobe',
-  retries: [10, 30, 60], maxAudioSec: Number(E.MAX_AUDIO_SEC || 3 * 3600), maxParts: 1500, bodySec: 120,
+  retries: BUDGET_IPC ? [] : [10, 30, 60], maxAudioSec: Number(E.MAX_AUDIO_SEC || 3 * 3600), maxParts: 1500, bodySec: 120,
   // нарезка по паузам (gigaam): тишина — ниже -40 дБ дольше 0,4 с; фразы ближе 0,3 с склеиваются, короче 0,25 с — отбрасываются,
   // длиннее 25 с — режутся; к краям фразы — по 0,3 с (при -35 дБ и 0,15 с на 5-секундной записи срезалось начало тихой фразы)
   vad: { noise: '-40dB', minSilence: 0.4, joinGap: 0.3, minSpeech: 0.25, maxChunk: 25, edge: 0.3 },
   aiesaMinSec: 5
 };
+if (BUDGET_IPC) { CFG.maxTasks = 1; CFG.model = 'gigaam'; }
 if (!CFG.key || CFG.key.length < 24) { console.error('нет STT_KEY (или короче 24 символов)'); process.exit(2); }
 if (!MODELS[CFG.model]) { console.error('RESERVE_MODEL: ' + Object.keys(MODELS).join(' | ')); process.exit(2); }
 
@@ -52,29 +57,40 @@ let running = 0; const waiting = [];
 function acquire() { return new Promise(res => { if (running < CFG.maxTasks) { running++; res(); } else waiting.push(res); }); }
 function release() { const next = waiting.shift(); if (next) next(); else running--; }
 let inFlight = 0; // принятые запросы (в работе и в очереди)
+let shuttingDown = false;
+let cancelledActiveTool = false;
+const activeTools = new Map(), activeRequests = new Set(), activeTranscriptions = new Set();
 
 class HttpError extends Error { constructor(status, code, message, retryable) { super(message); this.status = status; this.code = code; this.retryable = !!retryable; } }
 const sleep = ms => new Promise(r => setTimeout(r, ms));
-const run = (cmd, args, timeoutMs) => new Promise((res, rej) => execFile(CFG[cmd] || cmd, args, { timeout: timeoutMs || 120000, maxBuffer: 32 * 1024 * 1024 }, (err, out, errOut) => (err ? rej(Object.assign(new Error(cmd + ': ' + String(errOut || err.message).slice(0, 300)), { stderr: errOut })) : res({ out, err: errOut }))));
+const run = (cmd, args, timeoutMs, requestInfo) => new Promise((res, rej) => {
+  if (BUDGET_IPC && shuttingDown) return rej(new Error('Сервис останавливается'));
+  let processHandle;
+  processHandle = execFile(CFG[cmd] || cmd, args, { timeout: timeoutMs || 120000, maxBuffer: 32 * 1024 * 1024 }, (err, out, errOut) => {
+    if (processHandle) activeTools.delete(processHandle);
+    return err ? rej(Object.assign(new Error(cmd + ': ' + String(errOut || err.message).slice(0, 300)), { stderr: errOut })) : res({ out, err: errOut });
+  });
+  if (BUDGET_IPC) activeTools.set(processHandle, { cmd, chunk: cmd === 'ffmpeg' && args.includes('-ss'), requestInfo });
+});
 
-async function probe(file) {
+async function probe(file, requestInfo) {
   let j;
-  try { j = JSON.parse((await run('ffprobe', ['-v', 'quiet', '-print_format', 'json', '-show_streams', '-show_format', file])).out); }
+  try { j = JSON.parse((await run('ffprobe', ['-v', 'quiet', '-print_format', 'json', '-show_streams', '-show_format', file], undefined, requestInfo)).out); }
   catch (e) { throw new HttpError(422, 'bad_audio', 'файл не читается как аудио', false); }
   const a = (j.streams || []).find(s => s.codec_type === 'audio');
   if (!a) throw new HttpError(422, 'bad_audio', 'в файле нет звуковой дорожки', false);
   return { channels: Number(a.channels) || 1, duration: Math.round(Number((j.format || {}).duration || a.duration || 0) * 100) / 100 };
 }
 // Дорожка канала: mp3 моно 16 кГц (pad — дополнить тишиной до N с)
-async function track(src, dest, filter, padSec) {
+async function track(src, dest, filter, padSec, requestInfo) {
   const af = filter + (padSec ? ',apad=whole_dur=' + padSec : '');
-  await run('ffmpeg', ['-v', 'error', '-y', '-i', src, '-af', af, '-ac', '1', '-ar', '16000', '-b:a', '48k', dest], 180000);
+  await run('ffmpeg', ['-v', 'error', '-y', '-i', src, '-af', af, '-ac', '1', '-ar', '16000', '-b:a', '48k', dest], 180000, requestInfo);
   return dest;
 }
 // Фразы канала по паузам: [{start, end}] (секунды от начала записи)
-async function speechParts(file, duration) {
+async function speechParts(file, duration, requestInfo) {
   const v = CFG.vad;
-  const r = await run('ffmpeg', ['-v', 'info', '-nostats', '-i', file, '-af', 'silencedetect=noise=' + v.noise + ':d=' + v.minSilence, '-f', 'null', '-'], 180000);
+  const r = await run('ffmpeg', ['-v', 'info', '-nostats', '-i', file, '-af', 'silencedetect=noise=' + v.noise + ':d=' + v.minSilence, '-f', 'null', '-'], 180000, requestInfo);
   const sil = []; let open = null;
   for (const line of String(r.err).split('\n')) {
     const s = line.match(/silence_start: (-?[\d.]+)/); if (s) open = Math.max(0, Number(s[1]));
@@ -94,7 +110,42 @@ async function speechParts(file, duration) {
 }
 
 // ---------- Polza ----------
-async function polzaUpload(file, model, deadline) {
+let budgetRequestId = 0;
+function budgetUpload(file, model, deadline, info) {
+  if (model !== MODELS.gigaam || !process.connected) return Promise.reject(new HttpError(502, 'provider_error', 'Бюджетный транспорт недоступен', false));
+  const audio = fs.readFileSync(file);
+  if (!audio.length || audio.length > 1024 * 1024) { audio.fill(0); return Promise.reject(new HttpError(422, 'too_large', 'Слишком большой фрагмент', false)); }
+  const requestId = ++budgetRequestId, encoded = audio.toString('base64');
+  audio.fill(0);
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (error, response) => {
+      if (settled) return; settled = true;
+      if (info.cancelCurrent === onCancel) info.cancelCurrent = null;
+      clearTimeout(timer); process.removeListener('message', onMessage); process.removeListener('disconnect', onDisconnect);
+      if (error) reject(error); else resolve(response);
+    };
+    const onCancel = () => {
+      try { if (process.connected) process.send({ type: 'stt_budget_cancel', id: requestId }, () => {}); } catch { /* канал уже закрыт */ }
+      finish(new HttpError(499, 'cancelled', 'Клиент отменил распознавание', false));
+    };
+    const onMessage = value => {
+      if (!value || value.type !== 'stt_budget_result' || value.id !== requestId) return;
+      if (value.ok !== true || !value.result || typeof value.result !== 'object' || Array.isArray(value.result)
+          || typeof value.result.text !== 'string') return finish(new HttpError(502, 'provider_error', 'Бюджетный транспорт не подтвердил запрос', false));
+      finish(null, value.result);
+    };
+    const onDisconnect = () => finish(new HttpError(502, 'provider_error', 'Бюджетный транспорт отключён', false));
+    const timer = setTimeout(onCancel, Math.min(120000, Math.max(1000, deadline - Date.now())));
+    process.on('message', onMessage); process.once('disconnect', onDisconnect);
+    info.cancelCurrent = onCancel;
+    if (info.cancelled) return onCancel();
+    try { process.send({ type: 'stt_budget_request', id: requestId, model, audio: encoded }, error => { if (error) onDisconnect(); }); }
+    catch { onDisconnect(); }
+  });
+}
+async function polzaUpload(file, model, deadline, info) {
+  if (BUDGET_IPC) return budgetUpload(file, model, deadline, info);
   const fd = new FormData();
   fd.append('file', new Blob([fs.readFileSync(file)], { type: 'audio/mpeg' }), path.basename(file));
   fd.append('model', model); fd.append('language', 'ru');
@@ -148,15 +199,16 @@ async function withRetry(fn, deadline, info) {
 
 // gigaam: канал → фразы → каждая фраза отдельным запросом
 async function gigaamChannel(file, ch, duration, base, deadline, info, files) {
-  const parts = await speechParts(file, duration);
+  const parts = await speechParts(file, duration, info);
   if (parts.length > CFG.maxParts) throw new HttpError(422, 'too_many_parts', 'в канале ' + parts.length + ' фраз — больше ' + CFG.maxParts, false);
   info.parts += parts.length; info.speech_sec += parts.reduce((s, p) => s + p.end - p.start, 0);
   // Нарезка фразы — внутри ограничителя одновременных запросов: не больше MAX_TASKS процессов ffmpeg разом, сколько бы ни было фраз
   const tasks = parts.map(async (p, i) => {
     const f = base + '_c' + ch + '_' + i + '.mp3'; files.push(f);
     const j = await withRetry(async () => {
-      if (!fs.existsSync(f)) await run('ffmpeg', ['-v', 'error', '-y', '-ss', p.start.toFixed(2), '-to', p.end.toFixed(2), '-i', file, '-ac', '1', '-ar', '16000', '-b:a', '48k', f], 60000);
-      try { return await polzaUpload(f, MODELS.gigaam, deadline); } finally { await fs.promises.rm(f, { force: true }).catch(() => {}); }
+      if (!fs.existsSync(f)) await run('ffmpeg', ['-v', 'error', '-y', '-ss', p.start.toFixed(2), '-to', p.end.toFixed(2), '-i', file, '-ac', '1', '-ar', '16000', '-b:a', '48k', f], 60000, info);
+      if (info.cancelled) throw cancelledError(info);
+      try { return await polzaUpload(f, MODELS.gigaam, deadline, info); } finally { await fs.promises.rm(f, { force: true }).catch(() => {}); }
     }, deadline, info);
     return { channel: ch, start: Math.round(p.start * 100) / 100, end: Math.round(p.end * 100) / 100, text: String(j.text || '').trim() };
   });
@@ -183,7 +235,7 @@ function testSegments(channels) {
 }
 
 // src — файл тела запроса (уже на диске), size — его размер; удаляется здесь же
-async function transcribe(src, size, q, id) {
+async function transcribe(src, size, q, id, requestInfo) {
   const t0 = Date.now(); const deadline = t0 + CFG.timeoutSec * 1000;
   const mode = q.get('channels') || 'auto';
   const base = src.replace(/\.in$/, ''); const files = [src];
@@ -195,7 +247,9 @@ async function transcribe(src, size, q, id) {
       return { ok: true, test: true, model: MODELS[CFG.model], channels, duration_sec: 24, segments: testSegments(channels), elapsed_ms: Date.now() - t0, request_id: id };
     }
     if (!size) throw new HttpError(400, 'bad_request', 'пустое тело: пришлите файл записи', false);
-    const p = await probe(src);
+    if (requestInfo?.cancelled) throw cancelledError(requestInfo);
+    const p = await probe(src, requestInfo);
+    if (requestInfo?.cancelled) throw cancelledError(requestInfo);
     if (p.duration > CFG.maxAudioSec) throw new HttpError(422, 'too_long', 'запись длиннее ' + Math.round(CFG.maxAudioSec / 60) + ' мин', false);
     if (mode === 'stereo' && p.channels < 2) throw new HttpError(422, 'bad_audio', 'запрошено stereo, а в записи ' + p.channels + ' канал', false);
     const stereo = p.channels >= 2 && mode !== 'mono';
@@ -204,10 +258,12 @@ async function transcribe(src, size, q, id) {
       ? [{ ch: 0, file: base + '_0.mp3', filter: 'pan=mono|c0=c0' }, { ch: 1, file: base + '_1.mp3', filter: 'pan=mono|c0=c1' }]
       : [{ ch: 0, file: base + '_m.mp3', filter: p.channels >= 2 ? 'pan=mono|c0=0.5*c0+0.5*c1' : 'anull' }];
     for (const t of tracks) {
+      if (requestInfo?.cancelled) throw cancelledError(requestInfo);
       files.push(t.file);
-      await track(src, t.file, t.filter, pad);
+      await track(src, t.file, t.filter, pad, requestInfo);
     }
-    const info = { calls: 0, retries: 0, errors: [], parts: 0, speech_sec: 0 };
+    const info = requestInfo || { calls: 0, retries: 0, errors: [], parts: 0, speech_sec: 0 };
+    if (info.cancelled) throw cancelledError(info);
     const settled = await Promise.allSettled(tracks.map(async t => {
       try {
         return await (CFG.model === 'gigaam' ? gigaamChannel(t.file, t.ch, p.duration, base, deadline, info, files) : aiesaChannel(t.file, t.ch, p.duration, deadline, info));
@@ -236,13 +292,26 @@ function reject(req, res, status, code, message, retryable) {
 }
 const server = http.createServer((req, res) => {
   const url = new URL(req.url, 'http://x'); const t0 = Date.now();
-  if (req.method === 'GET' && url.pathname === '/health') return send(res, 200, { ok: true, version: VERSION, model: MODELS[CFG.model], running, waiting: waiting.length, in_flight: inFlight, max_tasks: CFG.maxTasks });
+  if (req.method === 'GET' && url.pathname === '/health') return send(res, 200, { ok: true, version: VERSION, model: MODELS[CFG.model], running, waiting: waiting.length, in_flight: inFlight, max_tasks: CFG.maxTasks, ...(BUDGET_IPC ? { tool_running: activeTools.size, ffmpeg_chunk_running: [...activeTools.values()].filter(item => item.chunk).length } : {}) });
   if (!(req.method === 'POST' && url.pathname === '/v1/transcribe')) return reject(req, res, 404, 'not_found', 'есть только GET /health и POST /v1/transcribe', false);
   if (!keyOk(req.headers['x-stt-key'])) return reject(req, res, 401, 'unauthorized', 'нет или неверный X-STT-Key', false);
   if (inFlight >= CFG.queueMax) return reject(req, res, 503, 'overloaded', 'очередь сервиса заполнена (' + inFlight + ')', true);
   const declared = Number(req.headers['content-length'] || 0);
   if (declared > CFG.maxBytes) return reject(req, res, 413, 'too_large', 'файл больше ' + Math.round(CFG.maxBytes / 1048576) + ' МБ', false);
   inFlight++; let counted = true; const done = () => { if (counted) { counted = false; inFlight--; } };
+  const requestInfo = BUDGET_IPC ? { calls: 0, retries: 0, errors: [], parts: 0, speech_sec: 0, cancelled: false, cancelCurrent: null } : null;
+  const cancelRequest = () => {
+    if (!requestInfo || requestInfo.cancelled) return;
+    requestInfo.cancelled = true;
+    requestInfo.failure = new HttpError(499, 'cancelled', 'Клиент отменил распознавание', false);
+    requestInfo.cancelCurrent?.();
+    for (const [tool, item] of activeTools) if (item.requestInfo === requestInfo) {
+      cancelledActiveTool = true;
+      try { tool.kill('SIGTERM'); } catch { /* дождаться закрытия процесса */ }
+    }
+  };
+  if (requestInfo) activeRequests.add(cancelRequest);
+  if (requestInfo) res.on('close', () => { if (!res.writableEnded) cancelRequest(); });
   // Тело — сразу на диск, не в память: память сервиса не растёт от размера и числа записей в очереди
   const id = crypto.randomBytes(6).toString('hex');
   const src = path.join(CFG.work, id + '.in');
@@ -284,20 +353,44 @@ const server = http.createServer((req, res) => {
       if (error) return failStorage();
       if (aborted) return;
       let status = 200, out;
-      try { out = await transcribe(src, size, url.searchParams, id); }
+      let work;
+      try {
+        work = transcribe(src, size, url.searchParams, id, requestInfo);
+        if (BUDGET_IPC) activeTranscriptions.add(work);
+        out = await work;
+      }
       catch (e) {
         status = e instanceof HttpError ? e.status : 500;
         // Посторонние ошибки могут содержать URL, данные записи или секреты.
         out = { ok: false, error: { code: e instanceof HttpError ? e.code : 'internal', message: e instanceof HttpError ? e.message : 'Внутренняя ошибка распознавания', retryable: e instanceof HttpError ? e.retryable : true } };
-      } finally { done(); }
+      } finally { if (work) activeTranscriptions.delete(work); activeRequests.delete(cancelRequest); done(); }
       log({ status, ms: Date.now() - t0, bytes: size, model: out.model, channels: out.channels, duration: out.duration_sec, segments: out.segments ? out.segments.length : undefined, parts: out.speech_parts, speech_sec: out.speech_sec, calls: out.polza_calls, retries: out.retries || undefined, test: out.test || undefined, error: out.error });
       send(res, status, out);
     });
   });
-  req.on('error', () => { aborted = true; dropFile(); done(); });
-  req.on('aborted', () => { aborted = true; dropFile(); done(); });
+  req.on('error', () => { cancelRequest(); activeRequests.delete(cancelRequest); aborted = true; dropFile(); done(); });
+  req.on('aborted', () => { cancelRequest(); activeRequests.delete(cancelRequest); aborted = true; dropFile(); done(); });
 });
 // requestTimeout в Node — время на приём всего запроса (тело), а не на ответ: медленная загрузка не держит место в очереди дольше 120 с
 server.requestTimeout = CFG.bodySec * 1000; server.headersTimeout = 60000;
+if (BUDGET_IPC) process.on('message', message => {
+  if (message?.type !== 'stt_budget_shutdown' || shuttingDown) return;
+  shuttingDown = true;
+  const hadActiveTools = activeTools.size > 0 || cancelledActiveTool;
+  for (const cancel of activeRequests) cancel();
+  for (const tool of activeTools.keys()) { try { tool.kill('SIGTERM'); } catch { /* состояние проверяем ниже */ } }
+  server.close();
+  server.closeAllConnections?.();
+  const deadline = Date.now() + 3500;
+  const wait = () => {
+    if (activeTools.size === 0 && activeTranscriptions.size === 0) {
+      if (process.connected) return process.send({ type: 'stt_budget_shutdown_ack', had_active_tools: hadActiveTools }, () => process.exit(0));
+      return process.exit(1);
+    }
+    if (Date.now() >= deadline) return process.exit(1);
+    setTimeout(wait, 25);
+  };
+  wait();
+});
 server.listen(CFG.port, CFG.bind, () => { log({ start: VERSION, model: MODELS[CFG.model], bind: CFG.bind, port: CFG.port }); console.log('stt-reserve ' + VERSION + ' (' + MODELS[CFG.model] + ') слушает ' + CFG.bind + ':' + CFG.port); });
 server.on('error', e => { console.error('не удалось слушать ' + CFG.bind + ':' + CFG.port + ' — ' + e.message); process.exit(1); });

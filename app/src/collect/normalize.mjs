@@ -1,9 +1,14 @@
 import { createHash } from 'node:crypto';
 import { chatMillisTimestamp } from '../time-precision.mjs';
+import { explicitNonAudio, voiceFileSnapshot } from '../voice-file-metadata.mjs';
+import { verifiedAudioOnly } from '../stt-client.mjs';
 
 // Доказательство живёт только в памяти процесса; поля из ответа Битрикса и
 // сериализованной коммуникации сами по себе не дают права на классификацию.
 const verifiedFallbackEvents = new WeakMap();
+// Статус полного распознавания выдаётся только самим нормализатором для
+// подтверждённой сессии. Флаги в JSON или копии сообщения не являются proof.
+const verifiedVoiceEvents = new WeakSet();
 const AUDIO_EXTENSIONS = ['mp3', 'mpga', 'ogg', 'opus', 'wav', 'm4a', 'oga'];
 const VOICE_SUPPORTED = ['ogg', 'oga', 'opus', 'mp3', 'mpga'];
 const SYSTEM_PATTERNS = [
@@ -130,13 +135,15 @@ function metadataExtension(file) {
 }
 
 function audioMetadata(file) {
-  return file && (String(file.type).toLowerCase() === 'audio'
+  return file && !explicitNonAudio(file) && (String(file.type).toLowerCase() === 'audio'
     || String(file.type).toLowerCase().startsWith('audio/')
     || AUDIO_EXTENSIONS.includes(metadataExtension(file)));
 }
 
 function knownNonAudio(file) {
-  if (!file || audioMetadata(file)) return false;
+  if (!file) return false;
+  if (explicitNonAudio(file)) return true;
+  if (audioMetadata(file)) return false;
   const type = String(file.type || '').toLowerCase();
   const ext = metadataExtension(file);
   return type === 'image' || type === 'video' || type.startsWith('image/')
@@ -175,21 +182,32 @@ function lineId(history, chat) {
 
 async function verifyFallback({ collection, session, chatId, meta, verifyFallbackSession }) {
   if (collection.silent !== true || typeof verifyFallbackSession !== 'function'
-      || (!meta.isWazzup && !meta.isWappi) || (meta.isWazzup && session.session_id != null)) return null;
+      || (!meta.isWazzup && !meta.isWappi)) return null;
   const deal = safeId(collection.deal_id), chat = safeId(chatId), history = session.history;
   const sessionId = safeId(history?.sessionId), cutoff = strictTime(collection.deal_data?.lose_date);
   const line = chat && lineId(history, chat);
   const explicitSession = session.session_id == null ? null : safeId(session.session_id);
+  // activity-сессия из collectDeal содержит session_id и history.chatId,
+  // тогда как fallback содержит chat_id. Оба формата подтверждаются историей
+  // и единственной карточкой чата; явно заданный chat_id обязан совпадать.
+  const explicitChat = session.chat_id == null ? null : safeId(session.chat_id);
   const matchingSessions = () => collection.raw.sessions.filter(item => safeId(item?.history?.chatId) === chat
     && safeId(item?.history?.sessionId) === sessionId);
   if ((session.session_id != null && explicitSession !== sessionId)
       || matchingSessions().length !== 1 || matchingSessions()[0] !== session) return null;
   if (!deal || !chat || !sessionId || cutoff === null || !line || safeId(history?.chatId) !== chat
-      || safeId(session.chat_id) !== chat || collection.raw.chats.filter(item => safeId(item?.CHAT_ID) === chat).length !== 1) return null;
+      || (session.chat_id != null && explicitChat !== chat) || (explicitSession === null && explicitChat !== chat)
+      || collection.raw.chats.filter(item => safeId(item?.CHAT_ID) === chat).length !== 1) return null;
   const snapshot = historySnapshot(history);
   if (!snapshot) return null;
   const matchingChat = collection.raw.chats.find(item => safeId(item?.CHAT_ID) === chat);
   const chatSnapshot = JSON.stringify(matchingChat);
+  const chatStillMatches = () => {
+    const found = collection.raw.chats.filter(item => safeId(item?.CHAT_ID) === chat);
+    return found.length === 1 && found[0] === matchingChat && JSON.stringify(found[0]) === chatSnapshot
+      && collection.silent === true && safeId(collection.deal_id) === deal
+      && strictTime(collection.deal_data?.lose_date) === cutoff;
+  };
   const request = Object.freeze({ deal_id: deal, chat_id: chat, session_id: sessionId, line_id: line,
     cutoff: new Date(cutoff).toISOString(), history_sha256: snapshot.sha256,
     history: JSON.parse(snapshot.serialized) });
@@ -211,14 +229,15 @@ async function verifyFallback({ collection, session, chatId, meta, verifyFallbac
       || collection.raw.chats.filter(item => safeId(item?.CHAT_ID) === chat).length !== 1
       || JSON.stringify(collection.raw.chats.find(item => safeId(item?.CHAT_ID) === chat)) !== chatSnapshot
       || safeId(collection.deal_id) !== deal
-      || strictTime(collection.deal_data?.lose_date) !== cutoff || safeId(session.chat_id) !== chat
+      || strictTime(collection.deal_data?.lose_date) !== cutoff
+      || (session.chat_id == null ? null : safeId(session.chat_id)) !== explicitChat
       || (session.session_id == null ? null : safeId(session.session_id)) !== explicitSession
       || matchingSessions().length !== 1 || matchingSessions()[0] !== session
       || lineId(history, chat) !== line) return null;
   // Это подтверждение ОДНОЙ сессии; полноту предыдущей истории и смен линий
   // оно не доказывает. Проверяющий — доверенная внутренняя зависимость.
   return { deal, chat, sessionId, cutoff, history, sha256: snapshot.sha256,
-    eventSession: explicitSession ?? `chat_${chat}`, matchingSessions, session, members: [] };
+    eventSession: explicitSession ?? `chat_${chat}`, explicitSession, explicitChat, matchingSessions, chatStillMatches, session, members: [] };
 }
 
 // Используется только классификатором в том же процессе. Копирование/JSON
@@ -231,6 +250,9 @@ export function verifiedInferenceSession(event, { dealId, cutoff, cache } = {}) 
       || safeId(event.chat_id) !== binding.chat || safeId(event.inference_session_id) !== binding.sessionId
       || String(event.session_id) !== binding.eventSession || eventSnapshot !== binding.eventSnapshot
       || binding.session.history !== binding.history
+      || (binding.session.session_id == null ? null : safeId(binding.session.session_id)) !== binding.explicitSession
+      || (binding.session.chat_id == null ? null : safeId(binding.session.chat_id)) !== binding.explicitChat
+      || !binding.chatStillMatches()
       || binding.matchingSessions().length !== 1 || binding.matchingSessions()[0] !== binding.session) return null;
   let valid = cache?.get(binding.history);
   if (valid === undefined) {
@@ -251,6 +273,11 @@ export function verifiedInferenceGroup(events, { dealId, cutoff } = {}) {
   const cache = new Map();
   return events.every(item => verifiedFallbackEvents.get(item)?.members === binding.members
     && verifiedInferenceSession(item, { dealId, cutoff, cache }) === binding.sessionId);
+}
+
+export function verifiedInferenceVoice(event, { dealId, cutoff, cache } = {}) {
+  return verifiedVoiceEvents.has(event)
+    && verifiedInferenceSession(event, { dealId, cutoff, cache }) !== null;
 }
 
 function callEvent(call) {
@@ -349,8 +376,20 @@ export async function normalizeCommunications({ collection, resolveFile, transcr
   }));
   const messages = [];
   const messageIds = new Map();
-  const referencedFiles = new Set();
-  const orphanFiles = new Map();
+  const ambiguousMessageSessions = new Set();
+  const eventScopes = new WeakMap();
+  // ID файла может встретиться в нескольких сессиях; связь с сообщением
+  // учитывается только внутри той сессии, в которой файл найден.
+  const orphanFiles = [];
+  const fileSessions = new Map();
+  function registerSessionFile(key, scope, referenced) {
+    const previous = fileSessions.get(key) || [];
+    if (previous.some(item => item.scope !== scope && (!referenced || !item.referenced))) {
+      throw new Error('Неоднозначная привязка файла к сессии открытой линии');
+    }
+    previous.push({ scope, referenced });
+    fileSessions.set(key, previous);
+  }
   const audioItems = [];
   const voiceFailures = [];
   let systemDropped = 0;
@@ -359,6 +398,9 @@ export async function normalizeCommunications({ collection, resolveFile, transcr
     const history = session.history;
     if (!history || typeof history !== 'object' || Array.isArray(history)) throw new Error('Некорректная история открытой линии');
     if (!history.message || typeof history.message !== 'object') throw new Error('В истории открытой линии нет списка сообщений');
+    if (session.session_id != null && history.sessionId != null && String(session.session_id) !== String(history.sessionId)) {
+      throw new Error('История открытой линии относится к другой сессии');
+    }
     const historyChatIds = Object.keys(history.chat || {});
     const chatId = session.chat_id ?? history.chatId ?? (historyChatIds.length === 1 ? historyChatIds[0] : null);
     if (session.chat_id != null && history.chatId != null && String(session.chat_id) !== String(history.chatId)) {
@@ -371,11 +413,17 @@ export async function normalizeCommunications({ collection, resolveFile, transcr
       throw new Error('Чат отсутствует в карте истории открытой линии');
     }
     const sessionId = session.session_id ?? `chat_${chatId}`;
+    const sessionScope = `${chatId}:${safeId(history.sessionId) ?? sessionId}`;
     const meta = chatMeta.get(String(chatId)) || { connector: 'unknown', title: 'unknown', isWazzup: false, isWappi: false, connectorUnknown: true };
     const users = history.users || {};
+    const files = sessionFiles(history.files);
+    const linkedFiles = new Set(Object.values(history.message).flatMap(message => {
+      const ids = message?.params?.FILE_ID ?? message?.params?.fileId ?? [];
+      return (Array.isArray(ids) ? ids : [ids]).filter(value => value != null).map(String);
+    }));
     // Если все Wappi-авторы уже известны, вторая проверка истории и поиск
     // сессии не нужны: семантический классификатор всё равно не вызывается.
-    const hasWappiCandidate = meta.isWappi && Object.values(history.message).some(message => {
+    const hasWappiCandidate = meta.isWappi && (Object.values(history.message).some(message => {
       if (!message || typeof message !== 'object') return false;
       const text = message.text || message.TEXT || '';
       const params = message.params || {};
@@ -385,12 +433,15 @@ export async function normalizeCommunications({ collection, resolveFile, transcr
       const count = ids.length + (!ids.length && audioLink(text) ? 1 : 0);
       if (systemMessage(message, text, count) || (!cleanChatText(text, false) && !count)) return false;
       return roleForMessage(message, text, users, false, meta.connectorUnknown, meta.connectorConflict, true).role === 'unknown';
-    });
+    }) || files.some(file => {
+      if (!audioMetadata(file) || file.id == null || linkedFiles.has(String(file.id))) return false;
+      const user = users[String(file.authorid ?? '0')];
+      return !user || (userRole(user) === 'Менеджер' && !confirmedBitrixManager(user));
+    }));
     const verified = (!meta.isWappi || hasWappiCandidate)
       ? await verifyFallback({ collection, session, chatId, meta, verifyFallbackSession }) : null;
     const sessionMessageStart = messages.length;
     const sessionFileRefs = new Set();
-    const files = sessionFiles(history.files);
     const byId = new Map(files.filter(file => file && file.id != null).map(file => [String(file.id), file]));
     for (const [key, message] of Object.entries(history.message || {})) {
       if (!message || typeof message !== 'object') throw new Error('Некорректное сообщение открытой линии');
@@ -406,15 +457,21 @@ export async function normalizeCommunications({ collection, resolveFile, transcr
       const fileIds = params.FILE_ID || params.fileId || [];
       const ids = [...new Set((Array.isArray(fileIds) ? fileIds : [fileIds])
         .filter(id => id != null && String(id) !== '' && String(id) !== '0').map(String))];
+      for (const fileId of ids) sessionFileRefs.add(fileId);
       const fingerprint = JSON.stringify([
         text, [...ids].sort(), message.senderid ?? null, message.SENDER_ID ?? null,
         message.author_id ?? null, message.AUTHOR_ID ?? null, message.date ?? message.DATE ?? null,
       ]);
       if (messageIds.has(identity)) {
-        if (messageIds.get(identity) !== fingerprint) throw new Error('Версии сообщения открытой линии расходятся');
+        const previous = messageIds.get(identity);
+        if (previous.fingerprint !== fingerprint) throw new Error('Версии сообщения открытой линии расходятся');
+        if (previous.sessionScope !== sessionScope) {
+          ambiguousMessageSessions.add(previous.sessionScope);
+          ambiguousMessageSessions.add(sessionScope);
+        }
         continue;
       }
-      messageIds.set(identity, fingerprint);
+      messageIds.set(identity, { fingerprint, sessionScope });
       const link = ids.length ? null : audioLink(text);
       const count = ids.length + (link ? 1 : 0);
       if (systemMessage(message, text, count)) { systemDropped++; continue; }
@@ -433,6 +490,7 @@ export async function normalizeCommunications({ collection, resolveFile, transcr
         ...(meta.connectorUnknown && role === 'unknown' ? { _chat_connector_unknown: true } : {}),
         text: cleaned, is_system: false, _has_audio: count > 0, _has_files: count > 0,
       };
+      eventScopes.set(event, sessionScope);
       if (verified) {
         event.inference_session_id = verified.sessionId;
         verified.members.push(event);
@@ -440,8 +498,6 @@ export async function normalizeCommunications({ collection, resolveFile, transcr
       }
       messages.push(event);
       for (const id of ids) {
-        referencedFiles.add(id);
-        sessionFileRefs.add(id);
         audioItems.push({ event, fileId: id, fileMeta: byId.get(id) || null });
       }
       if (link) audioItems.push({ event, fileId: null, link });
@@ -455,21 +511,30 @@ export async function normalizeCommunications({ collection, resolveFile, transcr
         if (binding) binding.eventSnapshot = JSON.stringify(event);
       }
     }
+    for (const key of sessionFileRefs) registerSessionFile(key, sessionScope, true);
     for (const file of files) {
+      if (file.id != null && !sessionFileRefs.has(String(file.id))) {
+        registerSessionFile(String(file.id), sessionScope, false);
+      }
       if (!audioMetadata(file)) {
-        if (!knownNonAudio(file) && file.id != null && !referencedFiles.has(String(file.id))) {
+        if (!knownNonAudio(file) && file.id != null && !sessionFileRefs.has(String(file.id))) {
           throw new Error('Не удалось определить тип отдельного файла открытой линии');
         }
         continue;
       }
       if (file.id == null) throw new Error('Неизвестен ID аудиофайла открытой линии');
-      if (orphanFiles.has(String(file.id))) continue;
-      orphanFiles.set(String(file.id), { file, chatId, sessionId, meta, users, verified });
+      if (sessionFileRefs.has(String(file.id))) continue;
+      const prior = orphanFiles.find(item => item.sessionScope === sessionScope && String(item.file.id) === String(file.id));
+      if (prior) {
+        if (JSON.stringify(prior.file) !== JSON.stringify(file)) throw new Error('Версии файла открытой линии расходятся');
+        continue;
+      }
+      orphanFiles.push({ file, chatId, sessionId, sessionScope, meta, users, verified });
     }
   }
 
-  for (const [id, orphan] of orphanFiles) {
-    if (referencedFiles.has(id)) continue;
+  for (const orphan of orphanFiles) {
+    const id = String(orphan.file.id);
     const authorId = String(orphan.file.authorid ?? '0');
     const user = authorId !== '0' ? orphan.users[authorId] : null;
     const role = orphan.meta.connectorConflict ? 'unknown' : orphan.meta.isWazzup || orphan.meta.connectorUnknown
@@ -488,6 +553,7 @@ export async function normalizeCommunications({ collection, resolveFile, transcr
       ...(orphan.meta.connectorUnknown && role === 'unknown' ? { _chat_connector_unknown: true } : {}),
       is_system: false, _has_audio: true, _has_files: true,
     };
+    eventScopes.set(event, orphan.sessionScope);
     if (orphan.verified) {
       event.inference_session_id = orphan.verified.sessionId;
       orphan.verified.members.push(event);
@@ -499,14 +565,20 @@ export async function normalizeCommunications({ collection, resolveFile, transcr
 
   const transcripts = new Map();
   const unrecognized = new Map();
+  // Для допуска в контекст требуется успех КАЖДОГО вложения сообщения,
+  // а не только одного файла при наличии других, в том числе изображений.
+  const attachmentCoverage = new Map();
   let audioFound = 0;
   function markUnrecognized(event, failure) {
     unrecognized.set(event, (unrecognized.get(event) || 0) + 1);
     if (failure) voiceFailures.push(failure);
   }
   for (const item of audioItems) {
+    const coverage = attachmentCoverage.get(item.event) || { total: 0, success: 0, audioOnly: 0 };
+    coverage.total++;
+    attachmentCoverage.set(item.event, coverage);
     if (knownNonAudio(item.fileMeta)) continue;
-    let file;
+    let file, voiceSnapshot;
     if (item.link) {
       file = { id: `link${audioFound}`, name: `voice_link.${item.link.ext}`, url: item.link.url };
     } else {
@@ -515,11 +587,25 @@ export async function normalizeCommunications({ collection, resolveFile, transcr
         const resolved = await resolveFile(item.fileId);
         const data = resolved?.result || resolved;
         if (!data || typeof data !== 'object') throw new Error('Файл не получен');
+        // Если в истории указано аудио, а disk.file.get вернул изображение,
+        // видео или другой неаудиоформат, нельзя молча отбросить голосовое:
+        // источник противоречив, требуется повторная проверка.
+        if (knownNonAudio(data)) {
+          if (audioMetadata(item.fileMeta)) {
+            markUnrecognized(item.event, { file_id: item.fileId, retryable: true, step: 'disk_file_get',
+              error: 'Тип файла в истории и Битрикс Диске расходится' });
+          }
+          continue;
+        }
         const name = data.NAME || data.name || item.fileMeta?.name || '';
         if (audioMetadata(item.fileMeta) && !extension(name)) throw new Error('Не удалось определить формат аудиофайла');
         if (!audioMetadata(item.fileMeta) && !extension(name)) throw new Error('Не удалось определить тип файла');
         if (!audioMetadata(item.fileMeta) && !AUDIO_EXTENSIONS.includes(extension(name))) continue;
         file = { id: item.fileId, name, url: data.DOWNLOAD_URL || data.urlDownload || data.url || null };
+        if (verifiedFallbackEvents.has(item.event)) {
+          voiceSnapshot = voiceFileSnapshot(data, item.fileId, name);
+          if (!voiceSnapshot) throw new Error('Не подтверждены метаданные голосового');
+        }
       } catch {
         markUnrecognized(item.event, { file_id: item.fileId, retryable: true, step: 'disk_file_get', error: 'Не удалось получить файл' });
         continue;
@@ -533,7 +619,7 @@ export async function normalizeCommunications({ collection, resolveFile, transcr
     }
     try {
       if (!file.url || typeof transcribeVoice !== 'function') throw new Error('Распознавание недоступно');
-      const response = await transcribeVoice({
+      const voiceRequest = {
         download_url: file.url,
         file_name: `chat_audio_${collection.deal_id}_${file.id}_${file.name.replace(/[^a-zA-Z0-9._-]/g, '_')}`,
         file_id: file.id,
@@ -541,13 +627,19 @@ export async function normalizeCommunications({ collection, resolveFile, transcr
         call_direction: item.event.direction,
         comm_index: audioFound - 1, channel_count: 1,
         speaker_role: item.event.role === 'unknown' ? 'Участник чата' : item.event.role,
-      });
+        ...(verifiedFallbackEvents.has(item.event) ? { require_audio_only: true } : {}),
+        ...(voiceSnapshot ? { voice_file_snapshot: voiceSnapshot } : {}),
+      };
+      const expectedVoiceRequest = JSON.stringify(voiceRequest);
+      const response = await transcribeVoice(voiceRequest);
       if (!response || response.success !== true) throw new Error('Распознавание завершилось ошибкой');
       if (typeof response.formatted_dialog !== 'string') throw new Error('Некорректный результат распознавания');
-      if (!response.formatted_dialog) { markUnrecognized(item.event); continue; }
+      if (!response.formatted_dialog.trim()) { markUnrecognized(item.event); continue; }
       const list = transcripts.get(item.event) || [];
       list.push(response);
       transcripts.set(item.event, list);
+      coverage.success++;
+      if (JSON.stringify(voiceRequest) === expectedVoiceRequest && verifiedAudioOnly(response, voiceRequest)) coverage.audioOnly++;
     } catch {
       markUnrecognized(item.event, { file_id: file.id, file_name: file.name, retryable: true, step: 'transcribe_chat_audio', error: 'Не удалось распознать голосовое' });
     }
@@ -574,11 +666,17 @@ export async function normalizeCommunications({ collection, resolveFile, transcr
       message._voice_unrecognized = count;
       unrecognizedCount += count;
     }
-    // После штатной обработки вложений закрепляем окончательный объект:
-    // иначе аудиореплика выпала бы из группы, и текст классифицировался бы
-    // без неё. Наличие вложения по-прежнему блокирует всю сессию.
+    if (ambiguousMessageSessions.has(eventScopes.get(message))) message._session_context_ambiguous = true;
+    // Закрепляем окончательный объект после обработки вложений, чтобы
+    // аудиореплика не выпала из группы. Прочие и нераспознанные вложения
+    // не получают подтверждения и закрывают семантическую оценку сессии.
     const binding = verifiedFallbackEvents.get(message);
     if (binding) binding.eventSnapshot = JSON.stringify(message);
+    const coverage = attachmentCoverage.get(message);
+    if (binding && coverage?.total > 0 && coverage.success === coverage.total && coverage.audioOnly === coverage.total
+        && count === 0 && message._has_audio_transcript === true && message._session_unreferenced_files !== true) {
+      verifiedVoiceEvents.add(message);
+    }
   }
 
   const chatEvents = messages.filter(message => message.text || message._has_audio_transcript || message._has_files);

@@ -5,6 +5,38 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Readable, Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
+import { sameVoiceFileSnapshot } from './voice-file-metadata.mjs';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+import { resolveBinary } from './stt/binaries.mjs';
+
+const executeFile = promisify(execFile);
+const trustedAudioOnlyResults = new WeakMap();
+function voiceRequestSnapshot(meta) {
+  try {
+    return JSON.stringify(Object.fromEntries(['file_id','activity_id','download_url','file_name','call_date',
+      'call_direction','comm_index','channel_count','speaker_role','require_audio_only','voice_file_snapshot']
+      .map(key => [key, meta?.[key] ?? null])));
+  } catch { return null; }
+}
+export function verifiedAudioOnly(result, meta) {
+  const binding = result && trustedAudioOnlyResults.get(result);
+  if (!binding || !meta || voiceRequestSnapshot(meta) !== binding.request) return false;
+  try { return JSON.stringify(result) === binding.result; } catch { return false; }
+}
+
+async function probeAudioOnlyFile(path) {
+  try {
+    const { stdout } = await executeFile(resolveBinary('ffprobe', process.env),
+      ['-v', 'error', '-protocol_whitelist', 'file,pipe', '-format_whitelist', 'ogg,mp3,wav',
+        '-show_entries', 'stream=codec_type', '-of', 'json', path],
+      { timeout: 30000, maxBuffer: 256 * 1024, windowsHide: true });
+    const streams = JSON.parse(stdout)?.streams;
+    // STT обрабатывает только одну дорожку файла, поэтому второй поток
+    // означал бы недостающий контекст даже при полном успехе распознавания.
+    return Array.isArray(streams) && streams.length === 1 && streams[0]?.codec_type === 'audio';
+  } catch { return false; }
+}
 
 const MIN_AUDIO_BYTES = 1024;
 const MAX_AUDIO_BYTES = 50 * 1024 * 1024;
@@ -179,10 +211,12 @@ async function downloadToFile({ url, path, fetchImpl, timeoutMs, maxBytes }) {
 export function createSttClient({
   bitrix, sttUrl, sttKey, fetchImpl = globalThis.fetch, tempRoot = tmpdir(),
   reserveRequest = httpRequest,
+  probeAudioOnly = probeAudioOnlyFile,
   maxAudioBytes = MAX_AUDIO_BYTES, downloadTimeoutMs = 60000, reserveTimeoutMs = 660000,
 }) {
   if (typeof fetchImpl !== 'function') throw new TypeError('Не задан HTTP-клиент');
   if (typeof reserveRequest !== 'function') throw new TypeError('Не задан клиент локального сервиса');
+  if (typeof probeAudioOnly !== 'function') throw new TypeError('Не задана проверка голосового файла');
   if (!sttKey || typeof sttKey !== 'string') throw new TypeError('Не задан ключ сервиса распознавания');
   let endpoint;
   try { endpoint = new URL(sttUrl); } catch { throw new TypeError('Некорректный адрес сервиса распознавания'); }
@@ -198,6 +232,11 @@ export function createSttClient({
 
   return async function transcribe(meta) {
     if (!meta || ![1, 2].includes(Number(meta.channel_count))) throw new TypeError('Некорректное число каналов');
+    const voiceRequest = meta.require_audio_only === true ? voiceRequestSnapshot(meta) : null;
+    if (meta.require_audio_only === true && voiceRequest === null) return failure(meta, 'Не подтверждён запрос голосового файла');
+    if (meta.require_audio_only === true && /^\d+$/.test(String(meta.file_id ?? '')) && !meta.voice_file_snapshot) {
+      return failure(meta, 'Не подтверждены метаданные голосового файла', { downloadFailed: true });
+    }
     let downloadUrl;
     if (/^\d+$/.test(String(meta.file_id ?? ''))) {
       if (!Number.isSafeInteger(Number(meta.file_id)) || Number(meta.file_id) <= 0) {
@@ -206,6 +245,9 @@ export function createSttClient({
       if (!bitrix || typeof bitrix.request !== 'function') return failure(meta, 'Не настроен клиент Битрикса', { downloadFailed: true });
       try {
         const response = await withTimeout(signal => bitrix.request('disk.file.get', { id: Number(meta.file_id) }, { signal }), downloadTimeoutMs);
+        if (meta.voice_file_snapshot && !sameVoiceFileSnapshot(meta.voice_file_snapshot, response?.result)) {
+          return failure(meta, 'Метаданные голосового файла изменились', { downloadFailed: true });
+        }
         downloadUrl = response?.result?.DOWNLOAD_URL;
       } catch { return failure(meta, 'Не удалось получить файл из Битрикса', { downloadFailed: true }); }
     } else {
@@ -227,6 +269,9 @@ export function createSttClient({
       } catch (error) {
         const message = error instanceof AudioError ? error.message : 'Не удалось сохранить аудиозапись';
         return failure(meta, message, { downloadFailed: true, retryable: error?.retryable !== false });
+      }
+      if (meta.require_audio_only === true && await probeAudioOnly(file) !== true) {
+        return failure(meta, 'Не подтверждено отсутствие видео и других дорожек', { downloadFailed: true });
       }
       const url = new URL(endpoint);
       url.searchParams.set('channels', Number(meta.channel_count) === 1 ? 'mono' : 'stereo');
@@ -272,7 +317,11 @@ export function createSttClient({
       if (Number(meta.channel_count) === 1 && Number(body.channels) !== 1) {
         return failure(meta, 'Моно-запрос вернул несовпадающее число каналов');
       }
-      return reserveToTranscript(body, meta);
+      const result = reserveToTranscript(body, meta);
+      if (meta.require_audio_only === true && voiceRequestSnapshot(meta) === voiceRequest) {
+        trustedAudioOnlyResults.set(result, { request: voiceRequest, result: JSON.stringify(result) });
+      }
+      return result;
     } catch {
       return failure(meta, 'Не удалось подготовить аудиозапись', { downloadFailed: true });
     } finally {

@@ -1,12 +1,14 @@
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
-import { mkdtemp, readdir, rmdir } from 'node:fs/promises';
+import { mkdtemp, readdir, rmdir, readFile, unlink, writeFile } from 'node:fs/promises';
 import { readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import { runInNewContext } from 'node:vm';
-import { createSttClient, reserveToTranscript } from '../../app/src/stt-client.mjs';
+import { createSttClient, reserveToTranscript, verifiedAudioOnly } from '../../app/src/stt-client.mjs';
+import { execFile, execFileSync } from 'node:child_process';
+import { resolveBinary } from '../../app/src/stt/binaries.mjs';
 
 test('моно-голосовое неизвестного участника не превращается в речь менеджера или клиента', () => {
   const result = reserveToTranscript({ channels: 1, segments: [{ channel: 0, start: 0, text: 'Хочу уточнить условия' }] },
@@ -57,6 +59,94 @@ function sendJson(res, status, body) {
   res.writeHead(status, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify(body));
 }
+
+test('повторное чтение файла сверяет снимок голосового до скачивания и STT', async () => {
+ let gets=0,uploads=0;
+ const env=await setup(async (req,res)=>{
+  if(req.url==='/audio'){gets++;res.end(Buffer.alloc(1024));return;}
+  uploads++;for await(const chunk of req)void chunk;
+  sendJson(res,200,{ok:true,model:'ai-sage/gigaam-v3',channels:1,segments:[{channel:0,start:0,end:1,text:'Текст'}]});
+ });
+ try {
+  const original={ID:'100',NAME:'voice.ogg',SIZE:'1024',UPDATE_TIME:'2026-11-01T00:00:00Z',DOWNLOAD_URL:`${env.base}/audio`};
+  let current=original;
+  let hasOnlyAudio=true;
+  const transcribe=createSttClient({bitrix:{async request(){return {result:current};}},sttUrl:env.base,sttKey:key,tempRoot:env.tempRoot,
+   probeAudioOnly:async()=>hasOnlyAudio});
+  const options={...meta,channel_count:1,speaker_role:'Участник чата',require_audio_only:true,voice_file_snapshot:{id:'100',name:'voice.ogg',size:'1024',modified:'2026-11-01T00:00:00Z'}};
+  for(const change of [{ID:'101'},{NAME:'other.ogg'},{SIZE:'2048'},{UPDATE_TIME:'другая'},
+   {MIME_TYPE:'video/mp4'},{type:'image'},{ID:null}]){
+   current={...original,...change};assert.equal((await transcribe(options)).success,false);
+  }
+  assert.equal(gets,0);assert.equal(uploads,0);
+  current=original;hasOnlyAudio=false;assert.equal((await transcribe(options)).success,false);assert.equal(gets,1);assert.equal(uploads,0);
+  hasOnlyAudio=true;const result=await transcribe(options);assert.equal(result.success,true);assert.equal(gets,2);assert.equal(uploads,1);
+  assert.equal(verifiedAudioOnly(result,options),true);assert.equal(verifiedAudioOnly(JSON.parse(JSON.stringify(result)),options),false);
+  assert.equal(verifiedAudioOnly(result,{...options,file_id:'101'}),false);
+  result.formatted_dialog='Подменённый текст';assert.equal(verifiedAudioOnly(result,options),false);
+ } finally {await env.close();}
+});
+
+test('реальный ffprobe пропускает звук и отклоняет видео со звуковой дорожкой даже в .ogg', async () => {
+ const fixtureDir=await mkdtemp(join(tmpdir(),'voice-probe-fixture-'));
+ const audio=join(fixtureDir,'audio.wav'),ogg=join(fixtureDir,'audio.ogg'),mp3=join(fixtureDir,'audio.mp3'),
+  video=join(fixtureDir,'disguised.ogg'),twoAudio=join(fixtureDir,'two-audio.ogg');
+ const ffmpeg=resolveBinary('ffmpeg');
+ execFileSync(ffmpeg,['-v','error','-y','-f','lavfi','-i','sine=frequency=440:duration=1','-c:a','pcm_s16le',audio],{windowsHide:true});
+ execFileSync(ffmpeg,['-v','error','-y','-f','lavfi','-i','sine=frequency=440:duration=1','-c:a','libopus','-f','ogg',ogg],{windowsHide:true});
+ execFileSync(ffmpeg,['-v','error','-y','-f','lavfi','-i','sine=frequency=440:duration=1','-c:a','libmp3lame','-f','mp3',mp3],{windowsHide:true});
+ execFileSync(ffmpeg,['-v','error','-y','-f','lavfi','-i','color=c=black:s=64x64:r=5:d=1',
+  '-f','lavfi','-i','sine=frequency=440:duration=1','-c:v','mpeg4','-c:a','mp3','-shortest','-f','matroska',video],{windowsHide:true});
+ execFileSync(ffmpeg,['-v','error','-y','-f','lavfi','-i','sine=frequency=440:duration=1',
+  '-f','lavfi','-i','sine=frequency=880:duration=1','-map','0:a','-map','1:a','-c:a','libopus','-f','ogg',twoAudio],{windowsHide:true});
+ const info=JSON.parse(execFileSync(resolveBinary('ffprobe'),['-v','error','-show_entries','stream=codec_type:format=format_name',
+  '-of','json',twoAudio],{encoding:'utf8',windowsHide:true}));
+ assert.equal(info.format.format_name,'ogg');assert.deepEqual(info.streams.map(item=>item.codec_type),['audio','audio']);
+ let data=await readFile(audio),uploads=0;
+ const env=await setup(async(req,res)=>{
+  if(req.url==='/audio'){res.end(data);return;}
+  uploads++;for await(const chunk of req)void chunk;
+  sendJson(res,200,{ok:true,model:'ai-sage/gigaam-v3',channels:1,segments:[{channel:0,start:0,end:1,text:'Текст'}]});
+ });
+ try {
+  const client=createSttClient({sttUrl:env.base,sttKey:key,tempRoot:env.tempRoot});
+  const options={file_id:'link0',download_url:`${env.base}/audio`,channel_count:1,speaker_role:'Участник чата',require_audio_only:true};
+  const good=await client(options);assert.equal(good.success,true);assert.equal(verifiedAudioOnly(good,options),true);assert.equal(uploads,1);
+  data=await readFile(ogg);const validOgg=await client(options);assert.equal(validOgg.success,true);assert.equal(verifiedAudioOnly(validOgg,options),true);
+  data=await readFile(mp3);const validMp3=await client(options);assert.equal(validMp3.success,true);assert.equal(verifiedAudioOnly(validMp3,options),true);
+  assert.equal(uploads,3);
+  data=await readFile(video);
+  const bad=await client(options);assert.equal(bad.success,false);assert.equal(verifiedAudioOnly(bad,options),false);assert.equal(uploads,3);
+  data=await readFile(twoAudio);assert.equal((await client(options)).success,false);assert.equal(uploads,3);
+ } finally {await env.close();for(const file of [audio,ogg,mp3,video,twoAudio])await unlink(file);await rmdir(fixtureDir);}
+});
+
+test('ffprobe не открывает вложенный адрес подменённого плейлиста', async () => {
+ let nestedRequests=0,uploads=0;
+ const env=await setup(async(req,res)=>{
+  if(req.url==='/audio'){
+   res.writeHead(200,{'Content-Type':'application/octet-stream'});
+   const port=req.socket.localPort;
+   res.end(`#EXTM3U\n#EXT-X-TARGETDURATION:10\n${'#padding\n'.repeat(180)}#EXTINF:10,\nhttp://127.0.0.1:${port}/nested\n#EXT-X-ENDLIST\n`);
+   return;
+  }
+  if(req.url==='/nested'){nestedRequests++;res.end(Buffer.alloc(2048));return;}
+  uploads++;for await(const chunk of req)void chunk;res.end('{}');
+ });
+ const playlist=join(env.tempRoot,'proof-playlist.m3u8');
+ try {
+  // Контроль: тот же плейлист способен открыть локальный адрес при явно
+  // разрешённых сетевых протоколах. Иначе отрицательный тест был бы пустым.
+  await writeFile(playlist,`#EXTM3U\n#EXT-X-TARGETDURATION:10\n#EXTINF:10,\n${env.base}/nested\n#EXT-X-ENDLIST\n`);
+  await new Promise(resolve=>execFile(resolveBinary('ffprobe'),['-v','error','-protocol_whitelist','file,http,tcp,crypto,data',playlist],
+   {timeout:3000,windowsHide:true},()=>resolve()));
+  assert.ok(nestedRequests>0);nestedRequests=0;
+  const client=createSttClient({sttUrl:env.base,sttKey:key,tempRoot:env.tempRoot});
+  const result=await client({file_id:'link0',download_url:`${env.base}/audio`,channel_count:1,
+   speaker_role:'Участник чата',require_audio_only:true});
+  assert.equal(result.success,false);assert.equal(nestedRequests,0);assert.equal(uploads,0);
+ } finally {await unlink(playlist);await env.close();}
+});
 
 test('стерео скачивается через disk.file.get, передаётся по потоку, каналы сохраняют роли', async () => {
   let uploaded = 0;

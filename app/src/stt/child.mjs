@@ -141,9 +141,10 @@ export async function cleanupStaleAudio({ base = tmpdir(), nowMs = Date.now(), m
   return removed;
 }
 
-export function buildSttEnv({ env, port, key, polzaKey, workDir }) {
+export function buildSttEnv({ env, port, key, polzaKey, workDir, budgetIpc = false }) {
   const safe = Object.fromEntries(ALLOWED_ENV.filter(name => typeof env[name] === 'string').map(name => [name, env[name]]));
-  return { ...safe, STT_BIND: '127.0.0.1', STT_PORT: String(port), STT_KEY: key, POLZA_API_KEY: polzaKey,
+  return { ...safe, STT_BIND: '127.0.0.1', STT_PORT: String(port), STT_KEY: key,
+    ...(budgetIpc ? { STT_BUDGET_IPC: '1', MAX_TASKS: '1' } : { POLZA_API_KEY: polzaKey }),
     RESERVE_MODEL: 'gigaam', STT_FFMPEG_PATH: resolveBinary('ffmpeg', env), STT_FFPROBE_PATH: resolveBinary('ffprobe', env),
     ...(workDir ? { WORK_DIR: workDir } : {}) };
 }
@@ -165,8 +166,9 @@ function cancelled() {
 
 // Явный запуск: отдельно от импортирования приложения и только на loopback.
 // При отмене после spawn close завершается только после проверки всей группы.
-export async function startSttService({ polzaKey, timeoutMs = 10000, env = process.env, signal } = {}) {
+export async function startSttService({ polzaKey, timeoutMs = 10000, env = process.env, signal, budgetTransport } = {}) {
   if (typeof polzaKey !== 'string' || !polzaKey) throw new TypeError('Не задан ключ Polza');
+  if (budgetTransport !== undefined && (typeof budgetTransport !== 'function' || !signal)) throw new TypeError('Ручной бюджетный транспорт требует сигнал отмены');
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 100 || timeoutMs > 60000) throw new TypeError('Некорректный таймаут запуска');
   if (signal != null && (typeof signal.aborted !== 'boolean' || typeof signal.addEventListener !== 'function'
       || typeof signal.removeEventListener !== 'function')) throw new TypeError('Некорректный сигнал отмены');
@@ -206,8 +208,8 @@ export async function startSttService({ polzaKey, timeoutMs = 10000, env = proce
   try {
     checkCancelled();
     child = spawn(process.execPath, [fileURLToPath(new URL('./server.cjs', import.meta.url))], {
-      env: buildSttEnv({ env, port, key, polzaKey, workDir }),
-      stdio: 'ignore', windowsHide: true, detached: isolatedProcessGroup,
+      env: buildSttEnv({ env, port, key, polzaKey, workDir, budgetIpc: !!budgetTransport }),
+      stdio: budgetTransport ? ['ignore', 'ignore', 'ignore', 'ipc'] : 'ignore', windowsHide: true, detached: isolatedProcessGroup,
     });
   } catch (error) {
     await clearKnownRun(root, runName);
@@ -215,6 +217,55 @@ export async function startSttService({ polzaKey, timeoutMs = 10000, env = proce
   }
   let failed = false;
   let stopping = false, unexpectedlyExited = false;
+  const budgetAbort = new AbortController();
+  const pendingBudget = new Set();
+  let budgetBusy = false, lastBudgetId = 0, activeBudgetAbort = null, shutdownAck = null;
+  if (budgetTransport) child.on('message', message => {
+    const reply = value => { if (child.connected) { try { child.send(value, () => {}); } catch { /* процесс уже закрыт */ } } };
+    if (message?.type === 'stt_budget_shutdown_ack' && Object.keys(message).sort().join(',') === 'had_active_tools,type'
+        && typeof message.had_active_tools === 'boolean' && stopping) {
+      shutdownAck = message;
+      return;
+    }
+    if (message?.type === 'stt_budget_cancel' && Object.keys(message).sort().join(',') === 'id,type'
+        && Number.isSafeInteger(message.id) && message.id === lastBudgetId) {
+      activeBudgetAbort?.abort();
+      return;
+    }
+    const requestId = message?.id;
+    const valid = message && typeof message === 'object' && !Array.isArray(message)
+      && Object.keys(message).sort().join(',') === 'audio,id,model,type'
+      && message.type === 'stt_budget_request' && Number.isSafeInteger(requestId)
+      && requestId === lastBudgetId + 1 && message.model === 'ai-sage/gigaam-v3'
+      && typeof message.audio === 'string' && message.audio.length > 0 && message.audio.length <= 1398104
+      && /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(message.audio);
+    if (!valid || budgetBusy || stopping || signal.aborted) {
+      reply({ type: 'stt_budget_result', id: requestId, ok: false });
+      return;
+    }
+    const audio = Buffer.from(message.audio, 'base64');
+    if (!audio.length || audio.length > 1024 * 1024 || audio.toString('base64') !== message.audio) {
+      audio.fill(0); reply({ type: 'stt_budget_result', id: requestId, ok: false }); return;
+    }
+    lastBudgetId = requestId;
+    budgetBusy = true;
+    const requestAbort = new AbortController();
+    activeBudgetAbort = requestAbort;
+    const operation = (async () => {
+      try {
+        const operationSignal = AbortSignal.any([signal, budgetAbort.signal, requestAbort.signal, AbortSignal.timeout(120000)]);
+        operationSignal.throwIfAborted();
+        const result = await budgetTransport({ audio, model: message.model, signal: operationSignal });
+        operationSignal.throwIfAborted();
+        if (!result || typeof result !== 'object' || Array.isArray(result) || typeof result.text !== 'string'
+            || result.text.length > 30000 || JSON.stringify(result).length > 100000) throw new Error('Некорректный ответ');
+        reply({ type: 'stt_budget_result', id: requestId, ok: true, result });
+      } catch { reply({ type: 'stt_budget_result', id: requestId, ok: false }); }
+      finally { audio.fill(0); budgetBusy = false; if (activeBudgetAbort === requestAbort) activeBudgetAbort = null; }
+    })();
+    pendingBudget.add(operation);
+    operation.finally(() => pendingBudget.delete(operation));
+  });
   child.once('error', () => { failed = true; });
   child.once('exit', () => { if (!stopping) unexpectedlyExited = true; });
   async function healthy() {
@@ -235,21 +286,34 @@ export async function startSttService({ polzaKey, timeoutMs = 10000, env = proce
       signal?.removeEventListener('abort', onAbort);
       const wasRunning = child.exitCode === null && child.signalCode === null && !failed;
       stopping = true;
+      budgetAbort.abort();
       if (child.exitCode === null && child.signalCode === null && !failed) {
         const exited = new Promise(resolve => child.once('exit', resolve));
-        child.kill('SIGTERM');
-        await Promise.race([exited, delay(3000, undefined, { ref: false })]);
+        if (budgetTransport && child.connected) {
+          try { child.send({ type: 'stt_budget_shutdown' }, () => {}); } catch { /* проверка ниже не засчитает завершение */ }
+          await Promise.race([exited, delay(4500, undefined, { ref: false })]);
+        } else {
+          child.kill('SIGTERM');
+          await Promise.race([exited, delay(3000, undefined, { ref: false })]);
+        }
         if (child.exitCode === null && child.signalCode === null && !failed) {
           child.kill('SIGKILL');
           await Promise.race([exited, delay(3000, undefined, { ref: false })]);
         }
       }
       if (child.exitCode === null && child.signalCode === null && !failed) throw new Error('Не удалось остановить сервис распознавания');
+      if (pendingBudget.size) {
+        const completed = await Promise.race([Promise.allSettled([...pendingBudget]).then(() => true), delay(30000, false, { ref: false })]);
+        if (!completed) throw new Error('Завершение бюджетного запроса не подтверждено');
+      }
       // После внезапной смерти Node у него могут остаться потомки ffmpeg.
       // На Linux проверяем всю выделенную группу; на других системах при
       // внезапном завершении не можем доказать отсутствие потомков.
       if (isolatedProcessGroup && child.pid && !processGroupIsDead(child.pid)) throw new Error('Процессы аудио ещё работают; временные файлы сохранены');
       if (!isolatedProcessGroup && (unexpectedlyExited || !wasRunning) && child.pid) throw new Error('Не подтверждена остановка потомков; временные файлы сохранены');
+      if (budgetTransport && (!shutdownAck || (!isolatedProcessGroup && shutdownAck.had_active_tools))) {
+        throw new Error('Не подтверждена остановка процессов аудио; временные файлы сохранены');
+      }
       // Запись маркера и отмена могут пересечься; не удаляем каталог до её
       // завершения, иначе поздняя запись оставила бы файл после очистки.
       await markerUpdate.catch(() => {});

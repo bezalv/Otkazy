@@ -218,3 +218,22 @@ test('неоднозначное голосовое Wazzup блокируетс�
     assert.equal(result.analysis, undefined);
   }
 });
+
+test('противоречивый тип известного голосового Wappi не допускает вердикт', async () => {
+  let llmCalls=0,sttCalls=0;
+  const args=withChat(fixture({resolveFile:async()=>({NAME:'photo.jpg',TYPE:'image',DOWNLOAD_URL:'https://example.test/file'}),
+    transcribe:async()=>{sttCalls++;return {success:true,formatted_dialog:'текст'};}}),'wappi',{
+    1:{id:1,senderid:55,text:'Клиент подробно сообщил о своём решении отказаться',params:{FILE_ID:[7]}},
+  });
+  const original=args.bitrix.request;
+  args.bitrix.request=async(method,body)=>{
+    const response=await original(method,body);
+    if(method==='imopenlines.session.history.get')return {...response,result:{...response.result,
+      files:{7:{id:7,type:'audio',name:'voice.ogg'}}}};
+    return response;
+  };
+  args.llm={async complete(){llmCalls++;throw Error('Модель не должна вызываться');}};
+  const result=await processDeal(args);
+  assert.equal(result.status,'blocked');assert.equal(result.pipelineGate.kind,'recognition');
+  assert.equal(result.analysis,undefined);assert.equal(llmCalls,0);assert.equal(sttCalls,0);
+});

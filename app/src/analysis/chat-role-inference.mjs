@@ -1,4 +1,4 @@
-import { verifiedInferenceSession, verifiedInferenceGroup } from '../collect/normalize.mjs';
+import { verifiedInferenceSession, verifiedInferenceGroup, verifiedInferenceVoice } from '../collect/normalize.mjs';
 import { trustNeutralReaction } from './chat-role-trust.mjs';
 import { chatMillisTimestamp } from '../time-precision.mjs';
 
@@ -229,7 +229,8 @@ export async function inferChatRoles({ communications, client, cutoff, dealId } 
       const message = id(item.message_id);
       const known = observedRole(item);
       if (!message || seen.has(message) || !Number.isFinite(timestamp) || known === 'conflict'
-          || item._chat_connector_unknown === true || item._session_unreferenced_files === true || hasAttachment(item)
+          || item._chat_connector_unknown === true || item._session_unreferenced_files === true || item._session_context_ambiguous === true
+          || (hasAttachment(item) && !verifiedInferenceVoice(item, { dealId, cutoff, cache: verifiedHistoryCache }))
           || typeof item.text !== 'string' || !item.text.trim() || item.text.length > MAX_MESSAGE_CHARS
           || (ambiguous(item) && known)) invalid = true;
       seen.add(message); chars += typeof item.text === 'string' ? item.text.length : MAX_CHARS + 1;
