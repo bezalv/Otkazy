@@ -2,6 +2,8 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { persistResult, lookupOperation, loadResumableResult, CommitOutcomeUnknownError } from '../../app/src/persistence/index.mjs';
 import { toPersistenceResult } from '../../app/src/worker/run-job.mjs';
+import { sanitizeRoleInferenceMetadata } from '../../app/src/worker/role-inference-metadata.mjs';
+import { createRoleInferenceLedger } from '../../app/src/worker/role-inference-ledger.mjs';
 import { existsSync, readFileSync } from 'node:fs';
 
 function mockPool({ failAt, emptyQueue = false, invalidLease = false, expiredAtFinish = false, existing = null, lookup = null, resumable = null, silent = true, triggerType = 'batch', requestKey = 'test-key' } = {}) {
@@ -13,7 +15,7 @@ function mockPool({ failAt, emptyQueue = false, invalidLease = false, expiredAtF
       calls.push(query);
       if (failAt && (typeof failAt === 'string' ? text.includes(failAt) : failAt(text))) throw new Error('Ошибка с секретом');
       if (text.includes('FROM public.lost_processing_jobs') && text.includes('FOR UPDATE')) {
-        return invalidLease ? { rowCount: 0, rows: [] } : { rowCount: 1, rows: [{ deal_id: 42, lose_date: '2026-11-02T00:00:00Z', silent, screenshots: false, trigger_type: triggerType, request_key: requestKey }] };
+        return invalidLease ? { rowCount: 0, rows: [] } : { rowCount: 1, rows: [{ deal_id: 42, lose_date: '2026-11-02T00:00:00Z', role_lose_date_exact:'2026-11-02T00:00:00.000000Z', silent, screenshots: false, trigger_type: triggerType, request_key: requestKey }] };
       }
       if (text.includes('SELECT j.deal_id, j.silent')) return { rowCount: resumable ? 1 : 0, rows: resumable ? [resumable] : [] };
       if (text.includes('FROM public.lost_processing_jobs j')) return { rowCount: lookup ? 1 : 0, rows: lookup ? [lookup] : [] };
@@ -84,6 +86,138 @@ function insertedValues(calls) {
   const columns = query.text.match(/lost_deal_analyses \(([^)]+)\)/)[1].split(', ');
   return Object.fromEntries(columns.map((column, index) => [column, query.values[index]]));
 }
+
+const roleBinding={jobId:operationId,leaseToken,dealId:'42',stageHistoryId:'101',cutoff:'2026-11-02T00:00:00.000Z'};
+const roleJob={id:operationId,lease_token:leaseToken,deal_id:42,silent:true,
+  request_key:'bitrix24:deal-stage-history:101',lose_date:roleBinding.cutoff};
+function safeRoleMetadata({uncertain=false,binding=roleBinding,modelCalls=1}={}) {
+  const ledger=createRoleInferenceLedger({connect(){}},binding);
+  return sanitizeRoleInferenceMetadata({candidate_sessions:1,resolved:uncertain||!modelCalls?0:1,unresolved:uncertain?1:0,
+    skipped_sessions:0,failed_sessions:uncertain?1:0,excluded_after_cutoff:0,budget_exhausted_sessions:0,
+    nonmaterial_unknown:0,model_calls:modelCalls,model_unavailable_calls:uncertain?1:0,
+    actual_models:uncertain||!modelCalls?[]:['openai/gpt-6-sol'],usage_complete:!uncertain && !!modelCalls,
+    usage:uncertain||!modelCalls?null:{prompt_tokens:3,completion_tokens:2,total_tokens:5},private:'SECRET_TEXT'},
+  {physical_requests_started:1,responses_received:uncertain?0:1,in_flight:false,uncertain_outcome:uncertain,
+    private:'SECRET_URL'},uncertain||!modelCalls?[]:[{session:'session_1',messages:[{id:'m001',predicted_role:'client',
+      effective_role:'client',source:'semantic_inference',impact:'not_applicable',nonmaterial_unknown:false,
+      private:'SECRET_MESSAGE'}],private:'SECRET_ID'}],{ledger});
+}
+
+test('безопасная статистика авторов проходит worker и повторно проверяется до успешной SQL-записи',async()=>{
+  const metadata=safeRoleMetadata(), mock=mockPool({requestKey:roleJob.request_key});
+  const result=toPersistenceResult(roleJob,
+    {status:'processed',analysis:{...processed},dealData:deal,chatRoleInferenceMetadata:metadata});
+  await persistResult(mock.pool,result);
+  const row=insertedValues(mock.calls), role=JSON.parse(row.ai_judge_json).role_inference;
+  assert.equal(role.physical_requests_started,1);assert.equal(role.usage_complete,true);assert.equal(role.cost_rub,null);
+  assert.equal(row.llm_prompt_tokens,null);assert.equal(row.llm_completion_tokens,null);assert.equal(row.llm_total_tokens,null);
+  assert.equal(role.evidence_for_model_calls_complete,true);assert.equal(role.evidence[0].messages[0].id,'m001');
+  assert.doesNotMatch(JSON.stringify(mock.calls),/SECRET_TEXT|SECRET_URL|SECRET_MESSAGE|SECRET_ID/);
+});
+
+test('неизвестный результат авторства сохраняется при сбое без вердикта и с null расходом',async()=>{
+  const metadata=safeRoleMetadata({uncertain:true}),mock=mockPool({requestKey:roleJob.request_key});
+  const result=toPersistenceResult(roleJob,
+    {status:'blocked',pipelineGate:{pipeline_error:'автор не определён'},chatRoleInferenceMetadata:metadata});
+  await persistResult(mock.pool,result);
+  const row=insertedValues(mock.calls), value=JSON.parse(row.ai_judge_json), role=value.role_inference;
+  assert.equal(role.uncertain_outcome,true);assert.equal(role.cost_rub,null);assert.equal(role.usage,null);
+  assert.equal(role.evidence_for_model_calls_complete,false);assert.deepEqual(role.evidence,[]);
+  for(const key of ['llm_prompt_tokens','llm_completion_tokens','llm_total_tokens',
+    'judge_prompt_tokens','judge_completion_tokens','writer_prompt_tokens','writer_completion_tokens']) assert.equal(row[key],null,key);
+  assert.equal('ai_verdict' in row,false);assert.doesNotMatch(JSON.stringify(mock.calls),/SECRET_/);
+});
+
+test('подмена, сериализованная копия или произвольная метаинформация не сохраняются',async()=>{
+  for(const input of [JSON.parse(JSON.stringify(safeRoleMetadata())),{cost_rub:0,private:'SECRET_FAKE'}]) {
+    const mock=mockPool();
+    // Даже прямой вызов persistence в обход worker не доверяет JSON-копии.
+    await persistResult(mock.pool,{...processed,multi_agent_analysis:{...processed.multi_agent_analysis,role_inference:input}});
+    const row=insertedValues(mock.calls);
+    assert.equal(JSON.parse(row.ai_judge_json).role_inference,undefined);
+    assert.doesNotMatch(JSON.stringify(mock.calls),/SECRET_FAKE/);
+  }
+  const tampered=safeRoleMetadata();tampered.evidence[0].messages[0].id='SECRET_TAMPERED';
+  const mock=mockPool({requestKey:roleJob.request_key});
+  await persistResult(mock.pool,{...lease,deal_id:42,_status:'error',_error:'Сбой',role_inference_metadata:tampered});
+  assert.deepEqual(JSON.parse(insertedValues(mock.calls).ai_judge_json),{role_inference_unaccounted:true});
+  assert.doesNotMatch(JSON.stringify(mock.calls),/SECRET_TAMPERED/);
+  const trusted=safeRoleMetadata(), afterWorker=toPersistenceResult(roleJob,
+    {status:'processed',analysis:{...processed},dealData:deal,chatRoleInferenceMetadata:trusted});
+  afterWorker.multi_agent_analysis.role_inference.private='SECRET_AFTER_WORKER';
+  const changed=mockPool({requestKey:roleJob.request_key});await persistResult(changed.pool,afterWorker);
+  const changedRow=insertedValues(changed.calls),changedJson=JSON.parse(changedRow.ai_judge_json);
+  assert.equal(changedJson.role_inference,undefined);assert.equal(changedJson.role_inference_unaccounted,true);
+  assert.equal(changedRow.llm_total_tokens,null);assert.doesNotMatch(JSON.stringify(changed.calls),/SECRET_AFTER_WORKER/);
+});
+
+test('подлинная метаинформация чужой сделки, задания, перехода, даты или аренды не сохраняется как своя',async()=>{
+  for(const change of [{dealId:'43'},{stageHistoryId:'102'},{cutoff:'2026-11-02T00:00:01.000Z'},
+    {jobId:'00000000-0000-4000-8000-000000000004'}, {leaseToken:'00000000-0000-4000-8000-000000000003'}]){
+    const metadata=safeRoleMetadata({binding:{...roleBinding,...change}}),mock=mockPool({requestKey:roleJob.request_key});
+    // Проверяем persistence напрямую, минуя worker.
+    await persistResult(mock.pool,{...lease,deal_id:42,_status:'error',_error:'Сбой',role_inference_metadata:metadata});
+    const row=insertedValues(mock.calls);assert.deepEqual(JSON.parse(row.ai_judge_json),{role_inference_unaccounted:true});
+    assert.equal(row.llm_total_tokens,null);
+  }
+});
+
+test('сбой ролей вместе с доказательствами судьи не выдаёт judge-only токены за полный расход',async()=>{
+  const metadata=safeRoleMetadata(),mock=mockPool({requestKey:roleJob.request_key});
+  const llm_meta={prompt_tokens:5,completion_tokens:6,total_tokens:11,usage_complete:true,judge_usage_complete:true,
+    judge_usage:{prompt_tokens:5,completion_tokens:6,total_tokens:11},
+    proof_repair:{attempted:true,judge_calls:2,status:'failed',initial_errors:1}};
+  await persistResult(mock.pool,{...lease,deal_id:42,_status:'error',_error:'Сбой',llm_meta,role_inference_metadata:metadata});
+  const row=insertedValues(mock.calls),j=JSON.parse(row.ai_judge_json);
+  assert.equal(row.llm_prompt_tokens,null);assert.equal(row.llm_total_tokens,null);
+  assert.equal(row.judge_prompt_tokens,5);assert.equal(j.judge_usage_complete,true);assert.equal(j.usage_complete,false);
+  assert.equal(j.role_inference.cost_rub,null);
+});
+
+test('вызов ролей без доверенного snapshot помечается как неучтённый в успехе и ошибке',async()=>{
+  for(const status of ['processed','error']) {
+    const mock=mockPool({requestKey:roleJob.request_key});
+    const result=status==='processed'
+      ? {...processed,role_inference_unaccounted:true}
+      : {...lease,deal_id:42,_status:'error',_error:'Сбой',role_inference_unaccounted:true};
+    await persistResult(mock.pool,result);
+    const row=insertedValues(mock.calls),value=JSON.parse(row.ai_judge_json);
+    assert.equal(value.role_inference_unaccounted,true);
+    assert.equal(row.llm_prompt_tokens,null);assert.equal(row.llm_completion_tokens,null);assert.equal(row.llm_total_tokens,null);
+    assert.equal(value.role_inference,undefined);
+  }
+});
+
+test('физический POST не считается нулевым расходом при model_calls=0',async()=>{
+  for(const status of ['processed','error']) {
+    const mock=mockPool({requestKey:roleJob.request_key}),metadata=safeRoleMetadata({modelCalls:0});
+    const outcome=status==='processed'
+      ? {status:'processed',analysis:{...processed},dealData:deal,chatRoleInferenceMetadata:metadata}
+      : {status:'error',analysis:{pipeline_error:'Сбой'},chatRoleInferenceMetadata:metadata};
+    const result=toPersistenceResult(roleJob,outcome);
+    if(status==='processed')assert.equal(result.llm_meta.total_tokens,null);
+    await persistResult(mock.pool,result);
+    const row=insertedValues(mock.calls),role=JSON.parse(row.ai_judge_json).role_inference;
+    assert.equal(role.model_calls,0);assert.equal(role.physical_requests_started,1);
+    assert.equal(role.usage_complete,false);assert.equal(role.cost_rub,null);
+    assert.equal(row.llm_prompt_tokens,null);assert.equal(row.llm_total_tokens,null);
+  }
+});
+
+test('manual/nightly не принимает origin без независимой проверки в базе как доказательство перехода',async()=>{
+  for(const trigger of ['manual','nightly']) {
+    const metadata=safeRoleMetadata(), job={...roleJob,trigger_type:trigger,request_key:`${trigger}:42`};
+    const result=toPersistenceResult(job,{status:'processed',analysis:{...processed},dealData:deal,
+      chatRoleInferenceMetadata:metadata},'101');
+    assert.equal(result.multi_agent_analysis.role_inference,undefined);
+    assert.equal(result.multi_agent_analysis.role_inference_unaccounted,true);
+    assert.equal(result.llm_meta.total_tokens,null);
+    const mock=mockPool({requestKey:job.request_key,triggerType:trigger});
+    await persistResult(mock.pool,result);
+    const value=JSON.parse(insertedValues(mock.calls).ai_judge_json);
+    assert.equal(value.role_inference,undefined);assert.equal(value.role_inference_unaccounted,true);
+  }
+});
 
 test('неизвестная статистика повтора не превращается при записи в нули', async () => {
   const mock = mockPool();

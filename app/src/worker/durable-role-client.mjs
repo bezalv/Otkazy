@@ -10,6 +10,10 @@ const instant = value => chatMillisTimestamp(value)?.getTime() ?? null;
 const validDeal = value => /^[1-9]\d{0,15}$/.test(String(value ?? '')) && Number.isSafeInteger(Number(value));
 const hasAttachment = item => item._has_audio === true || item._has_files === true || item._has_audio_transcript === true
   || item.transcript != null || item.attachments != null || item.files != null || item.file_id != null;
+const clientLedgers = new WeakMap();
+export function getDurableRoleClientLedger(client) {
+  return client && (typeof client === 'object' || typeof client === 'function') ? clientLedgers.get(client) ?? null : null;
+}
 
 export function createDurableRoleClient({ ledger, sessionContext, transport, checkLease } = {}) {
   const ledgerScope = getRoleInferenceLedgerScope(ledger), sessionScope = getRoleSessionContextScope(sessionContext);
@@ -55,7 +59,7 @@ export function createDurableRoleClient({ ledger, sessionContext, transport, che
     try { await ledger.finish(attempt, 'unknown'); } catch { /* резерв остаётся неопределённым */ }
   }
   function closeTransport() { try { transport.failClosed(); } catch { /* дальнейшие POST запрещены адаптером */ } }
-  return Object.freeze({
+  const client = Object.freeze({
     // Этот ограниченный клиент допускается только к независимо проверенной
     // сессии. Анализатор проверяет in-memory proof до и после запроса.
     requireVerifiedSession:true,
@@ -120,4 +124,6 @@ export function createDurableRoleClient({ ledger, sessionContext, transport, che
         ...(typeof transport.snapshot === 'function' ? { transport:transport.snapshot() } : {}) });
     },
   });
+  clientLedgers.set(client, ledger);
+  return client;
 }

@@ -1,5 +1,6 @@
 import { processDeal } from '../process-deal.mjs';
 import { safeErrorUsageMeta } from '../persistence/rows.mjs';
+import { revalidateRoleInferenceMetadata, markRoleUsageUnknown } from './role-inference-metadata.mjs';
 
 // Входом служит только уже захваченное задание. Ошибки сохранения или потери
 // аренды не превращаются в результат сделки и оставляются очереди на восстановление.
@@ -7,8 +8,32 @@ export function toPersistenceResult(job, outcome, audioOriginHistoryId = null) {
   const base = { deal_id: Number(job.deal_id), operation_id: job.id, lease_token: job.lease_token, silent: job.silent === true,
     audio_origin_stage_history_id: audioOriginHistoryId };
   const collection = outcome?.collection || {};
+  const transition = typeof job.request_key === 'string'
+    ? /^bitrix24:deal-stage-history:([1-9]\d{0,29})$/.exec(job.request_key)?.[1] : null;
+  const binding = {jobId:job.id,leaseToken:job.lease_token,dealId:String(job.deal_id),
+    // Пока только канонический ключ задания независимо проверяется в SQL.
+    // Для manual/nightly одного origin из вызывающего кода недостаточно.
+    stageHistoryId:transition,
+    cutoff:job.lose_date instanceof Date && Number.isFinite(job.lose_date.getTime()) ? job.lose_date.toISOString() : job.lose_date};
+  const roleMetadata = revalidateRoleInferenceMetadata(outcome?.chatRoleInferenceMetadata,binding);
+  const roleUnaccounted = outcome?.chatRoleInferenceUnaccounted === true
+    || (!!outcome?.chatRoleInferenceMetadata && !roleMetadata);
+  const roleSpent = roleUnaccounted || (roleMetadata?.model_calls > 0)
+    || (roleMetadata?.physical_requests_started > 0) || roleMetadata?.uncertain_outcome === true;
+  const inputAnalysis = outcome?.analysis?.multi_agent_analysis;
+  const hasAnalysis = inputAnalysis && typeof inputAnalysis === 'object' && !Array.isArray(inputAnalysis);
+  // Поле от произвольного process не должно попасть даже в store, если не
+  // подтверждено отдельным валидатором. Остальное содержимое не меняем.
+  const cleanAnalysis = hasAnalysis ? { ...inputAnalysis } : {};
+  delete cleanAnalysis.role_inference;
+  delete cleanAnalysis.role_inference_unaccounted;
   if (outcome?.status === 'processed') return {
     ...base, ...outcome.analysis, _status: 'processed', deal_data: outcome.dealData,
+    ...(hasAnalysis ? { multi_agent_analysis: { ...cleanAnalysis,
+      ...(roleMetadata ? {role_inference:roleMetadata} : {}),
+      ...(roleUnaccounted ? {role_inference_unaccounted:true} : {}) } } : {}),
+    ...(roleSpent ? { llm_meta:markRoleUsageUnknown(outcome.analysis?.llm_meta,cleanAnalysis) } : {}),
+    ...(roleUnaccounted ? {role_inference_unaccounted:true} : {}),
     comm_stats: outcome.dealData?.comm_stats || {},
     communications_with_transcripts: outcome.analysis?.communications || [],
     audio_wait: outcome.audioWait?.queue || null,
@@ -23,6 +48,8 @@ export function toPersistenceResult(job, outcome, audioOriginHistoryId = null) {
   if (outcome?.status === 'skipped' || outcome?.status === 'skip' || collection._reason === 'not_in_lost_stage') return { ...base, _status: 'skipped' };
   return {
     ...base, _status: 'error',
+    ...(roleMetadata ? { role_inference_metadata:roleMetadata } : {}),
+    ...(roleUnaccounted ? { role_inference_unaccounted:true } : {}),
     ...(safeErrorUsageMeta(outcome?.analysis?.llm_meta) ? { llm_meta: safeErrorUsageMeta(outcome.analysis.llm_meta) } : {}),
     // Только блокировка с известной непоправимой без ручной проверки причиной
     // завершает конкретное ожидание аудио. Сетевые ошибки остаются повторяемыми.

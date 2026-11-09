@@ -1,6 +1,7 @@
 import { pgSafeReason } from '../rules/pipeline-gate.mjs';
 import { baseDealRow, processedRows, communicationRow, safeErrorUsageMeta } from './rows.mjs';
 import { inTransaction, CommitOutcomeUnknownError } from './transaction.mjs';
+import { revalidateRoleInferenceMetadata, markRoleUsageUnknown } from '../worker/role-inference-metadata.mjs';
 
 export { CommitOutcomeUnknownError };
 
@@ -316,6 +317,20 @@ async function archiveExpiredCard(connection, operation, id) {
  */
 export async function persistResult(pool, result) {
   if (!result || typeof result !== 'object') throw new TypeError('Не получен результат сделки');
+  // Изолируем поле до получения и блокировки настоящего задания. Входу не
+  // доверяем: сопоставление делается только с данными заблокированной строки.
+  let roleInput = result.role_inference_metadata;
+  let analysisRoleUnaccounted = false;
+  if (result.multi_agent_analysis && typeof result.multi_agent_analysis === 'object'
+      && (Object.hasOwn(result.multi_agent_analysis, 'role_inference')
+        || Object.hasOwn(result.multi_agent_analysis, 'role_inference_unaccounted'))) {
+    const { role_inference:input, role_inference_unaccounted:unaccounted, ...analysis } = result.multi_agent_analysis;
+    if (result._status === 'processed') roleInput = input;
+    analysisRoleUnaccounted = unaccounted === true;
+    result = { ...result, multi_agent_analysis:analysis };
+  }
+  result = { ...result };
+  delete result.role_inference_metadata;
   const id = dealId(result.deal_id);
   const status = result._status;
   if (!['processed', 'error', 'skipped_by_reason', 'skipped', 'waiting_audio'].includes(status)) {
@@ -341,7 +356,9 @@ export async function persistResult(pool, result) {
   try {
     return await inTransaction(pool, async (connection) => {
     const locked = await connection.query({
-      text: `SELECT deal_id, lose_date, silent, screenshots, trigger_type, request_key FROM public.lost_processing_jobs
+      text: `SELECT deal_id, lose_date, silent, screenshots, trigger_type, request_key,
+          to_char(lose_date AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS role_lose_date_exact
+        FROM public.lost_processing_jobs
         WHERE id=$1 AND deal_id=$2 AND status='processing' AND lease_token=$3
           AND lease_until>clock_timestamp() FOR UPDATE`,
       values: [operation, id, lease],
@@ -355,7 +372,17 @@ export async function persistResult(pool, result) {
         throw new Error('Результат относится к другому переходу в отказ');
       }
     }
-    result = { ...result, silent: job.silent === true, audio_wait_screenshots: job.screenshots === true };
+    const transition = typeof job.request_key === 'string'
+      ? /^bitrix24:deal-stage-history:([1-9]\d{0,29})$/.exec(job.request_key)?.[1] : null;
+    const role = revalidateRoleInferenceMetadata(roleInput,{jobId:operation,leaseToken:lease,dealId:String(id),
+      stageHistoryId:transition,cutoff:job.role_lose_date_exact});
+    const roleUnaccounted = result.role_inference_unaccounted === true || analysisRoleUnaccounted || (!!roleInput && !role);
+    const roleSpent = roleUnaccounted || (role?.model_calls > 0)
+      || (role?.physical_requests_started > 0) || role?.uncertain_outcome === true;
+    result = { ...result, silent: job.silent === true, audio_wait_screenshots: job.screenshots === true,
+      ...(status === 'processed' && (role || roleUnaccounted) ? {multi_agent_analysis:{...result.multi_agent_analysis,
+        ...(role ? {role_inference:role} : {}), ...(roleUnaccounted ? {role_inference_unaccounted:true} : {})}} : {}),
+      ...(status === 'processed' && roleSpent ? {llm_meta:markRoleUsageUnknown(result.llm_meta,result.multi_agent_analysis)} : {}) };
 
     const save = async () => {
     if (['processed', 'error'].includes(status)) {
@@ -370,16 +397,24 @@ export async function persistResult(pool, result) {
     if (status === 'error') {
       const message = pgSafeReason(result._error || result.pipeline_error || result._reason || 'неизвестная ошибка').slice(0, 1000);
       const meta = safeErrorUsageMeta(result.llm_meta);
+      const errorMetadata = { ...(meta ? { proof_repair: meta.proof_repair, judge_usage: meta.judge_usage,
+        judge_usage_known: meta.judge_usage_known, judge_usage_complete: meta.judge_usage_complete,
+        usage_complete:roleSpent ? false : meta.usage_complete } : {}), ...(role ? { role_inference:role } : {}),
+        ...(roleUnaccounted ? {role_inference_unaccounted:true} : {}) };
       const inserted = await connection.query(insertStatement('lost_deal_analyses', {
         deal_id: id, pipeline_error: message, prompt_version: result.prompt_version || 'v2.8-sol',
         trigger_type: 'batch', processing_time_sec: Number(result.processing_time_sec) || 0,
         pipeline_operation_id: operation,
         ...(meta ? { llm_prompt_tokens: meta.prompt_tokens, llm_completion_tokens: meta.completion_tokens,
           llm_total_tokens: meta.total_tokens, judge_prompt_tokens: meta.judge_usage?.prompt_tokens ?? null,
-          judge_completion_tokens: meta.judge_usage?.completion_tokens ?? null,
-          ai_judge_json: JSON.stringify({ proof_repair: meta.proof_repair, judge_usage: meta.judge_usage,
-            judge_usage_known: meta.judge_usage_known, judge_usage_complete: meta.judge_usage_complete,
-            usage_complete: meta.usage_complete }) } : {}),
+          judge_completion_tokens: meta.judge_usage?.completion_tokens ?? null } : {}),
+        // DEFAULT 0 не означает отсутствие расхода: при сбое роль могла
+        // вызвать модель, а сведения о последующих стадиях неизвестны.
+        ...(roleSpent ? { llm_prompt_tokens:null, llm_completion_tokens:null, llm_total_tokens:null } : {}),
+        ...(roleSpent && !meta ? {
+          judge_prompt_tokens:null, judge_completion_tokens:null } : {}),
+        ...(roleSpent ? { writer_prompt_tokens:null, writer_completion_tokens:null } : {}),
+        ...(meta || role || roleUnaccounted ? { ai_judge_json:JSON.stringify(errorMetadata) } : {}),
       }, { returning: ' RETURNING id' }));
       if (inserted.rowCount !== 1 || !inserted.rows?.[0]?.id) throw new Error('Не удалось сохранить сбой');
       if (job.trigger_type === 'audio_wait') {

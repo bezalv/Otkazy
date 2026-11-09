@@ -20,9 +20,21 @@ const validUuid = value => typeof value === 'string' && UUID.test(value);
 // Область подтверждается только для объекта, созданного этой фабрикой;
 // одноимённый метод произвольного объекта не является доказательством связи.
 const ledgerScopes = new WeakMap();
+const ledgerBindings = new WeakMap();
 export function getRoleInferenceLedgerScope(ledger) {
   return ledger && (typeof ledger === 'object' || typeof ledger === 'function')
     ? ledgerScopes.get(ledger) ?? null : null;
+}
+// Секрет аренды никогда не возвращается вызывающему и не сериализуется.
+export function matchesRoleInferenceLedgerBinding(ledger, expected) {
+  const binding = ledger && (typeof ledger === 'object' || typeof ledger === 'function')
+    ? ledgerBindings.get(ledger) : null;
+  if (!binding || !expected || typeof expected !== 'object') return false;
+  const cutoffDate = exactMillisTimestamp(expected.cutoff);
+  return validUuid(expected.jobId) && validUuid(expected.leaseToken)
+    && expected.jobId.toLowerCase() === binding.jobId && expected.leaseToken.toLowerCase() === binding.leaseToken
+    && String(expected.dealId ?? '') === binding.dealId && String(expected.stageHistoryId ?? '') === binding.stageHistoryId
+    && cutoffDate?.toISOString() === binding.cutoff;
 }
 const positiveId = value => {
   const s=String(value ?? '');
@@ -202,5 +214,6 @@ export function createRoleInferenceLedger(pool, { jobId, leaseToken, dealId, sta
     },
   });
   ledgerScopes.set(ledger, scope);
+  ledgerBindings.set(ledger, Object.freeze({ ...scope, jobId:jobId.toLowerCase(), leaseToken:leaseToken.toLowerCase() }));
   return ledger;
 }

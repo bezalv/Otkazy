@@ -1,6 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { sanitizeRoleInferenceMetadata } from '../../app/src/worker/role-inference-metadata.mjs';
+import { sanitizeRoleInferenceMetadata, revalidateRoleInferenceMetadata } from '../../app/src/worker/role-inference-metadata.mjs';
+import { createRoleInferenceLedger } from '../../app/src/worker/role-inference-ledger.mjs';
+
+const binding={jobId:'00000000-0000-4000-8000-000000000001',leaseToken:'00000000-0000-4000-8000-000000000002',
+  dealId:'42',stageHistoryId:'101',cutoff:'2026-11-02T00:00:00.000Z'};
+const ledger=createRoleInferenceLedger({connect(){}},binding);
 
 const stats = () => ({ candidate_sessions:1,resolved:1,unresolved:0,skipped_sessions:0,failed_sessions:0,
   excluded_after_cutoff:0,budget_exhausted_sessions:0,nonmaterial_unknown:0,model_calls:1,
@@ -77,4 +82,22 @@ test('отсутствующие данные не выдаются за пол�
   const actual=sanitizeRoleInferenceMetadata(s,t,undefined);
   assert.equal(actual.usage,null);assert.equal(actual.usage_complete,false);assert.equal(actual.models_complete,false);
   assert.equal(actual.evidence_for_model_calls_complete,false);assert.deepEqual(actual.evidence,[]);
+});
+
+test('повторная валидация сохраняет только неизменённый результат sanitizer в том же процессе',()=>{
+  for(const configure of [()=>{},(s,t)=>{t.uncertain_outcome=true;t.responses_received=0;s.failed_sessions=1;},
+    (s)=>{s.actual_models=['SECRET_UNKNOWN'];},(s)=>{s.usage_complete=false;}]) {
+    const s=stats(),t=transport();configure(s,t);
+    const value=sanitizeRoleInferenceMetadata(s,t,evidence(),{ledger});
+    assert.ok(value);const checked=revalidateRoleInferenceMetadata(value,binding);
+    assert.deepEqual(checked,value);assert.notEqual(checked,value);
+    assert.deepEqual(revalidateRoleInferenceMetadata(checked,binding),value);
+    assert.equal(revalidateRoleInferenceMetadata(JSON.parse(JSON.stringify(value)),binding),null);
+    for(const change of [{dealId:'43'},{stageHistoryId:'102'},{cutoff:'2026-11-02T00:00:01.000Z'},
+      {jobId:'00000000-0000-4000-8000-000000000004'},{leaseToken:'00000000-0000-4000-8000-000000000003'}])
+      assert.equal(revalidateRoleInferenceMetadata(checked,{...binding,...change}),null);
+    value.evidence.push({session:'SECRET'});
+    assert.equal(revalidateRoleInferenceMetadata(value,binding),null);
+  }
+  for(const fake of [null,undefined,{},[],{private:'SECRET'}]) assert.equal(revalidateRoleInferenceMetadata(fake),null);
 });

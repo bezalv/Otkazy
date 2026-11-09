@@ -1,3 +1,5 @@
+import { matchesRoleInferenceLedgerBinding } from './role-inference-ledger.mjs';
+
 // Только преобразование в ограниченную метаинформацию; запись, восстановление
 // и подтверждение расходов выполняются отдельно. Исходный текст не сохраняем.
 const MODELS = new Set(['openai/gpt-6-sol', 'gpt-6-sol', 'openai/gpt-6.1-sol', 'gpt-6.1-sol']);
@@ -8,9 +10,12 @@ const COUNTS = ['candidate_sessions', 'resolved', 'unresolved', 'skipped_session
   'excluded_after_cutoff', 'budget_exhausted_sessions', 'nonmaterial_unknown'];
 const USAGE = ['prompt_tokens', 'completion_tokens', 'total_tokens'];
 const count = (value, max = 1_000_000) => Number.isSafeInteger(value) && value >= 0 && value <= max;
+// Маркер живёт только в процессе; JSON-копия или подмена не становится
+// подтверждённой телеметрией. Храним канонический безопасный снимок.
+const verifiedMetadata = new WeakMap();
 
 /** Никаких сообщений, ошибок провайдера, внешних ID, дат или денежных оценок. */
-export function sanitizeRoleInferenceMetadata(stats, transport, evidence) {
+export function sanitizeRoleInferenceMetadata(stats, transport, evidence, { ledger } = {}) {
   if (!stats || typeof stats !== 'object' || Array.isArray(stats)
       || !transport || typeof transport !== 'object' || Array.isArray(transport)
       || !count(stats.model_calls, 3) || !COUNTS.every(key => count(stats[key]))
@@ -47,7 +52,7 @@ export function sanitizeRoleInferenceMetadata(stats, transport, evidence) {
   if (!evidenceValid) safeEvidence = [];
   const evidenceComplete = evidenceValid && provenCalls && stats.failed_sessions === 0
     && evidence.length === stats.model_calls;
-  return {
+  const result = {
     ...Object.fromEntries(COUNTS.map(key => [key, stats[key]])),
     model_calls:stats.model_calls,
     physical_requests_started:transport.physical_requests_started,
@@ -62,4 +67,36 @@ export function sanitizeRoleInferenceMetadata(stats, transport, evidence) {
     // сессий: часть могла быть пропущена ещё до обращения к модели.
     evidence_for_model_calls_complete:evidenceComplete, evidence:safeEvidence,
   };
+  verifiedMetadata.set(result, { snapshot:JSON.stringify(result), ledger });
+  return result;
+}
+
+/** Повторная проверка перед worker и записью, без доверия к вызывающему. */
+export function revalidateRoleInferenceMetadata(input, binding) {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return null;
+  const registration = verifiedMetadata.get(input);
+  if (!registration || !matchesRoleInferenceLedgerBinding(registration.ledger,binding)) return null;
+  const {snapshot:original,ledger} = registration;
+  try {
+    if (JSON.stringify(input) !== original) return null;
+    const v = JSON.parse(original);
+    if (typeof v.usage_complete !== 'boolean' || typeof v.models_complete !== 'boolean'
+        || typeof v.evidence_for_model_calls_complete !== 'boolean' || v.cost_rub !== null) return null;
+    const stats = { ...Object.fromEntries(COUNTS.map(key => [key,v[key]])), model_calls:v.model_calls,
+      model_unavailable_calls:v.models_complete ? 0 : 1, actual_models:v.models,
+      usage_complete:v.usage_complete, usage:v.usage };
+    const transport = { physical_requests_started:v.physical_requests_started,
+      responses_received:v.responses_received, in_flight:false, uncertain_outcome:v.uncertain_outcome };
+    const safe = sanitizeRoleInferenceMetadata(stats,transport,v.evidence,{ledger});
+    return safe && JSON.stringify(safe) === original ? safe : null;
+  } catch { return null; }
+}
+
+// Общие поля включают роль, судью и писателя; пока отдельная стоимость/учёт
+// роли не доказаны, суммарные значения неизвестны, а не равны judge+writer.
+export function markRoleUsageUnknown(meta, analysis) {
+  const j = analysis?.judge_usage;
+  const knownJudge = j && count(j.prompt_tokens,1_000_000_000) && count(j.completion_tokens,1_000_000_000);
+  return { ...meta, usage_complete:false,prompt_tokens:null,completion_tokens:null,total_tokens:null,
+    ...(!knownJudge ? {judge_usage_complete:false} : {}) };
 }

@@ -7,6 +7,9 @@ import { buildJournal } from './analysis/journal.mjs';
 import { buildCommunicationAnalytics } from './analysis/communication-analytics.mjs';
 import { assembleFacts } from './analysis/facts-assembler.mjs';
 import { inferChatRoles } from './analysis/chat-role-inference.mjs';
+import { sanitizeRoleInferenceMetadata } from './worker/role-inference-metadata.mjs';
+import { getDurableRoleClientLedger } from './worker/durable-role-client.mjs';
+import { getRoleInferenceLedgerScope } from './worker/role-inference-ledger.mjs';
 import { processScreenshots } from './screenshots/process.mjs';
 import { pgDecide } from './rules/pipeline-gate.mjs';
 import { dsEvaluate, dsInsufficientJudge } from './rules/data-sufficiency.mjs';
@@ -22,7 +25,7 @@ export async function processDeal({
   dealId, bitrix, llm, resolveFile, downloadFile, transcribe,
   judgeSystemPrompt, writerSystemPrompt, audioWaitEnabledAt, savedAudioWait = null,
   silent = false, screenshots = true, nowMs = null, clock = Date.now, expectedLoseDate = null, expectedHistoryId = null, wait,
-  semanticChatRoles = false, verifyFallbackSession, verifyLatestSession, repairProofErrors = false,
+  semanticChatRoles = false, verifyFallbackSession, verifyLatestSession, repairProofErrors = false, roleInferenceClient,
 }) {
   if (typeof repairProofErrors !== 'boolean' || (repairProofErrors && (silent !== true || semanticChatRoles !== true))) {
     throw new Error('Исправление доказательств доступно только в тихом ручном эксперименте');
@@ -39,6 +42,10 @@ export async function processDeal({
   }
   if (semanticChatRoles === true && silent !== true) {
     throw new Error('Эксперимент определения ролей доступен только в тихом режиме');
+  }
+  if (roleInferenceClient !== undefined && (semanticChatRoles !== true || silent !== true
+      || expectedHistoryId === null || expectedLoseDate === null || !getDurableRoleClientLedger(roleInferenceClient))) {
+    throw new Error('Нужен подтверждённый клиент и переход для определения авторов');
   }
   if (typeof judgeSystemPrompt !== 'string' || !judgeSystemPrompt.trim()) {
     throw new Error('Не задан промпт судьи');
@@ -103,28 +110,53 @@ export async function processDeal({
   normalized.deal_data._historical_scope_checked = true;
   let chatRoleInferenceStats = null;
   let chatRoleInferenceEvidence = null;
+  let chatRoleInferenceMetadata = null;
   // Только явный ручной режим для проверки текста. Обычная обработка по умолчанию
   // не подключает эту экспериментальную оценку и не ослабляет защиту источников.
   if (semanticChatRoles === true) {
     const prerequisites = pgDecide({ sources: collected._sources, recognition: { voices: normalized.voice_failures } });
     if (prerequisites.block) return { status: 'blocked', collection: collected, audioWait, pipelineGate: prerequisites };
-    const inferred = await inferChatRoles({ communications: normalized.deal_data.communications, client: llm,
-      cutoff: collected.deal_data.lose_date, dealId });
+    const roleClient = roleInferenceClient ?? llm;
+    let inferred;
+    try {
+      inferred = await inferChatRoles({ communications: normalized.deal_data.communications, client: roleClient,
+        cutoff: collected.deal_data.lose_date, dealId });
+    } catch {
+      // Исключение может последовать после POST, когда точный учёт недоступен.
+      return { status:'error', collection:collected, audioWait,
+        analysis:{pipeline_error:'Сбой определения авторов'}, chatRoleInferenceUnaccounted:true };
+    }
     normalized.deal_data.communications = inferred.communications;
     chatRoleInferenceStats = inferred.stats;
     chatRoleInferenceEvidence = inferred.evidence;
+    // Не предполагаем, что каждый LLM-клиент предоставляет статистику
+    // физических запросов; отсутствие снимка означает неизвестный расход.
+    try {
+      const ledger = getDurableRoleClientLedger(roleClient), scope = getRoleInferenceLedgerScope(ledger);
+      if (scope && scope.dealId === String(dealId) && scope.stageHistoryId === expectedHistoryId
+          && scope.cutoff === new Date(collected.deal_data.lose_date).toISOString()) {
+        chatRoleInferenceMetadata = sanitizeRoleInferenceMetadata(chatRoleInferenceStats,
+          roleClient.snapshot()?.transport, chatRoleInferenceEvidence, {ledger});
+      }
+    } catch { chatRoleInferenceMetadata = null; }
   }
+  const roleFields = () => chatRoleInferenceStats
+    ? { chatRoleInferenceStats, chatRoleInferenceEvidence,
+      ...(chatRoleInferenceMetadata ? { chatRoleInferenceMetadata } : {}),
+      ...(!chatRoleInferenceMetadata && (chatRoleInferenceStats.model_calls > 0 || roleInferenceClient !== undefined)
+        ? {chatRoleInferenceUnaccounted:true} : {}) } : {};
+  try {
   const earlyGate = pgDecide({ sources: collected._sources, communications: normalized.deal_data.communications,
     recognition: { voices: normalized.voice_failures }, allowNonmaterialUnknown: semanticChatRoles === true });
   if (earlyGate.block) return { status: 'blocked', collection: collected, audioWait, pipelineGate: earlyGate,
-    ...(chatRoleInferenceStats ? { chatRoleInferenceStats, chatRoleInferenceEvidence } : {}) };
+    ...roleFields() };
 
   const calls = await transcribeCalls({ dealData: normalized.deal_data, transcribe });
   const recognition = { calls: calls.transcription_errors, voices: normalized.voice_failures, screenshots: [] };
   const initialGate = pgDecide({ sources: collected._sources, recognition, communications: normalized.deal_data.communications,
     allowNonmaterialUnknown: semanticChatRoles === true });
   if (initialGate.block) return { status: 'blocked', collection: collected, audioWait, calls, pipelineGate: initialGate,
-    ...(chatRoleInferenceStats ? { chatRoleInferenceStats, chatRoleInferenceEvidence } : {}) };
+    ...roleFields() };
 
   const journalInput = { ...normalized.deal_data, communications: calls.communications, transcription_stats: calls.transcription_stats };
   const analytics = buildCommunicationAnalytics(buildJournal(journalInput), evaluatedAt);
@@ -133,7 +165,7 @@ export async function processDeal({
   const pipelineGate = pgDecide({ sources: collected._sources, recognition, communications: calls.communications,
     allowNonmaterialUnknown: semanticChatRoles === true });
   if (pipelineGate.block) return { status: 'blocked', collection: collected, audioWait, calls, pipelineGate,
-    ...(chatRoleInferenceStats ? { chatRoleInferenceStats, chatRoleInferenceEvidence } : {}) };
+    ...roleFields() };
 
   const prepared = assembleFacts(screenshotResult.output, judgeSystemPrompt);
   const sufficiency = dsEvaluate(prepared.facts_packet.facts);
@@ -149,6 +181,15 @@ export async function processDeal({
   return {
     status: analysis.pipeline_error ? 'error' : 'processed',
     collection: collected, dealData: normalized.deal_data, audioWait, calls, pipelineGate, analysis,
-    ...(chatRoleInferenceStats ? { chatRoleInferenceStats, chatRoleInferenceEvidence } : {}),
+    ...roleFields(),
   };
+  } catch (error) {
+    // После вызова ролей исключение следующих стадий не должно незаметно
+    // терять безопасный учёт уже сделанных запросов. Без подтверждённой
+    // метаинформации сохраняем прежний контракт исключения.
+    if (!chatRoleInferenceMetadata && !(chatRoleInferenceStats?.model_calls > 0)
+        && !(chatRoleInferenceStats && roleInferenceClient !== undefined)) throw error;
+    return { status:'error', collection:collected, audioWait,
+      analysis:{pipeline_error:'Сбой обработки данных сделки'}, ...roleFields() };
+  }
 }
