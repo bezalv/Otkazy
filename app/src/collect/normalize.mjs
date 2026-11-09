@@ -3,6 +3,7 @@ import { chatMillisTimestamp } from '../time-precision.mjs';
 import { explicitNonAudio, voiceFileSnapshot } from '../voice-file-metadata.mjs';
 import { verifiedAudioOnly } from '../stt-client.mjs';
 import { ambiguousProcessingOnly } from '../calls/transcript-quality.mjs';
+import { PrejudgeStageError } from '../persistence/prejudge.mjs';
 import { isMissedCallSystemMessage } from '../system-chat.mjs';
 
 export class TemporalScopeError extends Error {
@@ -681,13 +682,17 @@ export async function normalizeCommunications({ collection, resolveFile, transcr
       if (!response || response.success !== true) throw new Error('Распознавание завершилось ошибкой');
       if (typeof response.formatted_dialog !== 'string') throw new Error('Некорректный результат распознавания');
       if (ambiguousProcessingOnly(response)) throw new Error('Неоднозначный результат распознавания');
+      if (['incomplete','unknown_legacy'].includes(response.transcription_coverage?.status)) {
+        (item.event.transcription_coverage ||= []).push(response.transcription_coverage);
+      }
       if (!response.formatted_dialog.trim()) { markUnrecognized(item.event); continue; }
       const list = transcripts.get(item.event) || [];
       list.push(response);
       transcripts.set(item.event, list);
       coverage.success++;
       if (JSON.stringify(voiceRequest) === expectedVoiceRequest && verifiedAudioOnly(response, voiceRequest)) coverage.audioOnly++;
-    } catch {
+    } catch (error) {
+      if (error instanceof PrejudgeStageError) throw error;
       markUnrecognized(item.event, { file_id: file.id, file_name: file.name, retryable: true, step: 'transcribe_chat_audio', error: 'Не удалось распознать голосовое' });
     }
   }
@@ -721,7 +726,7 @@ export async function normalizeCommunications({ collection, resolveFile, transcr
     if (binding) binding.eventSnapshot = JSON.stringify(message);
     const coverage = attachmentCoverage.get(message);
     if (binding && coverage?.total > 0 && coverage.success === coverage.total && coverage.audioOnly === coverage.total
-        && count === 0 && message._has_audio_transcript === true && message._session_unreferenced_files !== true) {
+        && count === 0 && !message.transcription_coverage?.length && message._has_audio_transcript === true && message._session_unreferenced_files !== true) {
       verifiedVoiceEvents.add(message);
     }
   }

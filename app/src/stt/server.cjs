@@ -79,7 +79,9 @@ async function probe(file, requestInfo) {
   catch (e) { throw new HttpError(422, 'bad_audio', 'файл не читается как аудио', false); }
   const a = (j.streams || []).find(s => s.codec_type === 'audio');
   if (!a) throw new HttpError(422, 'bad_audio', 'в файле нет звуковой дорожки', false);
-  return { channels: Number(a.channels) || 1, duration: Math.round(Number((j.format || {}).duration || a.duration || 0) * 100) / 100 };
+  const channels = Number(a.channels);
+  if (!Number.isSafeInteger(channels) || channels < 1) throw new HttpError(422, 'bad_audio', 'не определено число каналов', false);
+  return { channels, duration: Math.round(Number((j.format || {}).duration || a.duration || 0) * 100) / 100 };
 }
 // Дорожка канала: mp3 моно 16 кГц (pad — дополнить тишиной до N с)
 async function track(src, dest, filter, padSec, requestInfo) {
@@ -216,7 +218,7 @@ async function gigaamChannel(file, ch, duration, base, deadline, info, files) {
   const failed = settled.find(result => result.status === 'rejected');
   if (failed) throw failed.reason;
   const out = settled.map(result => result.value);
-  return out.filter(s => s.text);
+  return out;
 }
 // aiesa: канал целиком, отрезки и метки — от модели
 async function aiesaChannel(file, ch, duration, deadline, info) {
@@ -251,7 +253,7 @@ async function transcribe(src, size, q, id, requestInfo) {
     const p = await probe(src, requestInfo);
     if (requestInfo?.cancelled) throw cancelledError(requestInfo);
     if (p.duration > CFG.maxAudioSec) throw new HttpError(422, 'too_long', 'запись длиннее ' + Math.round(CFG.maxAudioSec / 60) + ' мин', false);
-    if (mode === 'stereo' && p.channels < 2) throw new HttpError(422, 'bad_audio', 'запрошено stereo, а в записи ' + p.channels + ' канал', false);
+    if (mode === 'stereo' && p.channels === 1) throw new HttpError(422, 'channels_mismatch', 'запрошено stereo, а в записи один канал', false);
     const stereo = p.channels >= 2 && mode !== 'mono';
     const pad = CFG.model === 'aiesa' && p.duration < CFG.aiesaMinSec ? CFG.aiesaMinSec : 0;
     const tracks = stereo
@@ -275,8 +277,14 @@ async function transcribe(src, size, q, id, requestInfo) {
     const failed = settled.find(result => result.status === 'rejected');
     if (failed) throw failed.reason;
     const per = settled.map(result => result.value);
-    const segments = [].concat(...per).sort((a, b) => a.start - b.start || a.channel - b.channel);
+    const allSegments = [].concat(...per).sort((a, b) => a.start - b.start || a.channel - b.channel);
+    const segments = allSegments.filter(s => s.text);
+    // Пустой ответ модели на фрагмент с обнаруженным звуком не доказывает тишину.
+    // no_empty_fragments относится только к отправленным отрезкам: фильтр пауз
+    // и минимальная длительность сами по себе не гарантируют охват всей речи.
+    const unrecognized = allSegments.filter(s => !s.text).map(({channel,start,end}) => ({channel,start,end}));
     return { ok: true, model: MODELS[CFG.model], channels: stereo ? 2 : 1, source_channels: p.channels, duration_sec: p.duration, padded: !!pad, segments,
+      ...(CFG.model === 'gigaam' ? { transcription_coverage: { version: 1, status: unrecognized.length ? 'incomplete' : 'no_empty_fragments', total_fragments: allSegments.length, unrecognized_count: unrecognized.length, unrecognized_segments: unrecognized } } : {}),
       elapsed_ms: Date.now() - t0, polza_calls: info.calls, retries: info.retries, retried_errors: info.errors, speech_parts: info.parts || undefined, speech_sec: info.parts ? Math.round(info.speech_sec * 10) / 10 : undefined, request_id: id };
   } finally { await Promise.allSettled(files.map(f => fs.promises.rm(f, { force: true }))); }
 }

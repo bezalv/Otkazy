@@ -63,6 +63,13 @@ run_clean "$pgbin/pg_ctl" -D "$test_root/data" -l "$test_root/server.log" \
   -o "-c listen_addresses='' -p 56471 -k $test_root -c unix_socket_permissions=0700 -c shared_buffers=16MB -c max_connections=12" -w start
 run_clean "$clientbin/createdb" -h "$test_root" -p 56471 -U otkazytest -T template0 otkazytest
 cd "$project"
+case "${OTKAZY_LOCAL_PG_SUITE:-role}" in
+  role) test_file=tests/restore-worker/author-inference-real-pg.test.mjs ;;
+  prejudge) test_file=tests/restore-worker/prejudge-real-pg.test.mjs ;;
+  manual-schema) test_file=tests/restore-worker/manual-staging-schema-real-pg.test.mjs ;;
+  manual-prejudge) test_file=tests/restore-worker/manual-prejudge-real-pg.test.mjs ;;
+  *) printf 'Неизвестный тестовый набор\n' >&2; exit 1 ;;
+esac
 env -i PATH=/usr/bin:/bin HOME="$test_root" LD_LIBRARY_PATH="$lib" \
   OTKAZY_LOCAL_PG_TEST=1 OTKAZY_LOCAL_PG_SOCKET="$test_root" OTKAZY_LOCAL_PG_PORT=56471 \
-  "$nodebin" --test --test-reporter=spec tests/restore-worker/author-inference-real-pg.test.mjs
+  "$nodebin" --test --test-reporter=spec "$test_file"

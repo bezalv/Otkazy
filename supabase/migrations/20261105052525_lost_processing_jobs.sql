@@ -6,6 +6,8 @@ create table public.lost_processing_jobs (
   deal_id bigint not null,
   lose_date timestamptz not null,
   trigger_type text not null,
+  -- Проверенный переход ручного/ночного повтора фиксируется под арендой.
+  origin_stage_history_id text check (origin_stage_history_id is null or origin_stage_history_id ~ '^[1-9][0-9]{0,29}$'),
   silent boolean not null default false,
   screenshots boolean not null default true,
   status text not null default 'pending'

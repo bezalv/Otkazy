@@ -316,4 +316,27 @@ function notalkManagerNamedPurpose(mn) {
   return notalkHit(mn, NOTALK_PURPOSE);
 }
 
-export { detectNoConversation };
+// Для частичной записи наличие признака машины не означает, что всё остальное
+// тоже говорит машина. Вызывающий сохраняет такую слитую фразу как неизвестную.
+function hasMachineMarker(text, manager = false) {
+  var normalized = notalkNormalize(text);
+  return !!(manager ? notalkHit(normalized, NOTALK_MACHINE_IN_MANAGER)
+    : /(?:абонент|вызываемый абонент)\s+(?:(?:временно|сейчас|пока)\s+)?(?:недоступен|не доступен|не на связи)/u.test(normalized)
+      || notalkHit(normalized, NOTALK_MACHINE_IN_MANAGER)
+      || notalkHit(normalized, NOTALK_MACHINE.filter(function(s) {
+      // Одиночные «секретарь», «недоступен» и т.п. могут быть обычной
+      // клиентской речью. Для смешанной длинной фразы нужны устойчивые обороты.
+      return s.length >= 13 && s.indexOf(' ') !== -1;
+    })) || notalkHit(normalized, NOTALK_BOT_SMALLTALK));
+}
+
+// Для неполного звонка проверяем только распознанный текст, без лимита на его
+// длину. Короткий ответ «не актуально» не равен одному приветствию.
+function hasObservedClientContent(text) {
+  var rest = notalkStripList(notalkNormalize(text), NOTALK_DIALING);
+  rest = notalkStripWords(rest, NOTALK_GREETING);
+  rest = notalkStripWords(rest, NOTALK_DEBRIS);
+  return !!rest;
+}
+
+export { detectNoConversation, hasMachineMarker, hasObservedClientContent };

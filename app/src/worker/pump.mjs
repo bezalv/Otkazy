@@ -1,6 +1,8 @@
 import { enqueueDueAudioChecks, loadAudioWait, loadAudioWaitEnabledAt } from '../audio-wait/scheduler.mjs';
 import { loadResumableResult, persistResult } from '../persistence/index.mjs';
 import { runJob } from './run-job.mjs';
+import { savePrejudgeArtifact, hasPrejudgeArtifacts, hasUnsafePrejudgeResume, markPrejudgeNeedsReview } from '../persistence/prejudge.mjs';
+import { claimSttAttempt, completeSttAttempt } from '../persistence/stt-attempts.mjs';
 
 // Один явный такт. Модуль сам не создаёт таймер и не начинает обработку при импорте.
 export function createWorkerPump({ pool, queue, processOptions, delivery, operations = {} }) {
@@ -23,7 +25,15 @@ export function createWorkerPump({ pool, queue, processOptions, delivery, operat
         const job = await claim();
         if (!job) return { status: 'idle', enqueued: enqueued.length };
         const result = await execute({ job, queue,
-          store: { loadResumableResult: args => loadResumableResult(pool, args), persistResult: result => persistResult(pool, result) },
+          store: { loadResumableResult: args => loadResumableResult(pool, args), persistResult: result => persistResult(pool, result),
+            ...(processOptions.persistInputsBeforeJudge === true ? {
+              savePrejudgeArtifact:args => savePrejudgeArtifact(pool,args),
+              hasPrejudgeArtifacts:args => hasPrejudgeArtifacts(pool,args),
+              hasUnsafePrejudgeResume:args => hasUnsafePrejudgeResume(pool,args),
+              claimSttAttempt:args => claimSttAttempt(pool,args),
+              completeSttAttempt:args => completeSttAttempt(pool,args),
+              markPrejudgeNeedsReview:args => markPrejudgeNeedsReview(pool,args),
+            } : {}) },
           loadAudioWait: item => loadAudioWait(pool, item),
           delivery,
           processOptions: { ...processOptions, audioWaitEnabledAt },

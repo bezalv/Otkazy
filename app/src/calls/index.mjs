@@ -1,6 +1,7 @@
 import { copyNeutralReactionTrust } from '../analysis/chat-role-trust.mjs';
 import { pgSafeReason } from '../rules/pipeline-gate.mjs';
 import { ambiguousProcessingOnly } from './transcript-quality.mjs';
+import { PrejudgeStageError } from '../persistence/prejudge.mjs';
 
 function pickAudioUrl(call) {
   for (const file of call.audio_files || []) {
@@ -53,6 +54,7 @@ function transcriptMode(result, requested) {
 function mergeTranscript(call, result) {
   const out = { ...call };
   if (!result) return out;
+  if (result.transcription_coverage) out.transcription_coverage = result.transcription_coverage;
   if (result.formatted_dialog && result.formatted_dialog.length > 0) {
     out.transcript = result.formatted_dialog;
     out.transcript_conversation = result.conversation;
@@ -129,6 +131,7 @@ export async function transcribeCalls({ dealData, transcribe }) {
     try {
       result = await transcribe(request);
     } catch (error) {
+      if (error instanceof PrejudgeStageError) throw error;
       fail('pass1_stereo', error?.message || 'Ошибка стерео-прохода');
       continue;
     }
@@ -158,6 +161,10 @@ export async function transcribeCalls({ dealData, transcribe }) {
       results.push({ ...result, activity_id: activityId, comm_index: index, _transcript_mode: mode });
       continue;
     }
+    if (result?.success === true && result.transcription_coverage?.status === 'incomplete') {
+      results.push({ ...result, activity_id: activityId, comm_index: index, _transcript_mode: 'stereo' });
+      continue;
+    }
     if (!monoFallback(result)) {
       fail('pass1_stereo', errorText(result, 'Стерео-проход не дал результата'), result?.retryable !== false);
       continue;
@@ -165,6 +172,7 @@ export async function transcribeCalls({ dealData, transcribe }) {
     try {
       result = await transcribe({ ...request, channel_count: 1, speaker_role: 'Говорящий' });
     } catch (error) {
+      if (error instanceof PrejudgeStageError) throw error;
       fail('pass2_mono', error?.message || 'Ошибка моно-прохода');
       continue;
     }

@@ -1,4 +1,5 @@
 import { detectNoConversation } from './no-conversation.mjs';
+import { partialCallObservations } from './partial-call.mjs';
 import { hasChatAttachments } from './chat-attachments.mjs';
 import { isMissedCallSystemMessage } from '../system-chat.mjs';
 
@@ -93,10 +94,21 @@ var noTalkIdx = {};
 var monoIdx = {};
 var callsNoConversation = 0;
 var callsMono = 0;
+var callsContactUnknown = 0;
 for (var nci = 0; nci < calls.length; nci++) {
   var ncd = calls[nci].data;
   var ncMono = isMonoTranscript(ncd);
-  if (detectNoConversation(ncd.transcript_client_text, ncd.transcript_manager_text, getCallDuration(calls[nci]), ncMono)) {
+  if (['incomplete','unknown_legacy'].includes(ncd.transcription_coverage?.status)) {
+    var partialObservation = partialCallObservations(ncd, ncMono);
+    if (partialObservation.status === 'unknown') {
+      calls[nci].contactUnknown = true;
+      noTalkIdx[calls[nci].index] = true;
+      callsContactUnknown++;
+    }
+    if (ncMono) { calls[nci].monoTranscript = true; monoIdx[calls[nci].index] = true; callsMono++; }
+    continue;
+  }
+  if (!['incomplete','unknown_legacy'].includes(ncd.transcription_coverage?.status) && detectNoConversation(ncd.transcript_client_text, ncd.transcript_manager_text, getCallDuration(calls[nci]), ncMono)) {
     calls[nci].noConversation = true;
     noTalkIdx[calls[nci].index] = true;
     callsNoConversation++;
@@ -110,7 +122,7 @@ var callsOutgoing = calls.filter(function(c) { return c.data.direction === 'outg
 var callsIncoming = calls.filter(function(c) { return c.data.direction === 'incoming'; });
 function getCallDuration(c) { if (c.data.duration_seconds && c.data.duration_seconds > 0) return c.data.duration_seconds; if (c.data.duration_start && c.data.duration_end) { var ds = new Date(c.data.duration_start).getTime(); var de = new Date(c.data.duration_end).getTime(); if (!isNaN(ds) && !isNaN(de) && de > ds) return Math.round((de - ds) / 1000); } return 0; }
 var unansweredOutgoing = callsOutgoing.filter(function(c) { return getCallDuration(c) <= 5; });
-var meaningfulCalls = calls.filter(function(c) { return !c.noConversation && getCallDuration(c) > 15; });
+var meaningfulCalls = calls.filter(function(c) { return !c.noConversation && !c.contactUnknown && getCallDuration(c) > 15; });
 var meaningfulDurations = meaningfulCalls.map(function(c) { return getCallDuration(c); });
 var avgMeaningfulDuration = meaningfulDurations.length > 0 ? Math.round(meaningfulDurations.reduce(function(a, b) { return a + b; }, 0) / meaningfulDurations.length) : 0;
 var longestCall = null; var longestDuration = 0;
@@ -170,6 +182,10 @@ if (nonmaterialUnknownCount > 0) dataWarnings.push('Автор ' + nonmaterialUn
 var semanticRoleCount = chats.filter(function(c) { return c.data._role_source === 'semantic_inference'; }).length;
 if (semanticRoleCount > 0) dataWarnings.push('Авторы ' + semanticRoleCount + ' сообщений оценены по контексту: метрики сторон являются предположительными');
 var analytics = { cutoff_at: new Date(cutoffTs).toISOString(), cutoff_source: cutoffSource, calls_no_conversation: callsNoConversation, calls_mono_recorded: callsMono, days_in_funnel_until_lose: daysInFunnel, calls_total: calls.length, calls_outgoing: callsOutgoing.length, calls_incoming: callsIncoming.length, calls_unanswered_outgoing: unansweredOutgoing.length, calls_unanswered_outgoing_pct: callsOutgoing.length > 0 ? Math.round(unansweredOutgoing.length / callsOutgoing.length * 100) : 0, calls_missed_incoming: missedIncoming.length, calls_meaningful: meaningfulCalls.length, calls_avg_duration_sec: avgMeaningfulDuration, calls_longest_duration_sec: longestDuration, calls_longest_date: longestCall ? formatDateRu(longestCall.ts) : null, calls_last_successful: lastSuccessfulCall ? formatDateRu(lastSuccessfulCall.ts) : null, calls_last_successful_days_before_lose: lastSuccessfulCall ? daysAgo(lastSuccessfulCall.ts) : null, calls_pending: callsPending, calls_incoming_pct: calls.length > 0 ? Math.round(callsIncoming.length / calls.length * 100) : 0, calls_max_unanswered_streak: maxUnansweredStreak, calls_max_missed_incoming_streak: maxMissedIncomingStreak, chats_total: chats.length, chats_manager: chatManager.length, chats_client: chatClient.length, chats_unknown: chatUnknown.length, chats_last_client_msg: lastClientChat ? formatDateRu(lastClientChat.ts) : null, chats_last_client_days_before_lose: lastClientChat ? daysAgo(lastClientChat.ts) : null, chats_last_manager_msg: lastManagerChat ? formatDateRu(lastManagerChat.ts) : null, chats_last_manager_days_before_lose: lastManagerChat ? daysAgo(lastManagerChat.ts) : null, chats_unanswered_by_manager: unansweredByManager, chats_unanswered_by_client: unansweredByClient, preferred_channel: preferredChannel, first_contact: firstContact ? formatDateRu(firstContact) : null, last_contact: lastContact ? formatDateRu(lastContact) : null, last_contact_days_before_lose: lastContact ? daysAgo(lastContact) : null, initiative_manager_pct: initiativeManagerPct, initiative_client_pct: initiativeClientPct, max_gap_days: maxGapDays, max_gap_who: maxGapWho, max_gap_period: maxGapStart && maxGapEnd ? formatDateRu(maxGapStart) + ' - ' + formatDateRu(maxGapEnd) : null, trend: trend, pause_cycles: pauseCycles, comments_count: comments.length, tasks_count: tasks.length, data_quality_transcribed_pct: transcribedPct, data_quality_unknown_author_pct: unknownPct, data_quality_warnings: dataWarnings };
+if (callsContactUnknown) {
+  analytics.calls_contact_unknown = callsContactUnknown;
+  dataWarnings.push('В ' + callsContactUnknown + ' звонках наличие контакта неизвестно из-за неполной расшифровки');
+}
 if (semanticRoleCount > 0) analytics.chat_role_inference = {
   source: 'semantic_inference', count: semanticRoleCount,
   affected_metrics: ['chats_manager', 'chats_client', 'chats_unknown', 'chats_last_client_msg',

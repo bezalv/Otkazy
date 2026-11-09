@@ -192,13 +192,13 @@ test('моно голосовое по роли клиента получает 
   } finally { await env.close(); }
 });
 
-test('стерео bad_audio передаёт mismatch и только calls запускает моно', async () => {
+test('подтверждённое несовпадение каналов запускает моно', async () => {
   const modes = [];
   const env = await setup(async (req, res) => {
     if (req.url === '/audio') { res.end(Buffer.alloc(1024)); return; }
     for await (const chunk of req) void chunk;
     modes.push(req.url);
-    if (req.url.includes('stereo')) return sendJson(res, 422, { ok: false, error: { code: 'bad_audio', retryable: false } });
+    if (req.url.includes('stereo')) return sendJson(res, 422, { ok: false, error: { code: 'channels_mismatch', retryable: false } });
     return sendJson(res, 200, { ok: true, model: 'ai-sage/gigaam-v3', channels: 1, segments: [{ channel: 0, start: 0, text: 'Разговор' }] });
   });
   try {
@@ -211,6 +211,23 @@ test('стерео bad_audio передаёт mismatch и только calls з�
     assert.equal(result.communications[0].transcript, 'Говорящий: Разговор');
     assert.equal(result.transcription_errors.length, 0);
   } finally { await env.close(); }
+});
+
+test('bad_audio без доказательства одного канала не включает моно', async () => {
+  const modes=[];
+  const env=await setup(async(req,res)=>{
+    if(req.url==='/audio'){res.end(Buffer.alloc(1024));return;}
+    for await(const chunk of req)void chunk;
+    modes.push(req.url);sendJson(res,422,{ok:false,error:{code:'bad_audio',retryable:false}});
+  });
+  try {
+    const {transcribe}=makeClient(env);
+    const result=await transcribeCalls({dealData:{deal_id:42,communications:[{
+      type:'call',activity_id:'123',_needs_transcription:true,audio_url:'https://example.test/?fileId=100'}]},transcribe});
+    assert.deepEqual(modes,['/v1/transcribe?channels=stereo']);
+    assert.equal(result.transcription_errors.length,1);
+    assert.equal(result.communications[0]._transcribed,undefined);
+  } finally {await env.close();}
 });
 
 test('размер проверяется до передачи в сервис при малом и неизвестном заранее большом файле', async () => {
@@ -451,6 +468,10 @@ test('формат отрезков совпадает с исходником �
   ]) {
     const actual = reserveToTranscript(body, request);
     delete actual._transcript_mode;
+    if (body.model.includes('gigaam')) {
+      assert.deepEqual(actual.transcription_coverage, {version:0,status:'unknown_legacy'});
+      delete actual.transcription_coverage;
+    }
     // VM создаёт объекты другого контекста, поэтому сравниваем сериализованные данные.
     assert.deepEqual(JSON.parse(JSON.stringify(actual)), JSON.parse(JSON.stringify(reference(body, request))));
   }

@@ -12,6 +12,20 @@ test('подготовка зависимостей не обращается к
   assert.equal(typeof result.queue.claim, 'function');
 });
 
+test('рабочий обработчик сохраняет материалы до судьи и использует только GigaAM', () => {
+  let options;
+  const forbidden = () => assert.fail('подготовка не должна подключаться к сервисам');
+  createWorkerDependencies({ pool: { query: forbidden, connect: forbidden },
+    bitrixBaseUrl: 'https://example.invalid/rest/1/test/', polzaKey: 'fixture',
+    sttUrl: 'http://127.0.0.1:8790', sttKey: 'fixture', tempRoot: tmpdir(),
+    judgePrompt: 'судья', writerPrompt: 'писатель', fetchImpl: forbidden,
+    makePump: args => { options = args.processOptions; return {}; },
+  });
+  assert.equal(options.persistInputsBeforeJudge, true);
+  assert.equal(options.sttAttemptPolicy.expectedEngine, 'reserve:gigaam');
+  assert.match(options.sttAttemptPolicy.sha256, /^[a-f0-9]{64}$/);
+});
+
 test('пустой промпт блокирует подготовку конвейера', () => {
   assert.throws(() => createWorkerDependencies({ pool: { query() {}, connect() {} }, judgePrompt: '', writerPrompt: 'a' }), /промпты/i);
 });

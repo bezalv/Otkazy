@@ -98,7 +98,12 @@ test('теги Битрикса с подчёркиванием не счита�
 test('детектор разговора совпадает с исходником проекта', () => {
   const source = readFileSync('prototype/lib/no-conversation.js', 'utf8').replace(/\r\n/g, '\n').trimEnd();
   const module = readFileSync('app/src/analysis/no-conversation.mjs', 'utf8').replace(/\r\n/g, '\n').trimEnd();
-  assert.equal(module, `${source}\n\nexport { detectNoConversation };`);
+  // Дополнительные функции частичного транскрипта находятся после перенесённого
+  // оригинала и не меняют сам детектор; его текст по-прежнему сверяется целиком.
+  assert.ok(module.startsWith(`${source}\n\n`));
+  const additions=module.slice(source.length);
+  assert.match(additions, /export \{ detectNoConversation, hasMachineMarker, hasObservedClientContent \};$/);
+  assert.doesNotMatch(additions, /\b(?:function|class|const|let|var)\s+detectNoConversation\b|\bdetectNoConversation\s*=/);
 });
 
 test('сообщение с файлом и служебной фразой сохраняет распознанную речь', () => {

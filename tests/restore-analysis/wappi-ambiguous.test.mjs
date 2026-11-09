@@ -12,13 +12,15 @@ import { mkdtemp, rmdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-async function trustedVoice(info,text='Голосовой отказ от заказа') {
+async function trustedVoice(info,text='Голосовой отказ от заказа',legacy=false) {
  const dir=await mkdtemp(join(tmpdir(),'voice-test-'));
  const server=createServer(async(req,res)=>{
   if(req.url==='/audio'){res.end(Buffer.alloc(1024));return;}
   for await(const chunk of req)void chunk;
   res.setHeader('Content-Type','application/json');
-  res.end(JSON.stringify({ok:true,model:'ai-sage/gigaam-v3',channels:1,segments:[{channel:0,start:0,end:1,text}]}));
+  res.end(JSON.stringify({ok:true,model:'ai-sage/gigaam-v3',channels:1,segments:[{channel:0,start:0,end:1,text}],
+    ...(!legacy ? {transcription_coverage:{version:1,status:'no_empty_fragments',total_fragments:1,
+      unrecognized_count:0,unrecognized_segments:[]}} : {})}));
  });
  await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
  const base=`http://127.0.0.1:${server.address().port}`;
@@ -193,6 +195,15 @@ test('неизвестный автор голосового определяе�
  const facts=assembleFacts({lose_date:cutoff,communications:out.result.communications},'prompt').facts_packet.facts;
  assert.equal(facts.filter(item=>item.content.includes('Голосовой отказ от заказа')).length,1);
  assert.equal(facts.find(item=>item.content.includes('Голосовой отказ от заказа')).source,'chat_voice_transcript');
+});
+test('старый ответ GigaAM без учёта фрагментов не подтверждает полноту голосового для оценки автора',async()=>{
+ const f=voiceFixture();
+ const output=await normalizeCommunications({collection:f.collection,verifyFallbackSession:f.verifier,
+  resolveFile:async fileId=>({id:fileId,name:'voice.ogg',url:'https://example.test/voice'}),
+  transcribeVoice:async info=>trustedVoice(info,'Голосовой отказ от заказа',true)});
+ const messages=output.deal_data.communications;
+ assert.equal(messages[1].transcription_coverage[0].status,'unknown_legacy');
+ assert.equal((await inference(messages)).calls,0);
 });
 test('известная роль голосового не переопределяется, когда в той же сессии есть неизвестная реплика',async()=>{
  const f=voiceFixture({sender:1});const h=f.collection.raw.sessions[0].history;

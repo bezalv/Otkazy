@@ -1,6 +1,9 @@
 import { processDeal } from '../process-deal.mjs';
 import { safeErrorUsageMeta } from '../persistence/rows.mjs';
 import { revalidateRoleInferenceMetadata, markRoleUsageUnknown } from './role-inference-metadata.mjs';
+import { PrejudgeStageError } from '../persistence/prejudge.mjs';
+import { SttAttemptsExhaustedError } from '../persistence/stt-attempts.mjs';
+import { resolveCurrentTransition } from '../collect/index.mjs';
 
 // Входом служит только уже захваченное задание. Ошибки сохранения или потери
 // аренды не превращаются в результат сделки и оставляются очереди на восстановление.
@@ -68,7 +71,7 @@ export function toPersistenceResult(job, outcome, audioOriginHistoryId = null) {
  * Все зависимости передаются извне, реальных сетевых вызовов здесь нет.
  * delivery вызывается лишь после сохранения результата либо его восстановления.
  */
-export async function runJob({ job, queue, store, loadAudioWait, delivery, process = processDeal, processOptions = {}, heartbeatMs = 60000 }) {
+export async function runJob({ job, queue, store, loadAudioWait, delivery, process = processDeal, processOptions = {}, heartbeatMs = 60000, resolveRetryTransition = resolveCurrentTransition }) {
   if (processOptions.semanticChatRoles === true) {
     throw new Error('Эксперимент определения ролей доступен только без записи и доставки');
   }
@@ -77,6 +80,24 @@ export async function runJob({ job, queue, store, loadAudioWait, delivery, proce
     throw new TypeError('Не заданы зависимости обработки');
   }
   if (!Number.isFinite(heartbeatMs) || heartbeatMs < 1000) throw new TypeError('Некорректный интервал аренды');
+  if (processOptions.prejudgeCheckpoint !== undefined || processOptions.prejudgeCheckLease !== undefined
+      || processOptions.prejudgeSttHooks !== undefined) throw new TypeError('Недопустимый внешний checkpoint');
+  if (processOptions.persistInputsBeforeJudge !== undefined && typeof processOptions.persistInputsBeforeJudge !== 'boolean') {
+    throw new TypeError('Некорректная настройка сохранения материалов');
+  }
+  const stageEnabled = processOptions.persistInputsBeforeJudge === true;
+  const sttPolicy = processOptions.sttAttemptPolicy;
+  const engines=Array.isArray(sttPolicy?.expectedEngine) ? sttPolicy.expectedEngine : [sttPolicy?.expectedEngine];
+  if (sttPolicy !== undefined && (!stageEnabled || !sttPolicy || typeof sttPolicy !== 'object'
+      || !/^[a-f0-9]{64}$/.test(sttPolicy.sha256 || '') || !engines.length || engines.length>4
+      || !engines.every(x=>typeof x==='string' && /^reserve:[a-z0-9-]{1,24}$/.test(x))))
+    throw new TypeError('Не задана версия политики STT');
+  if (stageEnabled && (typeof store.savePrejudgeArtifact !== 'function' || typeof store.hasPrejudgeArtifacts !== 'function'
+      || typeof store.markPrejudgeNeedsReview !== 'function')) {
+    throw new TypeError('Не подключено сохранение материалов');
+  }
+  if (sttPolicy && (typeof store.claimSttAttempt !== 'function' || typeof store.completeSttAttempt !== 'function'
+      || typeof store.hasUnsafePrejudgeResume !== 'function')) throw new TypeError('Не подключён журнал попыток STT');
   let leaseLost = false;
   let renewal = Promise.resolve();
   const renew = () => {
@@ -137,6 +158,43 @@ export async function runJob({ job, queue, store, loadAudioWait, delivery, proce
       }
       audioHistoryId = id;
     }
+    if (stageEnabled && ['manual','nightly'].includes(job.trigger_type) && job.origin_stage_history_id != null
+        && (typeof job.origin_stage_history_id !== 'string' || !/^[1-9]\d{0,29}$/.test(job.origin_stage_history_id)
+          || (audioHistoryId && audioHistoryId !== job.origin_stage_history_id))) throw new PrejudgeStageError();
+    let retryHistoryId = null;
+    if (stageEnabled && !(eventKey || audioHistoryId) && ['manual','nightly'].includes(job.trigger_type)) {
+      if (typeof resolveRetryTransition !== 'function' || typeof queue.bindRetryTransition !== 'function') throw new PrejudgeStageError();
+      await checkLease();
+      const verified = await resolveRetryTransition({client:processOptions.bitrix,dealId:Number(job.deal_id),loseDate:job.lose_date,wait:processOptions.wait});
+      await checkLease();
+      if (verified?.status === 'obsolete') {
+        if (typeof queue.finishObsoleteTransition !== 'function' || !await queue.finishObsoleteTransition(job.id,job.lease_token)) throw new PrejudgeStageError();
+        return {status:'obsolete'};
+      }
+      if (verified?.status !== 'current' || typeof verified.stageHistoryId !== 'string'
+          || !/^[1-9]\d{0,29}$/.test(verified.stageHistoryId)) throw new PrejudgeStageError();
+      const bound = await queue.bindRetryTransition({id:job.id,token:job.lease_token,dealId:Number(job.deal_id),
+        loseDate:job.lose_date,stageHistoryId:verified.stageHistoryId});
+      if (!bound) throw new PrejudgeStageError();
+      await checkLease();
+      retryHistoryId = verified.stageHistoryId;
+    }
+    if (stageEnabled && !(eventKey || audioHistoryId || retryHistoryId)) throw new PrejudgeStageError();
+    let stageScope;
+    if (stageEnabled) {
+      await checkLease();
+      // Нельзя автоматически повторять распознавание по тем же ID файла:
+      // начало уже записано, а идентичность аудиобайтов не подтверждена.
+      stageScope={operationId:job.id,leaseToken:job.lease_token,dealId:Number(job.deal_id),
+        stageHistoryId:eventKey ? eventKey[1] : audioHistoryId || retryHistoryId,
+        loseDate:job.lose_date instanceof Date ? job.lose_date.toISOString() : job.lose_date};
+      const unsafe = sttPolicy ? await store.hasUnsafePrejudgeResume(stageScope) : await store.hasPrejudgeArtifacts(stageScope);
+      if (unsafe) {
+        await checkLease();
+        if (await store.markPrejudgeNeedsReview(stageScope) !== true) throw new PrejudgeStageError();
+        return {status:'needs_review',reason:'prejudge_materials_need_review'};
+      }
+    }
     let outcome;
     try {
       if ((['live', 'backfill'].includes(job.trigger_type) || String(job.request_key || '').startsWith('bitrix24:deal-stage-history:')) && !eventKey) {
@@ -147,10 +205,28 @@ export async function runJob({ job, queue, store, loadAudioWait, delivery, proce
       // этом не открываем повторно и её прежний срок не продлеваем.
       const recheckTerminalAudio = ['manual', 'nightly'].includes(job.trigger_type)
         && audioWait && ['done', 'expired', 'cancelled'].includes(audioWait.state);
-      outcome = await process({ ...processOptions, dealId: Number(job.deal_id), expectedLoseDate: job.lose_date, expectedHistoryId: eventKey ? eventKey[1] : audioHistoryId,
+      const runOptions = { ...processOptions };
+      delete runOptions.persistInputsBeforeJudge;
+      delete runOptions.sttAttemptPolicy;
+      outcome = await process({ ...runOptions, dealId: Number(job.deal_id), expectedLoseDate: job.lose_date, expectedHistoryId: eventKey ? eventKey[1] : audioHistoryId || retryHistoryId,
         silent: job.silent === true, screenshots: job.screenshots === true,
+        ...(stageEnabled ? { prejudgeCheckpoint:async args => {
+          await checkLease();
+          return store.savePrejudgeArtifact({ ...args, operationId:job.id, leaseToken:job.lease_token });
+        }, prejudgeCheckLease:checkLease, ...(sttPolicy ? {prejudgeSttHooks:{
+          beforeStt:async args=>{ await checkLease(); const claim=await store.claimSttAttempt({scope:stageScope,...args,
+            policySha256:sttPolicy.sha256,expectedEngine:sttPolicy.expectedEngine}); await checkLease(); return claim; },
+          afterStt:async args=>{ await checkLease(); return store.completeSttAttempt({scope:stageScope,...args,
+            policySha256:sttPolicy.sha256,expectedEngine:sttPolicy.expectedEngine}); },
+        }} : {}) } : {}),
         savedAudioWait: recheckTerminalAudio ? { ...audioWait, _recheck_terminal: true } : audioWait });
-    } catch {
+    } catch (error) {
+      if (error instanceof SttAttemptsExhaustedError && stageEnabled) {
+        await checkLease();
+        if (await store.markPrejudgeNeedsReview({...stageScope,reason:'stt_attempts_exhausted'}) !== true) throw new PrejudgeStageError();
+        return {status:'needs_review',reason:'stt_attempts_exhausted'};
+      }
+      if (error instanceof PrejudgeStageError) throw error;
       // Исключения нормализации не должны исчезать вместе с процессом.
       outcome = { status: 'error', collection: { _error: 'Сбой обработки данных сделки' } };
     }

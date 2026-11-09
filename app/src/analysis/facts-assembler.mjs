@@ -1,6 +1,7 @@
 import { detectNoConversation } from './no-conversation.mjs';
 import { hasChatAttachments } from './chat-attachments.mjs';
 import { isMissedCallSystemMessage } from '../system-chat.mjs';
+import { partialCallObservations } from './partial-call.mjs';
 
 // Перенос детерминированной ноды из выгрузки n8n от 19.10.2026.
 export function assembleFacts(input, judgeSystemPrompt) {
@@ -156,6 +157,45 @@ for (var i = 0; i < comms.length; i++) {
       if (!isNaN(durS) && !isNaN(durE) && durE > durS) dur = Math.round((durE - durS) / 1000);
     }
 
+    var partialCoverage = c.transcription_coverage && c.transcription_coverage.status === 'incomplete'
+      ? c.transcription_coverage : null;
+    if (c.transcription_coverage?.status === 'unknown_legacy') {
+      facts.push({ fact_id: nextId(), source: 'call_event', actor: 'system', ts: ts,
+        direction: c.direction || null, recording_unrecognized: true,
+        content: 'Историческая расшифровка GigaAM не содержит данных о нераспознанных фрагментах; полнота неизвестна.' });
+    }
+    if (partialCoverage) {
+      var gapText = partialCoverage.unrecognized_segments.map(function(s) {
+        return 'канал ' + s.channel + ': ' + s.start + '–' + s.end + ' сек';
+      }).join('; ');
+      facts.push({ fact_id: nextId(), source: 'call_event', actor: 'system', ts: ts,
+        direction: c.direction || null, recording_unrecognized: true,
+        content: 'Расшифровка звонка неполная: не распознано фрагментов ' + partialCoverage.unrecognized_count
+          + ' из ' + partialCoverage.total_fragments + ' (' + gapText + '). Их содержание неизвестно; это не доказательство тишины.' });
+    }
+    var uncertainCoverage = c.transcription_coverage?.status === 'unknown_legacy' || !!partialCoverage;
+    if (uncertainCoverage) {
+      var observedParts = partialCallObservations(c, isMonoTranscript(c));
+      var machineParts = observedParts.client.machine.concat(observedParts.manager.machine);
+      if (machineParts.length) facts.push({fact_id:nextId(),source:'call_event',actor:'system',ts:ts,
+        direction:c.direction || null,content:'В распознанной части прозвучало служебное сообщение: «' + machineParts.join(' ') + '». Остальные фрагменты неизвестны.'});
+      var ambiguousParts = observedParts.client.ambiguous.concat(observedParts.manager.ambiguous);
+      if (ambiguousParts.length) facts.push({fact_id:nextId(),source:'call_transcript',actor:'unknown',ts:ts,
+        direction:c.direction || null,content:'В распознанной части автор или состав реплики не определён: «' + ambiguousParts.join(' ') + '».'});
+      if (isMonoTranscript(c)) {
+        var monoObserved = observedParts.client.human.concat(observedParts.manager.human).join(' ');
+        if (monoObserved) facts.push({fact_id:nextId(),source:'call_transcript',actor:'unknown',ts:ts,
+          direction:c.direction || null,transcript_mode:'mono',content:'Запись без разделения сторон: ' + monoObserved});
+      } else {
+        if (observedParts.manager.human.length) facts.push({fact_id:nextId(),source:'call_transcript',actor:'manager',ts:ts,
+          direction:c.direction || null,content:observedParts.manager.human.join(' ')});
+        if (observedParts.client.human.length) facts.push({fact_id:nextId(),source:'call_transcript',actor:'client',ts:ts,
+          direction:c.direction || null,content:observedParts.client.human.join(' ')});
+      }
+      if (observedParts.status === 'unknown') facts.push({fact_id:nextId(),source:'call_event',actor:'system',ts:ts,
+        direction:c.direction || null,content:'Контакт с клиентом по имеющейся части записи не установлен; нераспознанное содержание неизвестно.'});
+      continue;
+    }
     var vmResult = detectVoicemail(c.transcript_client_text, c.transcript_manager_text, dur);
 
     if (vmResult.isVoicemail) {
@@ -256,6 +296,20 @@ for (var i = 0; i < comms.length; i++) {
       });
     }
   } else if (c.type === 'chat') {
+    if (Array.isArray(c.transcription_coverage)) for (var vci = 0; vci < c.transcription_coverage.length; vci++) {
+      var voiceCoverage = c.transcription_coverage[vci];
+      if (voiceCoverage.status === 'unknown_legacy') {
+        facts.push({ fact_id: nextId(), source: 'chat_voice_transcription', actor: 'system', ts: ts,
+          content: 'Историческая расшифровка голосового GigaAM не содержит данных о нераспознанных фрагментах; полнота неизвестна.' });
+        continue;
+      }
+      if (voiceCoverage.status !== 'incomplete') continue;
+      facts.push({ fact_id: nextId(), source: 'chat_voice_transcription', actor: 'system', ts: ts,
+        content: 'Голосовое распознано частично: не распознано ' + voiceCoverage.unrecognized_count + ' из '
+          + voiceCoverage.total_fragments + ' фрагментов (' + voiceCoverage.unrecognized_segments.map(function(s) {
+            return s.start + '–' + s.end + ' сек';
+          }).join('; ') + '). Содержание неизвестно; это не доказательство тишины.' });
+    }
     // П.8: один факт на сообщение. Пакет вклеивает расшифровку голосового в текст
     // сообщения, а здесь из того же сообщения делался ЕЩЁ один факт chat_voice_transcript
     // с тем же текстом. За 60 дней все 28 голосовых фактов оказались дублями, и судья

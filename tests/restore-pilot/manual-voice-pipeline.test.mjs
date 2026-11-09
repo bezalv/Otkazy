@@ -68,6 +68,8 @@ async function fixture() {
   const server=createServer(async(req,res)=>{counts.uploads++;for await(const chunk of req)void chunk;
     const stereo=req.url.includes('stereo');res.writeHead(200,{'Content-Type':'application/json'});
     res.end(JSON.stringify({ok:true,model:'ai-sage/gigaam-v3',channels:stereo?2:1,
+      transcription_coverage:{version:1,status:'no_empty_fragments',total_fragments:stereo?2:1,
+        unrecognized_count:0,unrecognized_segments:[]},
       segments:stereo?[{channel:0,start:0,end:1,text:'Здравствуйте'},
         {channel:1,start:1,end:2,text:'Мы уже заказали окна в другом месте.'}]
         :[{channel:0,start:0,end:1,text:'Нет, спасибо, мы уже заказали окна в другом месте.'}]}));});

@@ -9,15 +9,26 @@ import { sameVoiceFileSnapshot } from './voice-file-metadata.mjs';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { resolveBinary } from './stt/binaries.mjs';
+import { createHash } from 'node:crypto';
 
 const executeFile = promisify(execFile);
 const trustedAudioOnlyResults = new WeakMap();
+const trustedAudioHashes = new WeakMap();
+const sttClients = new WeakSet();
+export const supportsSttAttempts = client => typeof client === 'function' && sttClients.has(client);
 function voiceRequestSnapshot(meta) {
   try {
-    return JSON.stringify(Object.fromEntries(['file_id','activity_id','download_url','file_name','call_date',
+    return JSON.stringify(Object.fromEntries(['deal_id','file_id','activity_id','download_url','file_name','call_date',
       'call_direction','comm_index','channel_count','speaker_role','require_audio_only','voice_file_snapshot']
       .map(key => [key, meta?.[key] ?? null])));
   } catch { return null; }
+}
+/** SHA только от нашего скачивания; поле из постороннего ответа не является доказательством. */
+export function verifiedAudioHash(result, meta) {
+  const binding = result && trustedAudioHashes.get(result);
+  const current = meta && voiceRequestSnapshot(meta);
+  if (!binding || !current || current !== binding.request) return null;
+  try { return JSON.stringify(result) === binding.result ? binding.hash : null; } catch { return null; }
 }
 export function verifiedAudioOnly(result, meta) {
   const binding = result && trustedAudioOnlyResults.get(result);
@@ -42,7 +53,7 @@ const MIN_AUDIO_BYTES = 1024;
 const MAX_AUDIO_BYTES = 50 * 1024 * 1024;
 const MAX_RESPONSE_BYTES = 8 * 1024 * 1024;
 const RESERVE_ERROR_CODES = new Set([
-  'bad_request', 'unauthorized', 'not_found', 'too_large', 'bad_audio', 'too_long',
+  'bad_request', 'unauthorized', 'not_found', 'too_large', 'bad_audio', 'channels_mismatch', 'too_long',
   'too_many_parts', 'provider_error', 'overloaded', 'timeout', 'internal', 'storage_error',
 ]);
 
@@ -102,6 +113,8 @@ export function reserveToTranscript(body, meta) {
     manager_text: manager.join(' '), client_text: client.join(' '),
     operation_id: body.request_id || null, s3_file: null, transcript_engine: engineLabel(body.model),
     reserve_duration_sec: body.duration_sec ?? null, reserve_speech_sec: body.speech_sec ?? null,
+    ...(body.transcription_coverage ? { transcription_coverage: body.transcription_coverage }
+      : engineLabel(body.model) === 'reserve:gigaam' ? {transcription_coverage:{version:0,status:'unknown_legacy'}} : {}),
     ...(mono ? { _transcript_mode: 'mono' } : {}), success: true,
   };
 }
@@ -118,6 +131,17 @@ function failure(meta, message, options = {}) {
 
 function validReserveResponse(body) {
   if (!body || body.ok !== true || ![1, 2].includes(Number(body.channels)) || !Array.isArray(body.segments)) return false;
+  const coverage = body.transcription_coverage;
+  if (coverage !== undefined && (!coverage || coverage.version !== 1
+      || !['incomplete','no_empty_fragments'].includes(coverage.status)
+      || !Number.isSafeInteger(coverage.total_fragments) || coverage.total_fragments < 0
+      || !Array.isArray(coverage.unrecognized_segments)
+      || coverage.unrecognized_count !== coverage.unrecognized_segments.length
+      || coverage.total_fragments !== coverage.unrecognized_count + body.segments.length
+      || (coverage.status === 'incomplete') !== (coverage.unrecognized_count > 0)
+      || !coverage.unrecognized_segments.every(s => s && Number.isInteger(s.channel) && s.channel >= 0
+        && s.channel < Number(body.channels) && Number.isFinite(s.start) && s.start >= 0
+        && Number.isFinite(s.end) && s.end >= s.start))) return false;
   return body.segments.every(segment => segment && typeof segment.text === 'string'
     && typeof segment.start === 'number' && Number.isFinite(segment.start) && segment.start >= 0
     && Number.isInteger(segment.channel) && segment.channel >= 0
@@ -181,11 +205,12 @@ async function downloadToFile({ url, path, fetchImpl, timeoutMs, maxBytes }) {
     }
     if (!response.body) throw new AudioError('Получен пустой ответ записи');
     let size = 0;
+    const audioHash = createHash('sha256');
     const limiter = new Transform({
       transform(chunk, encoding, callback) {
         size += chunk.length;
         if (size > maxBytes) callback(new AudioError('Запись превышает допустимый размер', false));
-        else callback(null, chunk);
+        else { const copy = Buffer.from(chunk); audioHash.update(copy); callback(null, copy); }
       },
     });
     const input = typeof response.body.getReader === 'function' ? Readable.fromWeb(response.body) : response.body;
@@ -196,7 +221,7 @@ async function downloadToFile({ url, path, fetchImpl, timeoutMs, maxBytes }) {
       throw new AudioError('Не удалось скачать запись полностью');
     }
     if (size < MIN_AUDIO_BYTES) throw new AudioError('Запись пустая или меньше 1024 байт');
-    return size;
+    return { size, sha256: audioHash.digest('hex') };
   } finally { timeout.close(); }
 }
 
@@ -230,8 +255,10 @@ export function createSttClient({
     if (!Number.isSafeInteger(timeout) || timeout <= 0) throw new TypeError('Некорректный таймаут');
   }
 
-  return async function transcribe(meta) {
+  const transcribe = async function transcribe(meta, hooks = undefined) {
     if (!meta || ![1, 2].includes(Number(meta.channel_count))) throw new TypeError('Некорректное число каналов');
+    const audioRequest = voiceRequestSnapshot(meta);
+    if (audioRequest === null) return failure(meta, 'Не подтверждён запрос аудиофайла');
     const voiceRequest = meta.require_audio_only === true ? voiceRequestSnapshot(meta) : null;
     if (meta.require_audio_only === true && voiceRequest === null) return failure(meta, 'Не подтверждён запрос голосового файла');
     if (meta.require_audio_only === true && /^\d+$/.test(String(meta.file_id ?? '')) && !meta.voice_file_snapshot) {
@@ -263,15 +290,39 @@ export function createSttClient({
     try {
       directory = await mkdtemp(join(tempRoot, 'otkazy-audio-'));
       file = join(directory, 'recording');
-      let size;
+      let size, audioSha256;
       try {
-        size = await downloadToFile({ url: downloadUrl, path: file, fetchImpl, timeoutMs: downloadTimeoutMs, maxBytes: maxAudioBytes });
+        const downloaded = await downloadToFile({ url: downloadUrl, path: file, fetchImpl, timeoutMs: downloadTimeoutMs, maxBytes: maxAudioBytes });
+        size = downloaded.size; audioSha256 = downloaded.sha256;
       } catch (error) {
         const message = error instanceof AudioError ? error.message : 'Не удалось сохранить аудиозапись';
         return failure(meta, message, { downloadFailed: true, retryable: error?.retryable !== false });
       }
       if (meta.require_audio_only === true && await probeAudioOnly(file) !== true) {
         return failure(meta, 'Не подтверждено отсутствие видео и других дорожек', { downloadFailed: true });
+      }
+      if (voiceRequestSnapshot(meta) !== audioRequest) return failure(meta, 'Параметры аудиофайла изменились');
+      let attempt;
+      if (hooks !== undefined) {
+        if (typeof hooks?.beforeStt !== 'function' || typeof hooks?.afterStt !== 'function') {
+          throw new TypeError('Некорректные обработчики транскрипции');
+        }
+        // Внутренний контракт: вызывающий сначала сверяет SHA с БД или
+        // фиксирует попытку, и только затем разрешает платный POST.
+        attempt = await hooks.beforeStt({ request:meta, audioSha256 });
+        if (voiceRequestSnapshot(meta) !== audioRequest) throw new TypeError('Параметры аудиофайла изменились');
+        if (attempt?.cached) {
+          const cached = attempt.cached;
+          if ((cached.success !== true && !(cached.success === false && cached.channels_mismatch === true && cached.retryable === false)) || cached.audio_sha256 !== audioSha256
+              || Number(cached.channel_count) !== Number(meta.channel_count)
+              || (cached.success === true && typeof cached.formatted_dialog !== 'string')) {
+            throw new TypeError('Некорректный сохранённый транскрипт');
+          }
+          trustedAudioHashes.set(cached, {request:audioRequest, result:JSON.stringify(cached), hash:audioSha256});
+          if (voiceRequest) trustedAudioOnlyResults.set(cached, {request:voiceRequest, result:JSON.stringify(cached)});
+          return cached;
+        }
+        if (!attempt || attempt.allowed !== true) throw new TypeError('Отправка аудио не разрешена');
       }
       const url = new URL(endpoint);
       url.searchParams.set('channels', Number(meta.channel_count) === 1 ? 'mono' : 'stereo');
@@ -308,21 +359,35 @@ export function createSttClient({
       if (status !== 200 || body?.ok !== true) {
         const rawCode = String(body?.error?.code || '');
         const code = RESERVE_ERROR_CODES.has(rawCode) ? rawCode : '';
-        const channelsMismatch = code === 'bad_audio' && Number(meta.channel_count) === 2;
+        const channelsMismatch = code === 'channels_mismatch' && Number(meta.channel_count) === 2;
         const retryable = channelsMismatch ? false : typeof body?.error?.retryable === 'boolean'
           ? body.error.retryable : status >= 500 || status === 408 || status === 429;
-        return failure(meta, `Резерв распознавания: ${code || `HTTP ${status || 'без кода'}`}`, { retryable, channelsMismatch });
+        const result = failure(meta, `Резерв распознавания: ${code || `HTTP ${status || 'без кода'}`}`, { retryable, channelsMismatch });
+        if (hooks && channelsMismatch) {
+          if (voiceRequestSnapshot(meta) !== audioRequest) throw new TypeError('Параметры аудиофайла изменились');
+          result.audio_sha256=audioSha256;
+          trustedAudioHashes.set(result,{request:audioRequest,result:JSON.stringify(result),hash:audioSha256});
+          await hooks.afterStt({request:meta,result,audioSha256,attempt});
+        }
+        return result;
       }
       if (!validReserveResponse(body)) return failure(meta, 'Резерв распознавания вернул некорректный ответ');
       if (Number(meta.channel_count) === 1 && Number(body.channels) !== 1) {
         return failure(meta, 'Моно-запрос вернул несовпадающее число каналов');
       }
+      if (voiceRequestSnapshot(meta) !== audioRequest) return failure(meta, 'Параметры аудиофайла изменились во время распознавания');
       const result = reserveToTranscript(body, meta);
+      // SHA относится к тем самым скачанным байтам, переданным локальному STT;
+      // ID файла или URL сами по себе не подтверждают неизменность записи.
+      result.audio_sha256 = audioSha256;
+      trustedAudioHashes.set(result, {request:audioRequest, result:JSON.stringify(result), hash:audioSha256});
       if (meta.require_audio_only === true && voiceRequestSnapshot(meta) === voiceRequest) {
         trustedAudioOnlyResults.set(result, { request: voiceRequest, result: JSON.stringify(result) });
       }
+      if (hooks) await hooks.afterStt({ request:meta, result, audioSha256, attempt });
       return result;
-    } catch {
+    } catch (error) {
+      if (hooks) throw error;
       return failure(meta, 'Не удалось подготовить аудиозапись', { downloadFailed: true });
     } finally {
       let cleanupFailed = false;
@@ -331,4 +396,6 @@ export function createSttClient({
       if (cleanupFailed) throw new Error('Не удалось удалить временный аудиофайл');
     }
   };
+  sttClients.add(transcribe);
+  return transcribe;
 }

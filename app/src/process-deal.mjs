@@ -14,6 +14,9 @@ import { processScreenshots } from './screenshots/process.mjs';
 import { pgDecide } from './rules/pipeline-gate.mjs';
 import { dsEvaluate, dsInsufficientJudge } from './rules/data-sufficiency.mjs';
 import { runAgents } from './agents/index.mjs';
+import { PrejudgeStageError, prepareBeginArtifact, prepareRawCollectionArtifact, prepareTranscriptArtifact, prepareCommunicationsArtifact, prepareJudgeInputArtifact } from './persistence/prejudge.mjs';
+import { ambiguousProcessingOnly } from './calls/transcript-quality.mjs';
+import { supportsSttAttempts } from './stt-client.mjs';
 
 function blockedTemporalScope(collection, audioWait, source, reason) {
   const sources = { ...collection._sources, [source]: { ...collection._sources[source], complete: false, error: reason } };
@@ -26,7 +29,16 @@ export async function processDeal({
   judgeSystemPrompt, writerSystemPrompt, audioWaitEnabledAt, savedAudioWait = null,
   silent = false, screenshots = true, nowMs = null, clock = Date.now, expectedLoseDate = null, expectedHistoryId = null, wait,
   semanticChatRoles = false, verifyFallbackSession, verifyLatestSession, repairProofErrors = false, roleInferenceClient,
+  prejudgeCheckpoint, prejudgeCheckLease, prejudgeSttHooks,
 }) {
+  if (prejudgeCheckpoint !== undefined && (typeof prejudgeCheckpoint !== 'function'
+      || typeof prejudgeCheckLease !== 'function' || expectedHistoryId === null || expectedLoseDate === null || semanticChatRoles === true)) {
+    throw new Error('Для сохранения материалов нужен подтверждённый переход без экспериментального определения ролей');
+  }
+  if (prejudgeCheckpoint === undefined && prejudgeCheckLease !== undefined) throw new Error('Не задано сохранение материалов');
+  if (prejudgeSttHooks !== undefined && (!prejudgeCheckpoint || typeof prejudgeSttHooks !== 'object'
+      || typeof prejudgeSttHooks.beforeStt !== 'function' || typeof prejudgeSttHooks.afterStt !== 'function'
+      || !supportsSttAttempts(transcribe))) throw new Error('Не подключены подтверждённые попытки STT');
   if (typeof repairProofErrors !== 'boolean' || (repairProofErrors && (silent !== true || semanticChatRoles !== true))) {
     throw new Error('Исправление доказательств доступно только в тихом ручном эксперименте');
   }
@@ -96,10 +108,51 @@ export async function processDeal({
   // сохранённые ожидания. Судье и распознаванию — только события до отказа.
   temporal ||= scopeCollectionAtLose(collected, { screenshots });
   if (temporal.error) return blockedTemporalScope(collected, audioWait, temporal.error.source, temporal.error.reason);
+  const checkpoint = prejudgeCheckpoint === undefined ? null : async artifact => {
+    try {
+      const saved = await prejudgeCheckpoint({ dealId:Number(dealId), stageHistoryId:expectedHistoryId,
+        loseDate:collected.deal_data.lose_date, artifact });
+      if (saved?.saved !== true) throw new Error('Не подтверждено сохранение');
+    } catch { throw new PrejudgeStageError(); }
+  };
+  let stageLeaseLost = false;
+  const checkStageLease = async () => {
+    if (stageLeaseLost) throw new PrejudgeStageError();
+    try { await prejudgeCheckLease(); } catch { stageLeaseLost = true; throw new PrejudgeStageError(); }
+  };
+  const checkedLlm = checkpoint && typeof llm?.complete === 'function' ? { async complete(...args) {
+    await checkStageLease();
+    return llm.complete(...args);
+  } } : llm;
+  // Метка появляется до первого платного голосового/звонка. При аварийном
+  // повторе очередь обнаружит её и не заплатит за те же фрагменты вслепую.
+  if (checkpoint) {
+    await checkpoint(prepareBeginArtifact({sttAttempts:prejudgeSttHooks !== undefined}));
+    let rawArtifact;
+    try { rawArtifact = prepareRawCollectionArtifact(temporal.collection); }
+    catch { throw new PrejudgeStageError(); }
+    await checkpoint(rawArtifact);
+  }
+  const transcribeAndCheckpoint = checkpoint && typeof transcribe === 'function' ? async request => {
+    await checkStageLease();
+    let response;
+    try { response = await transcribe(request,prejudgeSttHooks); }
+    catch (error) { if (error instanceof PrejudgeStageError) throw error; if (prejudgeSttHooks) throw new PrejudgeStageError(); throw error; }
+    // Не выдаём пустой/ошибочный ответ за готовый транскрипт. Сохраняемый
+    // кандидат не используется автоматически при повторе без хеша аудиобайтов.
+    if (response?.success === true && typeof response.formatted_dialog === 'string'
+        && response.formatted_dialog.trim() && !ambiguousProcessingOnly(response)) {
+      let artifact;
+      try { artifact = prepareTranscriptArtifact(request, response); }
+      catch { throw new PrejudgeStageError(); }
+      await checkpoint(artifact);
+    }
+    return response;
+  } : transcribe;
   let normalized;
   try {
     normalized = await normalizeCommunications({
-      collection: temporal.collection, resolveFile, transcribeVoice: transcribe, screenshots, verifyFallbackSession,
+      collection: temporal.collection, resolveFile, transcribeVoice: transcribeAndCheckpoint, screenshots, verifyFallbackSession,
       temporalCutoff: collected.deal_data.lose_date,
     });
   } catch (error) {
@@ -108,6 +161,12 @@ export async function processDeal({
   }
   normalized.deal_data.comm_stats.excluded_after_cutoff = temporal.excluded;
   normalized.deal_data._historical_scope_checked = true;
+  if (checkpoint) {
+    let artifact;
+    try { artifact = prepareCommunicationsArtifact(Number(dealId), normalized.deal_data.communications, normalized.voice_failures); }
+    catch { throw new PrejudgeStageError(); }
+    await checkpoint(artifact);
+  }
   let chatRoleInferenceStats = null;
   let chatRoleInferenceEvidence = null;
   let chatRoleInferenceMetadata = null;
@@ -151,7 +210,7 @@ export async function processDeal({
   if (earlyGate.block) return { status: 'blocked', collection: collected, audioWait, pipelineGate: earlyGate,
     ...roleFields() };
 
-  const calls = await transcribeCalls({ dealData: normalized.deal_data, transcribe });
+  const calls = await transcribeCalls({ dealData: normalized.deal_data, transcribe: transcribeAndCheckpoint });
   const recognition = { calls: calls.transcription_errors, voices: normalized.voice_failures, screenshots: [] };
   const initialGate = pgDecide({ sources: collected._sources, recognition, communications: normalized.deal_data.communications,
     allowNonmaterialUnknown: semanticChatRoles === true });
@@ -160,7 +219,7 @@ export async function processDeal({
 
   const journalInput = { ...normalized.deal_data, communications: calls.communications, transcription_stats: calls.transcription_stats };
   const analytics = buildCommunicationAnalytics(buildJournal(journalInput), evaluatedAt);
-  const screenshotResult = await processScreenshots({ base: analytics, resolveFile, downloadFile, client: llm });
+  const screenshotResult = await processScreenshots({ base: analytics, resolveFile, downloadFile, client: checkedLlm });
   recognition.screenshots = screenshotResult.failures;
   const pipelineGate = pgDecide({ sources: collected._sources, recognition, communications: calls.communications,
     allowNonmaterialUnknown: semanticChatRoles === true });
@@ -168,14 +227,28 @@ export async function processDeal({
     ...roleFields() };
 
   const prepared = assembleFacts(screenshotResult.output, judgeSystemPrompt);
+  if (checkpoint) {
+    let artifact;
+    try { artifact = prepareJudgeInputArtifact(Number(dealId), calls.communications, prepared.facts_packet); }
+    catch { throw new PrejudgeStageError(); }
+    await checkpoint(artifact);
+    // Судья должен видеть именно сохранённый пакет. Ссылки скрываются в обоих
+    // направлениях, чтобы URL с webhook credential не остались в БД.
+    prepared.facts_packet = artifact.payload.facts_packet;
+    prepared.deal_card = prepared.facts_packet.deal_card;
+    prepared.judge_request_body = { ...prepared.judge_request_body,
+      messages:prepared.judge_request_body.messages.map((item,index) => index === 1
+        ? { ...item, content:JSON.stringify(prepared.facts_packet,null,2) } : item) };
+  }
   const sufficiency = dsEvaluate(prepared.facts_packet.facts);
   prepared._data_enough = sufficiency.enough;
   prepared._data_sufficiency = sufficiency;
   if (!sufficiency.enough) prepared.judge = dsInsufficientJudge(sufficiency);
+  if (checkpoint) await checkStageLease();
   const analysis = await runAgents({
     prepared, pipelineGate, analytics: screenshotResult.output,
     screenshotStats: screenshotResult.output.screenshot_stats,
-    writerSystemPrompt, client: llm, now: evaluatedAt, rejectUnknownRoleProof: semanticChatRoles === true,
+    writerSystemPrompt, client: checkedLlm, now: evaluatedAt, rejectUnknownRoleProof: semanticChatRoles === true,
     repairProofErrors, silent, semanticChatRoles,
   });
   return {
@@ -184,6 +257,7 @@ export async function processDeal({
     ...roleFields(),
   };
   } catch (error) {
+    if (error instanceof PrejudgeStageError) throw error;
     // После вызова ролей исключение следующих стадий не должно незаметно
     // терять безопасный учёт уже сделанных запросов. Без подтверждённой
     // метаинформации сохраняем прежний контракт исключения.

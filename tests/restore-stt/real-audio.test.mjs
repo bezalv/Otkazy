@@ -28,6 +28,7 @@ test('настоящие ffmpeg и ffprobe обрабатывают тишину
     ...process.env, STT_KEY: key, STT_BIND: '127.0.0.1', STT_PORT: String(port),
     STT_FFMPEG_PATH: ffmpeg, STT_FFPROBE_PATH: ffprobe, WORK_DIR: work,
     LOG_FILE: join(work, 'service.log'), POLZA_API_KEY: 'test-only', RESERVE_MODEL: 'gigaam',
+    OTKAZY_MOCK_EMPTY_EVERY: '2',
     NODE_OPTIONS: `--require=${resolve('tests/restore-stt/mock-polza-only.cjs')}`,
   }, stdio: 'ignore' });
   t.after(async () => {
@@ -54,6 +55,7 @@ test('настоящие ffmpeg и ffprobe обрабатывают тишину
     assert.equal(body.channels, channels);
     assert.equal(body.polza_calls, 0);
     assert.deepEqual(body.segments, []);
+    assert.equal(body.transcription_coverage.status, 'no_empty_fragments');
   }
   const signal = join(work, 'signal.wav');
   await exec(ffmpeg, ['-v', 'error', '-y', '-f', 'lavfi', '-i', 'sine=frequency=440:sample_rate=16000:duration=1.2', '-ac', '2', signal]);
@@ -63,6 +65,11 @@ test('настоящие ffmpeg и ffprobe обрабатывают тишину
   assert.equal(response.status, 200);
   const result = await response.json();
   assert.equal(result.polza_calls, 2);
-  assert.deepEqual(result.segments.map(item => item.channel).sort(), [0, 1]);
+  assert.equal(result.segments.length, 1);
   assert.ok(result.segments.every(item => item.text === 'тестовая реплика'));
+  assert.equal(result.transcription_coverage.status, 'incomplete');
+  assert.equal(result.transcription_coverage.total_fragments, 2);
+  assert.equal(result.transcription_coverage.unrecognized_count, 1);
+  const gap = result.transcription_coverage.unrecognized_segments[0];
+  assert.ok([0,1].includes(gap.channel)); assert.ok(gap.end > gap.start);
 });

@@ -170,6 +170,19 @@ export function createJobQueue(pool, { uuid = randomUUID, lease = DEFAULT_LEASE_
       return result.rows.length === 1;
     },
 
+    // Запись разрешена только текущему владельцу и не перезаписывает ID.
+    async bindRetryTransition({ id, token, dealId, loseDate, stageHistoryId }) {
+      if (!validId(id) || !validId(token) || !Number.isSafeInteger(Number(dealId)) || Number(dealId) <= 0
+          || !exactMillisTimestamp(loseDate instanceof Date ? loseDate.toISOString() : loseDate)
+          || typeof stageHistoryId !== 'string' || !/^[1-9]\d{0,29}$/.test(stageHistoryId)) throw new TypeError('Некорректный переход');
+      const result = await pool.query(`UPDATE public.lost_processing_jobs SET origin_stage_history_id=$5,updated_at=clock_timestamp()
+        WHERE id=$1 AND lease_token=$2 AND deal_id=$3 AND lose_date=$4::timestamptz
+          AND trigger_type IN ('manual','nightly') AND status='processing' AND lease_until>clock_timestamp()
+          AND (origin_stage_history_id IS NULL OR origin_stage_history_id=$5)
+        RETURNING origin_stage_history_id`, [id,token,Number(dealId),loseDate,stageHistoryId]);
+      return result.rows.length === 1 && result.rows[0].origin_stage_history_id === stageHistoryId;
+    },
+
     // Происхождение старого ожидания не угадывается по дате. Останавливаем
     // только задание: исходную очередь аудио оператор сверит отдельно.
     async markAudioOriginNeedsReview(id, token, reason) {

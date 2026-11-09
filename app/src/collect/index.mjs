@@ -145,6 +145,28 @@ function validateEventHistory(history) {
   if (history[0].STAGE_ID !== 'C23:LOSE') throw new Error('История стадий ещё не подтверждает текущий отказ');
 }
 
+/** Достоверный текущий переход для повтора, до любой платной обработки. */
+export async function resolveCurrentTransition({ client, dealId, loseDate, wait = defaultWait }) {
+  const id = Number(dealId);
+  const expected = exactMillisTimestamp(loseDate instanceof Date ? loseDate.toISOString() : loseDate);
+  if (!client || typeof client.request !== 'function' || !Number.isSafeInteger(id) || id <= 0 || !expected) {
+    throw new TypeError('Не заданы данные для проверки перехода');
+  }
+  const deal = await request(client, 'crm.deal.get', { id }, wait);
+  if (!deal.result || typeof deal.result !== 'object' || Array.isArray(deal.result)
+      || typeof deal.result.STAGE_ID !== 'string' || !deal.result.STAGE_ID) throw new Error('Некорректная стадия сделки');
+  if (deal.result.STAGE_ID !== 'C23:LOSE') return { status: 'obsolete' };
+  const history = await list(client, 'crm.stagehistory.list', {
+    entityTypeId: 2, filter: { OWNER_ID: id }, order: { CREATED_TIME: 'DESC' },
+    select: ['ID', 'STAGE_ID', 'CREATED_TIME', 'CATEGORY_ID'],
+  }, page => Array.isArray(page) ? page : page?.items, wait, undefined, { strictHistory: true });
+  validateEventHistory(history);
+  const current = exactMillisTimestamp(history[0].CREATED_TIME);
+  if (current.getTime() > expected.getTime()) return { status: 'obsolete' };
+  if (current.getTime() !== expected.getTime()) throw new Error('История не подтверждает дату отказа');
+  return { status: 'current', stageHistoryId: String(history[0].ID) };
+}
+
 function skipReason(id, text) {
   const key = String(id ?? '').trim();
   const byId = Object.hasOwn(SKIP_REASONS, key) ? SKIP_REASONS[key] : null;
