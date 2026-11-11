@@ -136,8 +136,8 @@ test('поддельная или сериализованная нейтрал�
  assert.equal(check(callOutput.communications).block,false);
  callOutput.communications[1].text='Изменено';assert.equal(check(callOutput.communications).kind,'author_ambiguous');
 });
-test('отдельные image/video без FILE_ID блокируют оценку, файлы не скачиваются',async()=>{
- for(const type of ['image','video']){const f=fixture();f.collection.raw.sessions[0].history.files={77:{id:77,type,name:`asset.${type==='image'?'jpg':'mp4'}`}};
+test('отдельное изображение без FILE_ID блокирует оценку, файл не скачивается',async()=>{
+ for(const type of ['image']){const f=fixture();f.collection.raw.sessions[0].history.files={77:{id:77,type,name:`asset.${type==='image'?'jpg':'mp4'}`}};
   f.state.history=structuredClone(f.collection.raw.sessions[0].history);let downloads=0;
   const messages=(await normalizeCommunications({collection:f.collection,verifyFallbackSession:f.verifier,resolveFile:async()=>{downloads++;throw Error('лишний вызов');}})).deal_data.communications;
   assert.equal((await inference(messages)).calls,0);assert.equal(downloads,0);
@@ -145,8 +145,8 @@ test('отдельные image/video без FILE_ID блокируют оцен�
 });
 
 
-test('неидентифицируемые отдельные image/video и файлы неизвестного типа закрывают семантику',async()=>{
- for(const file of [{type:'image'},{type:'video'},{type:'application/octet-stream'},{}]){
+test('неидентифицируемые изображения и файлы неизвестного типа закрывают семантику',async()=>{
+ for(const file of [{type:'image'},{type:'application/octet-stream'},{}]){
   const f=fixture();f.collection.raw.sessions[0].history.files=[file];
   f.state.history=structuredClone(f.collection.raw.sessions[0].history);let downloads=0;
   const messages=(await normalizeCommunications({collection:f.collection,verifyFallbackSession:f.verifier,
@@ -157,6 +157,25 @@ test('неидентифицируемые отдельные image/video и ф�
  const f=fixture();f.collection.raw.sessions[0].history.files=[{type:'audio'}];
  f.state.history=structuredClone(f.collection.raw.sessions[0].history);
  await assert.rejects(normalized(f),/Неизвестен ID аудиофайла/);
+});
+test('видео без подписи и непривязанное видео не мешают разбору текста',async()=>{
+ const f=fixture(),h=f.collection.raw.sessions[0].history;
+ h.files={77:{id:77,type:'video',name:'clip.mp4'},78:{id:78,type:'video',name:'other.mp4'}};
+ h.message[60]={id:60,senderid:3,text:'',params:{FILE_ID:[77]},date:'2026-10-27T00:00:08Z'};
+ f.state.history=structuredClone(h);let downloads=0;
+ const result=await normalizeCommunications({collection:f.collection,verifyFallbackSession:f.verifier,
+   resolveFile:async()=>{downloads++;throw Error('видео не скачивается');}});
+ assert.equal(result.deal_data.communications.length,5);
+ assert.equal((await inference(result.deal_data.communications)).calls,1);
+ assert.equal(downloads,0);
+});
+test('подпись к видео сохраняется как текст без загрузки видео',async()=>{
+ const f=fixture(),h=f.collection.raw.sessions[0].history;
+ h.files={77:{id:77,type:'video',name:'clip.mp4'}};
+ h.message[60]={id:60,senderid:3,text:'Подпись к видео',params:{FILE_ID:[77]},date:'2026-10-27T00:00:08Z'};
+ f.state.history=structuredClone(h);
+ const messages=await normalized(f);assert.equal(messages.length,6);
+ assert.equal(messages[5].text,'Подпись к видео');assert.equal(messages[5]._has_files,false);
 });
 test('полная замена объекта истории до или во время ответа модели недопустима',async()=>{
  for(const when of ['before','during']){

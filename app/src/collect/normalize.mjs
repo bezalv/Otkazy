@@ -147,6 +147,18 @@ function audioMetadata(file) {
     || AUDIO_EXTENSIONS.includes(metadataExtension(file)));
 }
 
+// Видео не участвует в анализе отказов. При противоречивых метаданных
+// оставляем файл для обычной проверки, чтобы не потерять голосовое.
+function ignoredVideo(file) {
+  if (!file || typeof file !== 'object') return false;
+  const types = [file.type, file.TYPE, file.mimeType, file.MIME_TYPE, file.contentType]
+    .filter(value => typeof value === 'string').map(value => value.toLowerCase());
+  return types.some(value => value === 'video' || value.startsWith('video/'))
+    && !types.some(value => value === 'audio' || value.startsWith('audio/')
+      || value === 'image' || value.startsWith('image/'))
+    && !AUDIO_EXTENSIONS.includes(metadataExtension(file));
+}
+
 function knownNonAudio(file) {
   if (!file) return false;
   if (explicitNonAudio(file)) return true;
@@ -485,11 +497,12 @@ export async function normalizeCommunications({ collection, resolveFile, transcr
       const text = message.text || message.TEXT || '';
       const params = message.params || {};
       const fileIds = params.FILE_ID || params.fileId || [];
-      const ids = [...new Set((Array.isArray(fileIds) ? fileIds : [fileIds])
+      const allIds = [...new Set((Array.isArray(fileIds) ? fileIds : [fileIds])
         .filter(id => id != null && String(id) !== '' && String(id) !== '0').map(String))];
-      for (const fileId of ids) sessionFileRefs.add(fileId);
+      for (const fileId of allIds) sessionFileRefs.add(fileId);
+      const ids = allIds.filter(id => !ignoredVideo(byId.get(id)));
       const fingerprint = JSON.stringify([
-        text, [...ids].sort(), message.senderid ?? null, message.SENDER_ID ?? null,
+        text, [...allIds].sort(), message.senderid ?? null, message.SENDER_ID ?? null,
         message.author_id ?? null, message.AUTHOR_ID ?? null, message.date ?? message.DATE ?? null,
       ]);
       if (messageIds.has(identity)) {
@@ -544,10 +557,10 @@ export async function normalizeCommunications({ collection, resolveFile, transcr
       }
       if (link) audioItems.push({ event, fileId: null, link });
     }
-    // Непривязанный image/video остаётся частью истории, даже если отдельного
+    // Непривязанное изображение остаётся частью истории, даже если отдельного
     // сообщения у него нет. Без его содержания текстовый контекст неполон.
-    const scopedFiles = files.filter(file => file?.id != null && sessionFileRefs.has(String(file.id))
-      || withinCutoff(file?.date || file?.DATE || null));
+    const scopedFiles = files.filter(file => !ignoredVideo(file) && (file?.id != null && sessionFileRefs.has(String(file.id))
+      || withinCutoff(file?.date || file?.DATE || null)));
     if (scopedFiles.some(file => file?.id == null || (!sessionFileRefs.has(String(file.id)) && knownNonAudio(file)))) {
       if (cutoff !== null && messages.length === sessionMessageStart) {
         throw new TemporalScopeError('openlines', 'Вложение истории не связано с сообщением до отказа');
