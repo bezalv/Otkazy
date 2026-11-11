@@ -19,8 +19,8 @@ test('входящая очередь и job в изолированном Postg
   const db = new PGlite();
   t.after(() => db.close());
   await db.exec('CREATE ROLE anon; CREATE ROLE authenticated; CREATE TABLE lost_deal_analyses (id bigint primary key)');
-  await db.exec(readFileSync('supabase/migrations/20261105052525_lost_processing_jobs.sql', 'utf8'));
-  await db.exec(readFileSync('supabase/migrations/20261105065540_lost_bitrix_events.sql', 'utf8'));
+  await db.exec(readFileSync('db/proposals/worker-migration-fixtures/20261105052525_lost_processing_jobs.sql', 'utf8'));
+  await db.exec(readFileSync('db/proposals/worker-migration-fixtures/20261105065540_lost_bitrix_events.sql', 'utf8'));
   const query = (q, params) => typeof q === 'string' ? db.query(q, params) : db.query(q.text, q.values);
   const pool = { query, async connect() { return { query, release() {} }; } };
   const inbox = createLiveInbox(pool, config);

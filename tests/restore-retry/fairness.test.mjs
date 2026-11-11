@@ -14,7 +14,7 @@ test('отложенная двадцатка не блокирует други
   const db = new PGlite();
   try {
     await db.exec(readFileSync('tests/restore-persistence/synthetic-schema.sql', 'utf8'));
-    await db.exec(readFileSync('supabase/migrations/20261105052525_lost_processing_jobs.sql', 'utf8'));
+    await db.exec(readFileSync('db/proposals/worker-migration-fixtures/20261105052525_lost_processing_jobs.sql', 'utf8'));
     await db.exec(`CREATE TABLE test_attention (deal_id integer, lose_date timestamptz, retry_eligible boolean, last_attempt_at timestamptz);
       INSERT INTO test_attention SELECT n, '2026-11-01'::timestamptz, true, '2026-11-01'::timestamptz + n * interval '1 second' FROM generate_series(1, 21) n;
       CREATE VIEW public.lost_pipeline_attention AS SELECT * FROM test_attention;`);
@@ -52,7 +52,7 @@ test('уже ожидающая задача не создаёт второй н
   const db = new PGlite();
   try {
     await db.exec(readFileSync('tests/restore-persistence/synthetic-schema.sql', 'utf8'));
-    await db.exec(readFileSync('supabase/migrations/20261105052525_lost_processing_jobs.sql', 'utf8'));
+    await db.exec(readFileSync('db/proposals/worker-migration-fixtures/20261105052525_lost_processing_jobs.sql', 'utf8'));
     await db.exec(`CREATE VIEW public.lost_pipeline_attention AS
       SELECT 42::integer AS deal_id, '2026-11-04'::timestamptz AS lose_date, true AS retry_eligible, '2026-11-04'::timestamptz AS last_attempt_at`);
     const pool = { query: (query, values) => db.query(query, values), transaction: fn => db.transaction(fn) };
@@ -69,7 +69,7 @@ test('невыполненный пункт старого снимка не б�
   const db = new PGlite();
   try {
     await db.exec(readFileSync('tests/restore-persistence/synthetic-schema.sql', 'utf8'));
-    await db.exec(readFileSync('supabase/migrations/20261105052525_lost_processing_jobs.sql', 'utf8'));
+    await db.exec(readFileSync('db/proposals/worker-migration-fixtures/20261105052525_lost_processing_jobs.sql', 'utf8'));
     await db.exec(`CREATE VIEW public.lost_pipeline_attention AS
       SELECT n::integer AS deal_id, '2026-11-04'::timestamptz AS lose_date, true AS retry_eligible,
         '2026-11-04'::timestamptz AS last_attempt_at FROM generate_series(42,43) n`);

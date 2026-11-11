@@ -7,16 +7,16 @@ import { resolveCurrentTransition } from '../collect/index.mjs';
 
 // Входом служит только уже захваченное задание. Ошибки сохранения или потери
 // аренды не превращаются в результат сделки и оставляются очереди на восстановление.
-export function toPersistenceResult(job, outcome, audioOriginHistoryId = null) {
+export function toPersistenceResult(job, outcome, audioOriginHistoryId = null, verifiedRoleHistoryId = null) {
   const base = { deal_id: Number(job.deal_id), operation_id: job.id, lease_token: job.lease_token, silent: job.silent === true,
-    audio_origin_stage_history_id: audioOriginHistoryId };
+    audio_origin_stage_history_id: audioOriginHistoryId,
+    ...(verifiedRoleHistoryId ? {role_origin_stage_history_id:verifiedRoleHistoryId} : {}) };
   const collection = outcome?.collection || {};
   const transition = typeof job.request_key === 'string'
     ? /^bitrix24:deal-stage-history:([1-9]\d{0,29})$/.exec(job.request_key)?.[1] : null;
   const binding = {jobId:job.id,leaseToken:job.lease_token,dealId:String(job.deal_id),
-    // Пока только канонический ключ задания независимо проверяется в SQL.
-    // Для manual/nightly одного origin из вызывающего кода недостаточно.
-    stageHistoryId:transition,
+    // Этот ID ещё раз независимо проверяется под блокировкой задания в БД.
+    stageHistoryId:verifiedRoleHistoryId || transition,
     cutoff:job.lose_date instanceof Date && Number.isFinite(job.lose_date.getTime()) ? job.lose_date.toISOString() : job.lose_date};
   const roleMetadata = revalidateRoleInferenceMetadata(outcome?.chatRoleInferenceMetadata,binding);
   const roleUnaccounted = outcome?.chatRoleInferenceUnaccounted === true
@@ -71,7 +71,7 @@ export function toPersistenceResult(job, outcome, audioOriginHistoryId = null) {
  * Все зависимости передаются извне, реальных сетевых вызовов здесь нет.
  * delivery вызывается лишь после сохранения результата либо его восстановления.
  */
-export async function runJob({ job, queue, store, loadAudioWait, delivery, process = processDeal, processOptions = {}, heartbeatMs = 60000, resolveRetryTransition = resolveCurrentTransition }) {
+export async function runJob({ job, queue, store, loadAudioWait, delivery, createRoleInference, process = processDeal, processOptions = {}, heartbeatMs = 60000, resolveRetryTransition = resolveCurrentTransition }) {
   if (processOptions.semanticChatRoles === true) {
     throw new Error('Эксперимент определения ролей доступен только без записи и доставки');
   }
@@ -86,6 +86,9 @@ export async function runJob({ job, queue, store, loadAudioWait, delivery, proce
     throw new TypeError('Некорректная настройка сохранения материалов');
   }
   const stageEnabled = processOptions.persistInputsBeforeJudge === true;
+  if (createRoleInference !== undefined && (typeof createRoleInference !== 'function' || !stageEnabled)) {
+    throw new TypeError('Для определения авторов нужно предварительное сохранение');
+  }
   const sttPolicy = processOptions.sttAttemptPolicy;
   const engines=Array.isArray(sttPolicy?.expectedEngine) ? sttPolicy.expectedEngine : [sttPolicy?.expectedEngine];
   if (sttPolicy !== undefined && (!stageEnabled || !sttPolicy || typeof sttPolicy !== 'object'
@@ -195,7 +198,7 @@ export async function runJob({ job, queue, store, loadAudioWait, delivery, proce
         return {status:'needs_review',reason:'prejudge_materials_need_review'};
       }
     }
-    let outcome;
+    let outcome,semanticRoleActive=false;
     try {
       if ((['live', 'backfill'].includes(job.trigger_type) || String(job.request_key || '').startsWith('bitrix24:deal-stage-history:')) && !eventKey) {
         throw new Error('Некорректный ключ перехода');
@@ -208,8 +211,19 @@ export async function runJob({ job, queue, store, loadAudioWait, delivery, proce
       const runOptions = { ...processOptions };
       delete runOptions.persistInputsBeforeJudge;
       delete runOptions.sttAttemptPolicy;
+      let roleOptions={};
+      if (createRoleInference) {
+        await checkLease();
+        const deps=await createRoleInference({job,stageScope,checkLease});
+        if (!deps?.sessionContext || !deps?.roleClient) throw new Error('Не созданы зависимости определения авторов');
+        roleOptions={semanticChatRoles:true,roleSessionContext:deps.sessionContext,
+          verifyFallbackSession:deps.sessionContext.verify,verifyLatestSession:deps.sessionContext.verify,
+          roleInferenceClient:deps.roleClient};
+        semanticRoleActive=true;
+        await checkLease();
+      }
       outcome = await process({ ...runOptions, dealId: Number(job.deal_id), expectedLoseDate: job.lose_date, expectedHistoryId: eventKey ? eventKey[1] : audioHistoryId || retryHistoryId,
-        silent: job.silent === true, screenshots: job.screenshots === true,
+        silent: job.silent === true, screenshots: job.screenshots === true, ...roleOptions,
         ...(stageEnabled ? { prejudgeCheckpoint:async args => {
           await checkLease();
           return store.savePrejudgeArtifact({ ...args, operationId:job.id, leaseToken:job.lease_token });
@@ -238,7 +252,14 @@ export async function runJob({ job, queue, store, loadAudioWait, delivery, proce
       }
       return { status: 'obsolete' };
     }
-    const result = toPersistenceResult(job, outcome, audioHistoryId);
+    let result = toPersistenceResult(job, outcome, audioHistoryId, stageScope?.stageHistoryId ?? null);
+    if (semanticRoleActive && result._status==='processed' && result.role_inference_unaccounted===true) {
+      // Непроверенные provenance/учёт не могут сопровождать успешный вердикт.
+      // Факт возможного расхода сохраняется в ошибке, без текста ответа модели.
+      outcome={...outcome,status:'error',analysis:{pipeline_error:'Не подтверждён учёт определения авторов'},
+        chatRoleInferenceUnaccounted:true};
+      result=toPersistenceResult(job,outcome,audioHistoryId,stageScope?.stageHistoryId ?? null);
+    }
     const stored = await store.persistResult(result);
     if (!stored.needsExternalActions) return { status: stored.status, analysisId: stored.analysisId || null,
       ...(outcome?.audioWait?.reason === 'audio_wait_terminal_recordings_missing'

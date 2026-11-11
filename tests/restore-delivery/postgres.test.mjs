@@ -10,7 +10,7 @@ import { createBitrixClient } from '../../app/src/bitrix-client.mjs';
 import { createBitrixLimiter } from '../../app/src/bitrix-limiter.mjs';
 
 const pglite = resolve('tmp/pgtest/node_modules/@electric-sql/pglite/dist/index.js');
-const migration = readFileSync('supabase/migrations/20261105052525_lost_processing_jobs.sql', 'utf8');
+const migration = readFileSync('db/proposals/worker-migration-fixtures/20261105052525_lost_processing_jobs.sql', 'utf8');
 const lease = '00000000-0000-4000-8000-000000000099';
 const jobId = n => `00000000-0000-4000-8000-${String(n).padStart(12, '0')}`;
 

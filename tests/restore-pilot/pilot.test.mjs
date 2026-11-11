@@ -39,10 +39,11 @@ test('белый список блокирует запись и неизвес�
   }
   assert.deepEqual(seen, []);
   for (const method of ['crm.deal.userfield.list', 'crm.deal.get', 'crm.stagehistory.list', 'crm.activity.list',
-    'crm.timeline.comment.list', 'imopenlines.crm.chat.get', 'imopenlines.session.history.get', 'tasks.task.list', 'disk.file.get']) {
+    'crm.timeline.comment.list', 'imopenlines.crm.chat.get', 'imopenlines.session.history.get', 'imopenlines.v2.Session.list',
+    'tasks.task.list', 'disk.file.get']) {
     await reader.request(method, {});
   }
-  assert.equal(seen.length, 9);
+  assert.equal(seen.length, 10);
   assert.deepEqual(Object.keys(reader), ['request']);
   assert.equal(Object.isFrozen(reader), true);
 });

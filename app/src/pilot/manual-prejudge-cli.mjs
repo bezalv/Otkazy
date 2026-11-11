@@ -12,7 +12,7 @@ import { runManualPrejudge } from './manual-prejudge.mjs';
 import { startSttService } from '../stt/child.mjs';
 import { exactMillisTimestamp } from '../time-precision.mjs';
 
-const ROLES = new Set(['judge', 'writer', 'screenshots']);
+const ROLES = new Set(['judge', 'writer', 'screenshots', 'chat-role-inference']);
 const STATUS = new Set(['processed', 'blocked', 'error', 'waiting', 'skip', 'skipped', 'skipped_by_reason', 'obsolete_transition', 'source_incomplete']);
 const VERDICTS = new Set(['правомерен', 'неправомерен', 'недостаточно_данных']);
 
@@ -53,13 +53,20 @@ export function parseManualPrejudgeOptions(args, env = process.env) {
   const sttReserveRub = money(env.TEST_POLZA_STT_RESERVE_RUB, 'резерв STT');
   const modelReserveRub = money(env.TEST_POLZA_MODEL_RESERVE_RUB, 'резерв модели');
   const maxSttParts = integer(env.TEST_POLZA_MAX_STT_PARTS, 'предел фрагментов', 10000);
+  const semanticRolesFrom = env.TEST_CHAT_ROLES_FROM;
+  if (semanticRolesFrom !== undefined && (!exactMillisTimestamp(semanticRolesFrom)
+      || Date.parse(semanticRolesFrom) > Date.parse(args[2])
+      || Date.parse(args[2]) - Date.parse(semanticRolesFrom) > 366 * 24 * 60 * 60 * 1000)) {
+    throw new TypeError('Некорректное окно проверки сессии');
+  }
   const lock = tempPath(env.TEST_POLZA_LOCK_PATH, 'путь блокировки');
   const journal = tempPath(env.TEST_POLZA_JOURNAL_PATH, 'путь журнала');
   if (lock === journal || limitRub > 500 || priorReservedRub >= limitRub || sttReserveRub > limitRub || modelReserveRub > limitRub) {
     throw new TypeError('Некорректные ограничения теста');
   }
   return { dealId, stageHistoryId:args[1], loseDate:args[2], databaseUrl, bitrixBaseUrl, polzaKey,
-    baselineRub, priorReservedRub, limitRub, sttReserveRub, modelReserveRub, maxSttParts, lock, journal };
+    baselineRub, priorReservedRub, limitRub, sttReserveRub, modelReserveRub, maxSttParts, lock, journal,
+    ...(semanticRolesFrom === undefined ? {} : {semanticRolesFrom}) };
 }
 
 async function boundedJson(response, signal, max = 2 * 1024 * 1024) {
@@ -79,7 +86,7 @@ async function boundedJson(response, signal, max = 2 * 1024 * 1024) {
 export function createManualPaidAdapters({ key, guard, signal, fetchImpl = fetch, sttReserveRub, modelReserveRub, maxSttParts }) {
   if (typeof key !== 'string' || !key || !guard?.run || !guard?.runUnpricedAudio || !signal?.throwIfAborted
       || typeof fetchImpl !== 'function' || !Number.isSafeInteger(maxSttParts) || maxSttParts < 1) throw new TypeError('Бюджетный транспорт не задан');
-  let parts = 0; const calls = { judge:0, writer:0, screenshots:0 };
+  let parts = 0; const calls = { judge:0, writer:0, screenshots:0, 'chat-role-inference':0 };
   const transcribe = async ({ audio, model, signal: inner }) => {
     if (!Buffer.isBuffer(audio) || audio.length < 1 || audio.length > 1024 * 1024 || model !== 'ai-sage/gigaam-v3'
         || !inner?.throwIfAborted || ++parts > maxSttParts) throw new Error('Аудиофрагмент не допущен');
@@ -98,13 +105,20 @@ export function createManualPaidAdapters({ key, guard, signal, fetchImpl = fetch
   };
   const llm = Object.freeze({ async complete(body, options = {}) {
     const role = options.role;
-    if (!ROLES.has(role) || ++calls[role] > (role === 'judge' ? 2 : role === 'writer' ? 1 : 10)
+    if (!ROLES.has(role) || ++calls[role] > (role === 'judge' ? 2 : role === 'writer' ? 1 : role === 'chat-role-inference' ? 3 : 10)
         || !body || typeof body !== 'object' || Array.isArray(body)
         || body.model !== (role === 'screenshots' ? 'anthropic/claude-sonnet-4.6' : 'openai/gpt-6-sol')
         || !Number.isSafeInteger(body.max_tokens)
         || body.max_tokens < 1 || body.max_tokens > 16000) throw new Error('Запрос модели не допущен');
     const payload = JSON.stringify(body);
     if (Buffer.byteLength(payload) > 15 * 1024 * 1024) throw new Error('Запрос модели слишком большой');
+    if (role === 'chat-role-inference') {
+      // Верхняя оценка токенов по байтам и завышенные тарифы (руб/млн),
+      // включая запас на служебные токены, до разрешения платного запроса.
+      const bytes=Buffer.byteLength(payload);
+      const upperRub=((bytes+4096)*150+body.max_tokens*700)/1_000_000;
+      if (bytes>100_000 || upperRub>modelReserveRub) throw new Error('Резерв модели недостаточен');
+    }
     const result = await guard.run(modelReserveRub, async ({ signal: budgetSignal }) => {
       const combined = AbortSignal.any([signal, budgetSignal, AbortSignal.timeout(180000)]);
       const response = await fetchImpl('https://api.polza.ai/api/v1/chat/completions', {
@@ -160,6 +174,7 @@ export async function runManualPrejudgeCommand({ args, env = process.env, fetchI
     dependencies = makeDependencies({ bitrixBaseUrl:config.bitrixBaseUrl, polzaKey:config.polzaKey,
       sttUrl:service.address, sttKey:service.key, tempRoot:service.tempRoot, signal, fetchImpl });
     const out = await run({ pool, dealId:config.dealId, stageHistoryId:config.stageHistoryId, loseDate:config.loseDate,
+      ...(config.semanticRolesFrom === undefined ? {} : {semanticRolesFrom:config.semanticRolesFrom}),
       options:{ bitrix:dependencies.bitrix, llm:paid.llm, transcribe:dependencies.transcribe,
         resolveFile:id => dependencies.bitrix.request('disk.file.get', { id }), downloadFile:dependencies.downloadFile,
         ...prompts, audioWaitEnabledAt:baseline.audio_wait_enabled_at, savedAudioWait:baseline.baselines[0].saved_audio_wait ?? null,
@@ -170,7 +185,8 @@ export async function runManualPrejudgeCommand({ args, env = process.env, fetchI
     await mark({ phase:'completed', status, calls:paid.snapshot(), budget:guard.snapshot() });
     return { status, verdict, run_id:out?.runId ?? null, silent:true, delivery:false,
       result_saved:out?.resultSaved === true,
-      limitations:['semantic_roles_not_enabled','unpriced_stt_reserves_retained'] };
+      limitations:[config.semanticRolesFrom === undefined ? 'semantic_roles_not_enabled' : 'semantic_roles_are_inference',
+        'unpriced_stt_reserves_retained'] };
   } catch (error) {
     if (journal) { try { await mark({ phase:'stopped' }); } catch { /* Предыдущий резерв остаётся зафиксированным. */ } }
     throw error;

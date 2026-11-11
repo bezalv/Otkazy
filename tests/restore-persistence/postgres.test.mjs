@@ -8,7 +8,7 @@ import { enqueueDueAudioChecks } from '../../app/src/audio-wait/scheduler.mjs';
 
 const pglitePath = resolve('tmp/pgtest/node_modules/@electric-sql/pglite/dist/index.js');
 const schema = readFileSync('tests/restore-persistence/synthetic-schema.sql', 'utf8');
-const migration = readFileSync('supabase/migrations/20261105052525_lost_processing_jobs.sql', 'utf8');
+const migration = readFileSync('db/proposals/worker-migration-fixtures/20261105052525_lost_processing_jobs.sql', 'utf8');
 const leaseToken = '00000000-0000-4000-8000-000000000099';
 const operation = (n) => `00000000-0000-4000-8000-${String(n).padStart(12, '0')}`;
 const deal = { deal_id: 42, title: "Тест'; SELECT 7; --", stage_id: 'C23:LOSE', lose_date: '2026-11-02T00:00:00Z', lose_reason: 'Цена', product_type: ['окна'] };
@@ -39,8 +39,8 @@ test('реальный SQL в изолированной БД PGlite', { skip: !
   try {
     await db.exec(schema);
     await db.exec(migration);
-    await db.exec(readFileSync('supabase/migrations/20261106031734_lost_audio_wait_origins.sql', 'utf8'));
-    await db.exec(readFileSync('supabase/migrations/20261105065551_lost_overwrite_history.sql', 'utf8'));
+    await db.exec(readFileSync('db/proposals/worker-migration-fixtures/20261106031734_lost_audio_wait_origins.sql', 'utf8'));
+    await db.exec(readFileSync('db/proposals/worker-migration-fixtures/20261105065551_lost_overwrite_history.sql', 'utf8'));
     const pool = {
       query(text, values) { return db.query(text, values); },
       async connect() {

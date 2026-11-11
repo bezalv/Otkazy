@@ -13,7 +13,7 @@ test('ожидающие записи ставятся в очередь оди�
   const db = new PGlite();
   try {
     await db.exec(readFileSync('tests/restore-persistence/synthetic-schema.sql', 'utf8'));
-    await db.exec(readFileSync('supabase/migrations/20261105052525_lost_processing_jobs.sql', 'utf8'));
+    await db.exec(readFileSync('db/proposals/worker-migration-fixtures/20261105052525_lost_processing_jobs.sql', 'utf8'));
     await db.query(`INSERT INTO public.lost_audio_wait
       (deal_id,lose_date,state,first_seen_at,deadline_at,next_check_at,silent,screenshots)
       VALUES (42,'2026-10-01T00:00:00Z','waiting','2026-10-01T00:00:00Z','2026-10-02T00:00:00Z','2026-10-01T00:05:00Z',true,true)`);

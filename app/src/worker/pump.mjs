@@ -5,7 +5,7 @@ import { savePrejudgeArtifact, hasPrejudgeArtifacts, hasUnsafePrejudgeResume, ma
 import { claimSttAttempt, completeSttAttempt } from '../persistence/stt-attempts.mjs';
 
 // Один явный такт. Модуль сам не создаёт таймер и не начинает обработку при импорте.
-export function createWorkerPump({ pool, queue, processOptions, delivery, operations = {} }) {
+export function createWorkerPump({ pool, queue, processOptions, delivery, createRoleInference, operations = {} }) {
   if (!pool || !queue || !processOptions) throw new TypeError('Не заданы зависимости обработчика');
   const recover = operations.recover || (() => queue.recoverExpired());
   const schedule = operations.schedule || (() => enqueueDueAudioChecks(pool));
@@ -36,6 +36,7 @@ export function createWorkerPump({ pool, queue, processOptions, delivery, operat
             } : {}) },
           loadAudioWait: item => loadAudioWait(pool, item),
           delivery,
+          ...(createRoleInference ? {createRoleInference} : {}),
           processOptions: { ...processOptions, audioWaitEnabledAt },
         });
         return { status: 'handled', enqueued: enqueued.length, result };

@@ -1,5 +1,5 @@
 -- ПРОЕКТ для ручного staging. НЕ полная миграция и НЕ запуск автоматики.
--- Фрагмент очереди из supabase/migrations/20261105052525_lost_processing_jobs.sql;
+-- Фрагмент очереди из db/proposals/worker-migration-fixtures/20261105052525_lost_processing_jobs.sql;
 -- существующие lost_deal_analyses и ночной реестр здесь не изменяются.
 create table public.lost_processing_jobs (
   id uuid primary key,

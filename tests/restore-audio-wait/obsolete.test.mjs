@@ -12,8 +12,8 @@ test('устаревший переход отменяет только своё
   const db = new PGlite();
   try {
     await db.exec(readFileSync('tests/restore-persistence/synthetic-schema.sql', 'utf8'));
-    await db.exec(readFileSync('supabase/migrations/20261105052525_lost_processing_jobs.sql', 'utf8'));
-    await db.exec(readFileSync('supabase/migrations/20261106031734_lost_audio_wait_origins.sql', 'utf8'));
+    await db.exec(readFileSync('db/proposals/worker-migration-fixtures/20261105052525_lost_processing_jobs.sql', 'utf8'));
+    await db.exec(readFileSync('db/proposals/worker-migration-fixtures/20261106031734_lost_audio_wait_origins.sql', 'utf8'));
     await db.exec(`INSERT INTO lost_audio_wait
       (deal_id,lose_date,state,first_seen_at,deadline_at,next_check_at,origin_stage_history_id)
       VALUES (42,'2026-10-01','waiting','2026-10-01','2026-10-02','2026-10-01','101')`);

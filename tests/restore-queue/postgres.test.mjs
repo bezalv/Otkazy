@@ -6,7 +6,7 @@ import { test } from 'node:test';
 import { createJobQueue } from '../../app/src/queue/index.mjs';
 
 const packagePath = resolve('tmp/pgtest/node_modules/@electric-sql/pglite/dist/index.js');
-const migrationPath = resolve('supabase/migrations/20261105052525_lost_processing_jobs.sql');
+const migrationPath = resolve('db/proposals/worker-migration-fixtures/20261105052525_lost_processing_jobs.sql');
 
 test('миграция и очередь на локальном движке PostgreSQL', { skip: !existsSync(packagePath) }, async t => {
   const { PGlite } = await import(pathToFileURL(packagePath).href);

@@ -14,8 +14,8 @@ test('общий ключ перехода сохраняет первое за�
   const db = new PGlite();
   t.after(() => db.close());
   await db.exec('CREATE ROLE anon; CREATE ROLE authenticated; CREATE TABLE lost_deal_analyses (id bigint primary key)');
-  await db.exec(readFileSync('supabase/migrations/20261105052525_lost_processing_jobs.sql', 'utf8'));
-  await db.exec(readFileSync('supabase/migrations/20261105065540_lost_bitrix_events.sql', 'utf8'));
+  await db.exec(readFileSync('db/proposals/worker-migration-fixtures/20261105052525_lost_processing_jobs.sql', 'utf8'));
+  await db.exec(readFileSync('db/proposals/worker-migration-fixtures/20261105065540_lost_bitrix_events.sql', 'utf8'));
   const queue = createJobQueue(db);
   await assert.rejects(queue.enqueue(backfill), /до включения/);
   await db.query('INSERT INTO lost_live_config (id, enabled_at) VALUES (true, $1)', ['2026-11-01T00:00:00Z']);
@@ -59,8 +59,8 @@ test('микросекунды в cutoff или сохранённой дате 
   const db = new PGlite();
   t.after(() => db.close());
   await db.exec('CREATE ROLE anon; CREATE ROLE authenticated; CREATE TABLE lost_deal_analyses (id bigint primary key)');
-  await db.exec(readFileSync('supabase/migrations/20261105052525_lost_processing_jobs.sql', 'utf8'));
-  await db.exec(readFileSync('supabase/migrations/20261105065540_lost_bitrix_events.sql', 'utf8'));
+  await db.exec(readFileSync('db/proposals/worker-migration-fixtures/20261105052525_lost_processing_jobs.sql', 'utf8'));
+  await db.exec(readFileSync('db/proposals/worker-migration-fixtures/20261105065540_lost_bitrix_events.sql', 'utf8'));
   await db.query("INSERT INTO lost_live_config (id,enabled_at) VALUES (true,'2026-11-01T00:00:00.000500Z')");
   const queue = createJobQueue(db);
   await assert.rejects(queue.enqueue({ ...backfill, loseDate: '2026-11-01T00:00:00.000Z' }), /до включения/);
@@ -75,8 +75,8 @@ test('конкурентное обнаружение одного перехо�
   const db = new PGlite();
   t.after(() => db.close());
   await db.exec('CREATE ROLE anon; CREATE ROLE authenticated; CREATE TABLE lost_deal_analyses (id bigint primary key)');
-  await db.exec(readFileSync('supabase/migrations/20261105052525_lost_processing_jobs.sql', 'utf8'));
-  await db.exec(readFileSync('supabase/migrations/20261105065540_lost_bitrix_events.sql', 'utf8'));
+  await db.exec(readFileSync('db/proposals/worker-migration-fixtures/20261105052525_lost_processing_jobs.sql', 'utf8'));
+  await db.exec(readFileSync('db/proposals/worker-migration-fixtures/20261105065540_lost_bitrix_events.sql', 'utf8'));
   await db.query("INSERT INTO lost_live_config (id, enabled_at) VALUES (true, '2026-11-01T00:00:00Z')");
   const queue = createJobQueue(db);
   const results = await Promise.all([

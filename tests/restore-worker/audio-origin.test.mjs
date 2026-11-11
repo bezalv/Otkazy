@@ -18,9 +18,9 @@ test('ожидание хранит ID при перезапуске, неодн
   const db = new PGlite();
   t.after(() => db.close());
   for (const filename of ['tests/restore-persistence/synthetic-schema.sql',
-    'supabase/migrations/20261105052525_lost_processing_jobs.sql',
-    'supabase/migrations/20261105065551_lost_overwrite_history.sql',
-    'supabase/migrations/20261106031734_lost_audio_wait_origins.sql']) await db.exec(readFileSync(filename, 'utf8'));
+    'db/proposals/worker-migration-fixtures/20261105052525_lost_processing_jobs.sql',
+    'db/proposals/worker-migration-fixtures/20261105065551_lost_overwrite_history.sql',
+    'db/proposals/worker-migration-fixtures/20261106031734_lost_audio_wait_origins.sql']) await db.exec(readFileSync(filename, 'utf8'));
   const query = (q, values) => typeof q === 'string' ? db.query(q, values) : db.query(q.text, q.values);
   const pool = { query, async connect() { return { query, release() {} }; } };
   const deps = () => ({ queue: createJobQueue(pool), store: { persistResult: data => persistResult(pool, data),
@@ -135,7 +135,7 @@ test('миграция аудио атомарно откатывается и �
   const db = new PGlite();
   t.after(() => db.close());
   await db.exec(readFileSync('tests/restore-persistence/synthetic-schema.sql', 'utf8'));
-  const migration = readFileSync('supabase/migrations/20261106031734_lost_audio_wait_origins.sql', 'utf8');
+  const migration = readFileSync('db/proposals/worker-migration-fixtures/20261106031734_lost_audio_wait_origins.sql', 'utf8');
   await db.exec(`BEGIN; ${migration} ROLLBACK;`);
   assert.equal((await db.query("SELECT count(*)::int AS n FROM information_schema.columns WHERE table_schema='public' AND table_name='lost_audio_wait' AND column_name='origin_stage_history_id'")).rows[0].n, 0);
   await db.exec(migration);

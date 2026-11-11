@@ -7,7 +7,7 @@ import { listPilotCandidates, loadPilotBaselines } from '../../app/src/pilot/can
 
 const pglitePath = resolve('tmp/pgtest/node_modules/@electric-sql/pglite/dist/index.js');
 const schema = readFileSync('tests/restore-persistence/synthetic-schema.sql', 'utf8');
-const migration = readFileSync('supabase/migrations/20261105052525_lost_processing_jobs.sql', 'utf8');
+const migration = readFileSync('db/proposals/worker-migration-fixtures/20261105052525_lost_processing_jobs.sql', 'utf8');
 const date = '2026-11-01T01:00:00Z';
 const facts = sources => JSON.stringify({ facts: sources.map(source => ({ source, content: 'синтетический факт' })) });
 

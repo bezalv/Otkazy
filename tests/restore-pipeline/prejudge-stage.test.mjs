@@ -5,6 +5,9 @@ import { PrejudgeStageError } from '../../app/src/persistence/prejudge.mjs';
 import { normalizeCommunications } from '../../app/src/collect/normalize.mjs';
 import { runJob } from '../../app/src/worker/run-job.mjs';
 import { SttAttemptsExhaustedError } from '../../app/src/persistence/stt-attempts.mjs';
+import { createServer } from 'node:http';
+import { resolve } from 'node:path';
+import { createSttClient } from '../../app/src/stt-client.mjs';
 
 const nowMs = Date.parse('2026-11-05T00:00:00Z');
 function fixture(events) {
@@ -61,6 +64,60 @@ test('неполное распознавание сохраняет интер�
   assert.ok(facts.some(f=>f.content.includes('не распознано фрагментов 1 из 2') && f.content.includes('10.25–12.5')));
   assert.ok(!facts.some(f=>f.content.includes('разговор не состоялся')));
   assert.deepEqual(seen.facts,facts);
+});
+
+for (const requested of [2,1]) test(`подтверждённый пустой ${requested===2?'stereo':'mono'} ответ сохраняется до решения`, async()=>{
+  const events=[],args=fixture(events),artifacts=[];
+  const server=createServer(async(req,res)=>{
+    if(req.url==='/audio'){res.end(Buffer.alloc(2048,17));return;}
+    for await(const _ of req){};
+    const mode=new URL(req.url,'http://localhost').searchParams.get('channels');
+    if(requested===1 && mode==='stereo'){
+      res.writeHead(422,{'Content-Type':'application/json'});res.end(JSON.stringify({ok:false,error:{code:'channels_mismatch',retryable:false}}));return;
+    }
+    const channels=mode==='mono'?1:2;
+    res.writeHead(200,{'Content-Type':'application/json'});res.end(JSON.stringify({ok:true,model:'ai-sage/gigaam-v3',
+      channels,duration_sec:70,segments:[],transcription_coverage:{version:1,status:'incomplete',total_fragments:1,
+        unrecognized_count:1,unrecognized_segments:[{channel:channels-1,start:1,end:2}]}}));
+  });
+  await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));const base=`http://127.0.0.1:${server.address().port}`;
+  try {
+    const client=createSttClient({bitrix:{request:async()=>({result:{DOWNLOAD_URL:`${base}/audio`}})},
+      sttUrl:base,sttKey:'test-only',tempRoot:resolve('tmp')});
+    args.transcribe=async req=>{events.push(`stt:${req.activity_id}:${req.channel_count}`);return client(req);};
+    args.prejudgeCheckpoint=async({artifact})=>{artifacts.push(artifact);events.push(`save:${artifact.type}`);return {saved:true};};
+    const result=await processDeal(args);assert.equal(result.status,'processed');
+    const empty=artifacts.filter(a=>a.type==='transcript');assert.equal(empty.length,2);
+    assert.ok(empty.every(a=>a.payload.status==='verified_stt_response' && a.payload.transcript.formatted_dialog===''
+      && a.payload.source.channel_count===requested && a.payload.transcript.transcription_coverage.status==='incomplete'));
+    assert.ok(events.lastIndexOf('save:transcript')<events.indexOf('save:judge_input'));
+  } finally {server.closeAllConnections?.();await new Promise(resolve=>server.close(resolve));}
+});
+
+test('фальшивый SHA пустого результата не создаёт запись и не запускает судью', async()=>{
+  const events=[],args=fixture(events);
+  args.prejudgeCheckpoint=async({artifact})=>{events.push(`save:${artifact.type}`);return {saved:true};};
+  args.transcribe=async req=>({success:true,activity_id:req.activity_id,formatted_dialog:'',manager_text:'',client_text:'',
+    conversation:[],total_replicas:0,channel_count:2,transcript_engine:'reserve:gigaam',audio_sha256:'a'.repeat(64),
+    reserve_duration_sec:70,transcription_coverage:{version:1,status:'incomplete',total_fragments:1,unrecognized_count:1,
+      unrecognized_segments:[{channel:0,start:1,end:2}]}});
+  await assert.rejects(processDeal(args),PrejudgeStageError);
+  assert.ok(!events.includes('save:transcript'));assert.ok(!events.some(x=>x.startsWith('llm:')));
+});
+
+test('старый пустой ответ без карты покрытия остаётся неизвестным и сохраняет mono fallback', async()=>{
+  const events=[],args=fixture(events),artifacts=[];
+  args.prejudgeCheckpoint=async({artifact})=>{artifacts.push(artifact);return {saved:true};};
+  args.transcribe=async req=>{events.push(req.channel_count);return req.channel_count===2
+    ? {success:true,activity_id:req.activity_id,channel_count:2,formatted_dialog:''}
+    : {success:true,activity_id:req.activity_id,channel_count:1,formatted_dialog:'Говорящий: Я уже купил в другом месте',
+      client_text:'',manager_text:'Я уже купил в другом месте',total_replicas:1,
+      conversation:[{id:1,speaker:'Говорящий',text:'Я уже купил в другом месте'}]};};
+  const result=await processDeal(args);assert.equal(result.status,'processed');
+  assert.deepEqual(events,[2,1,2,1]);
+  const transcripts=artifacts.filter(a=>a.type==='transcript');assert.equal(transcripts.length,2);
+  assert.ok(transcripts.every(a=>a.payload.source.channel_count===1));
+  assert.ok(!transcripts.some(a=>a.payload.transcript.formatted_dialog===''));
 });
 
 test('судья получает ровно сохранённый пакет без секретов в ссылках', async () => {

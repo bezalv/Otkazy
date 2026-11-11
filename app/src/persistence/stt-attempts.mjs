@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { inTransaction } from './transaction.mjs';
-import { PrejudgeStageError, prepareTranscriptArtifact, rehydrateVerifiedTranscript, transcriptSourceKey } from './prejudge.mjs';
+import { PrejudgeStageError, prepareTranscriptArtifact, rehydrateVerifiedTranscript, transcriptSourceKey, isLegacyEmptyTranscript } from './prejudge.mjs';
 import { ambiguousProcessingOnly } from '../calls/transcript-quality.mjs';
 import { verifiedAudioHash } from '../stt-client.mjs';
 
@@ -84,6 +84,16 @@ export async function claimSttAttempt(pool, { scope, request, audioSha256, polic
         }
         const cached=rehydrateVerifiedTranscript(row.transcript,request,audioSha256,expectedEngine);
         if (cached) { await stillLeased(c,scope); return {cached}; }
+        // До появления duration в payload пустые результаты могли попасть в
+        // completed. Сохраняем исходную запись как доказательство попытки,
+        // но не используем её как валидный кэш; разрешена только существующая
+        // вторая попытка для тех же байтов и политики.
+        const old=row.transcript,allowed=Array.isArray(expectedEngine)?expectedEngine:[expectedEngine];
+        if (old.status==='verified_stt_response' && old.source?.source_identity_sha256===key
+            && old.source?.audio_bytes_sha256===audioSha256 && allowed.includes(old.transcript?.transcript_engine)
+            && isLegacyEmptyTranscript({success:true,...old.transcript})) {
+          continue;
+        }
         throw new Error('Результат не соответствует политике распознавания');
       }
       if (same.length >= 2) { await stillLeased(c,scope); return {exhausted:true}; }
@@ -104,10 +114,14 @@ export async function claimSttAttempt(pool, { scope, request, audioSha256, polic
 export async function completeSttAttempt(pool, { scope, request, result, audioSha256, policySha256, expectedEngine, attempt }) {
   const key=validate(scope,request,audioSha256,policySha256,expectedEngine);
   if (!uuid(attempt?.attemptId)) throw new PrejudgeStageError();
-  let payload;
+  let payload,legacyEmpty=false;
   if (result?.success===false && result.channels_mismatch===true && result.retryable===false
       && Number(request.channel_count)===2 && verifiedAudioHash(result,request)===audioSha256) {
     payload={status:'channel_mismatch',source_key:key,audio_sha256:audioSha256};
+  } else if (isLegacyEmptyTranscript(result)) {
+    const allowed=Array.isArray(expectedEngine)?expectedEngine:[expectedEngine];
+    if (!allowed.includes(result?.transcript_engine) || verifiedAudioHash(result,request)!==audioSha256) throw new PrejudgeStageError();
+    legacyEmpty=true;
   } else {
     let artifact;
     try { artifact=prepareTranscriptArtifact(request,result,{allowEmpty:true}); } catch { throw new PrejudgeStageError(); }
@@ -117,11 +131,11 @@ export async function completeSttAttempt(pool, { scope, request, result, audioSh
         || artifact.payload.source.audio_bytes_sha256!==audioSha256) throw new PrejudgeStageError();
     payload=artifact.payload;
   }
-  const checksum=hash(canonical(payload));
+  const checksum=legacyEmpty ? null : hash(canonical(payload));
   try {
     return await inTransaction(pool,async c=>{
       await authorize(c,scope);
-      if (ambiguousProcessingOnly(result)) {
+      if (legacyEmpty || ambiguousProcessingOnly(result)) {
         const unknown=await c.query({text:`UPDATE public.lost_prejudge_stt_attempts SET status='unknown'
           WHERE attempt_id=$1 AND deal_id=$2 AND stage_history_id=$3 AND lose_date=$4::timestamptz
             AND source_key=$5 AND audio_sha256=$6 AND policy_sha256=$7 AND owner_job_id=$8 AND owner_lease_token=$9

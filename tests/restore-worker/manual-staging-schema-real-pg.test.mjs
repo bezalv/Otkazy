@@ -49,7 +49,7 @@ beforeEach(async () => {
 after(async () => { if (pool) await pool.end(); });
 
 test('фрагмент queue совпадает с готовой миграцией и не меняет других таблиц', async () => {
-  const original = await readFile(new URL('../../supabase/migrations/20261105052525_lost_processing_jobs.sql', import.meta.url), 'utf8');
+  const original = await readFile(new URL('../../db/proposals/worker-migration-fixtures/20261105052525_lost_processing_jobs.sql', import.meta.url), 'utf8');
   const proposal = await readFile(new URL('../../db/proposals/20261109_manual_staging_queue.sql', import.meta.url), 'utf8');
   const statements = text => text.replace(/--[^\n]*/g,'').split(';').map(s=>s.replace(/\s+/g,' ').trim().toLowerCase()).filter(Boolean);
   const source = statements(original), selected = statements(proposal);

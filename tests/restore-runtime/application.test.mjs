@@ -401,8 +401,8 @@ test('готовность читает реальные состояния оч
   const db = new PGlite();
   try {
     await db.exec(readFileSync('tests/restore-persistence/synthetic-schema.sql', 'utf8'));
-    await db.exec(readFileSync('supabase/migrations/20261105052525_lost_processing_jobs.sql', 'utf8'));
-    await db.exec(readFileSync('supabase/migrations/20261105065540_lost_bitrix_events.sql', 'utf8'));
+    await db.exec(readFileSync('db/proposals/worker-migration-fixtures/20261105052525_lost_processing_jobs.sql', 'utf8'));
+    await db.exec(readFileSync('db/proposals/worker-migration-fixtures/20261105065540_lost_bitrix_events.sql', 'utf8'));
     await db.query(`INSERT INTO public.lost_bitrix_events (id,deal_id,attempts,status)
       VALUES ('00000000-0000-4000-8000-000000000001',42,1,'pending')`);
     await db.query(`INSERT INTO public.lost_processing_jobs (id,request_key,deal_id,lose_date,trigger_type,status)

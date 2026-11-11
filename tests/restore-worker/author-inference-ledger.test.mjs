@@ -33,7 +33,7 @@ async function fixture(t, options = {}) {
   // Синтетический контракт, существует только в памяти этого PGlite.
   await db.exec(`CREATE TABLE public.lost_processing_jobs (
     id uuid PRIMARY KEY,deal_id bigint NOT NULL,lose_date timestamptz NOT NULL,request_key text NOT NULL,trigger_type text NOT NULL,
-    status text NOT NULL,lease_token uuid,lease_until timestamptz
+    status text NOT NULL,lease_token uuid,lease_until timestamptz,origin_stage_history_id text DEFAULT '123',silent boolean DEFAULT true
   );
   CREATE TABLE public.lost_role_inference_scopes (
     deal_id bigint NOT NULL,stage_history_id text NOT NULL CHECK (stage_history_id ~ '^[1-9][0-9]{0,29}$'),
@@ -49,7 +49,9 @@ async function fixture(t, options = {}) {
     CHECK ((state='reserved' AND finished_at IS NULL) OR (state IN ('settled','unknown') AND finished_at IS NOT NULL)),
     PRIMARY KEY (job_id,attempt_no),
     FOREIGN KEY(deal_id,stage_history_id) REFERENCES public.lost_role_inference_scopes(deal_id,stage_history_id)
-  );`);
+  );
+  CREATE TABLE public.lost_audio_wait (deal_id bigint,lose_date timestamptz,origin_stage_history_id text,
+    state text,next_check_at timestamptz);`);
   await db.query(`INSERT INTO public.lost_processing_jobs VALUES ($1,42,$3::timestamptz,'manual:test:1','manual','processing',$2,clock_timestamp()+interval '1 hour')`,[job,lease,binding.cutoff]);
   return {db,pool:serialPool(db,options)};
 }
@@ -127,7 +129,7 @@ test('другое задание на тот же переход не полу�
 test('одно задание нельзя переназначить другому переходу, а чужая сделка не проходит проверку аренды',enabled,async t=>{
   const {db,pool}=await fixture(t), first=createRoleInferenceLedger(pool,binding);
   assert.equal((await first.reserve()).status,'reserved');assert.equal((await first.finish(1,'settled')).status,'settled');
-  assert.deepEqual(await createRoleInferenceLedger(pool,{...binding,stageHistoryId:'124'}).reserve(),{status:'needs_review'});
+  assert.deepEqual(await createRoleInferenceLedger(pool,{...binding,stageHistoryId:'124'}).reserve(),{status:'lease_lost'});
   assert.deepEqual(await createRoleInferenceLedger(pool,{...binding,dealId:'43'}).reserve(),{status:'lease_lost'});
   assert.equal((await db.query('SELECT count(*)::int AS n FROM public.lost_role_inference_attempts')).rows[0].n,1);
 });
@@ -136,6 +138,33 @@ test('live/backfill задание допускает только history ID и
   await db.query("UPDATE public.lost_processing_jobs SET request_key='bitrix24:deal-stage-history:123',trigger_type='live'");
   assert.deepEqual(await createRoleInferenceLedger(pool,{...binding,stageHistoryId:'124'}).reserve(),{status:'lease_lost'});
   assert.equal((await db.query('SELECT count(*)::int AS n FROM public.lost_role_inference_attempts')).rows[0].n,0);
+  assert.equal((await createRoleInferenceLedger(pool,binding).reserve()).status,'reserved');
+});
+test('manual/nightly допускает только подтверждённый origin, независимо от доставки',enabled,async t=>{
+  for(const trigger of ['manual','nightly']) {
+    const {db,pool}=await fixture(t);
+    await db.query('UPDATE public.lost_processing_jobs SET trigger_type=$1,origin_stage_history_id=$2',[trigger,'124']);
+    assert.deepEqual(await createRoleInferenceLedger(pool,binding).reserve(),{status:'lease_lost'});
+    await db.query("INSERT INTO public.lost_audio_wait VALUES (42,$1,'123','done',NULL)",[binding.cutoff]);
+    assert.deepEqual(await createRoleInferenceLedger(pool,binding).reserve(),{status:'lease_lost'});
+    await db.query("UPDATE public.lost_processing_jobs SET origin_stage_history_id='123',silent=false");
+    assert.equal((await createRoleInferenceLedger(pool,binding).reserve()).status,'reserved');
+  }
+});
+test('audio_wait требует исходный переход и актуальный ключ расписания',enabled,async t=>{
+  const {db,pool}=await fixture(t), next='2026-10-28T05:40:03.000Z';
+  const key=`audio-wait:42:${Date.parse(binding.cutoff)*1000}:${Date.parse(next)*1000}`;
+  await db.query("UPDATE public.lost_processing_jobs SET trigger_type='audio_wait',request_key=$1",[key]);
+  await db.query("INSERT INTO public.lost_audio_wait VALUES (42,$1,'123','waiting',$2)",[binding.cutoff,next]);
+  await db.query("UPDATE public.lost_processing_jobs SET request_key='audio-wait:stale'");
+  assert.deepEqual(await createRoleInferenceLedger(pool,binding).reserve(),{status:'lease_lost'});
+  await db.query('UPDATE public.lost_processing_jobs SET request_key=$1',[key]);
+  assert.equal((await createRoleInferenceLedger(pool,binding).reserve()).status,'reserved');
+});
+test('manual с пустым origin может опираться на подтверждённую очередь аудио',enabled,async t=>{
+  const {db,pool}=await fixture(t);
+  await db.query('UPDATE public.lost_processing_jobs SET origin_stage_history_id=NULL');
+  await db.query("INSERT INTO public.lost_audio_wait VALUES (42,$1,'123','done',NULL)",[binding.cutoff]);
   assert.equal((await createRoleInferenceLedger(pool,binding).reserve()).status,'reserved');
 });
 test('потеря или смена аренды сохраняет reserved и исключает отметку settled',enabled,async t=>{

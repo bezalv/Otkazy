@@ -2,6 +2,7 @@ import { pgSafeReason } from '../rules/pipeline-gate.mjs';
 import { baseDealRow, processedRows, communicationRow, safeErrorUsageMeta } from './rows.mjs';
 import { inTransaction, CommitOutcomeUnknownError } from './transaction.mjs';
 import { revalidateRoleInferenceMetadata, markRoleUsageUnknown } from '../worker/role-inference-metadata.mjs';
+import { verifyRoleOrigin } from '../worker/role-origin.mjs';
 
 export { CommitOutcomeUnknownError };
 
@@ -357,8 +358,9 @@ export async function persistResult(pool, result) {
     return await inTransaction(pool, async (connection) => {
     const locked = await connection.query({
       text: `SELECT deal_id, lose_date, silent, screenshots, trigger_type, request_key,
+          to_jsonb(j)->>'origin_stage_history_id' AS origin_stage_history_id,
           to_char(lose_date AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS role_lose_date_exact
-        FROM public.lost_processing_jobs
+        FROM public.lost_processing_jobs j
         WHERE id=$1 AND deal_id=$2 AND status='processing' AND lease_token=$3
           AND lease_until>clock_timestamp() FOR UPDATE`,
       values: [operation, id, lease],
@@ -374,8 +376,19 @@ export async function persistResult(pool, result) {
     }
     const transition = typeof job.request_key === 'string'
       ? /^bitrix24:deal-stage-history:([1-9]\d{0,29})$/.exec(job.request_key)?.[1] : null;
+    let roleTransition=transition;
+    if (roleInput && result.role_origin_stage_history_id != null) {
+      const candidate=result.role_origin_stage_history_id;
+      const confirmed=typeof candidate==='string' && await verifyRoleOrigin(
+        (text,values)=>connection.query({text,values}),
+        {job,dealId:id,loseDate:job.role_lose_date_exact,stageHistoryId:candidate});
+      // Переход мог измениться после оценки автора. Нельзя сохранять вердикт
+      // или заявлять подтверждённый учёт по другому переходу.
+      if (!confirmed) throw new Error('Не подтверждён переход определения авторов');
+      roleTransition=candidate;
+    }
     const role = revalidateRoleInferenceMetadata(roleInput,{jobId:operation,leaseToken:lease,dealId:String(id),
-      stageHistoryId:transition,cutoff:job.role_lose_date_exact});
+      stageHistoryId:roleTransition,cutoff:job.role_lose_date_exact});
     const roleUnaccounted = result.role_inference_unaccounted === true || analysisRoleUnaccounted || (!!roleInput && !role);
     const roleSpent = roleUnaccounted || (role?.model_calls > 0)
       || (role?.physical_requests_started > 0) || role?.uncertain_outcome === true;

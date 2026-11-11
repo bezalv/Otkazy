@@ -32,9 +32,9 @@ test('архив, новая карточка и результат сохран
   const db = new PGlite();
   try {
     await db.exec(readFileSync('tests/restore-persistence/synthetic-schema.sql', 'utf8'));
-    await db.exec(readFileSync('supabase/migrations/20261105052525_lost_processing_jobs.sql', 'utf8'));
-    await db.exec(readFileSync('supabase/migrations/20261106031734_lost_audio_wait_origins.sql', 'utf8'));
-    await db.exec(readFileSync('supabase/migrations/20261105065551_lost_overwrite_history.sql', 'utf8'));
+    await db.exec(readFileSync('db/proposals/worker-migration-fixtures/20261105052525_lost_processing_jobs.sql', 'utf8'));
+    await db.exec(readFileSync('db/proposals/worker-migration-fixtures/20261106031734_lost_audio_wait_origins.sql', 'utf8'));
+    await db.exec(readFileSync('db/proposals/worker-migration-fixtures/20261105065551_lost_overwrite_history.sql', 'utf8'));
     const query = q => typeof q === 'string' ? db.query(q) : db.query(q.text, q.values);
     const pool = { async connect() { return { query, release() {} }; } };
     async function job(n, silent = true) {

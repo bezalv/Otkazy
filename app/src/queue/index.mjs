@@ -151,7 +151,7 @@ export function createJobQueue(pool, { uuid = randomUUID, lease = DEFAULT_LEASE_
               lease_until = now() + make_interval(secs => $2::double precision),
               attempts = attempts + 1, updated_at = now()
           from candidate where job.id = candidate.id
-          returning job.*`, [token, duration]);
+          returning job.*, to_char(job.lose_date AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS lose_date`, [token, duration]);
         return result.rows[0] || null;
       } catch (error) {
         // Два процесса могли одновременно выбрать разные задания одной сделки.

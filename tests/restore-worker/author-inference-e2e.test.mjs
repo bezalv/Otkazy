@@ -45,7 +45,7 @@ async function harness(t, { family = 'Wazzup', mode = 'ok' } = {}) {
   await db.exec(`CREATE TABLE public.lost_processing_jobs (
     id uuid PRIMARY KEY, deal_id bigint NOT NULL, lose_date timestamptz NOT NULL,
     request_key text NOT NULL, trigger_type text NOT NULL, status text NOT NULL,
-    lease_token uuid, lease_until timestamptz);
+    lease_token uuid, lease_until timestamptz, origin_stage_history_id text DEFAULT '101', silent boolean DEFAULT true);
     CREATE TABLE public.lost_role_inference_scopes (
       deal_id bigint NOT NULL, stage_history_id text NOT NULL CHECK(stage_history_id ~ '^[1-9][0-9]{0,29}$'),
       PRIMARY KEY(deal_id,stage_history_id));

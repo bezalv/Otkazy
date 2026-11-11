@@ -19,6 +19,32 @@ test('ручной тест требует идентификаторы пере
   assert.throws(() => parseManualPrejudgeOptions(args, {...env, TEST_POLZA_JOURNAL_PATH:env.TEST_POLZA_LOCK_PATH}));
 });
 
+test('проверка авторства включается только с явным ограниченным окном', () => {
+  assert.equal(parseManualPrejudgeOptions(args,env).semanticRolesFrom,undefined);
+  assert.equal(parseManualPrejudgeOptions(args,{...env,TEST_CHAT_ROLES_FROM:'2026-10-01T00:00:00.000Z'}).semanticRolesFrom,
+    '2026-10-01T00:00:00.000Z');
+  for(const value of ['2024-01-01T00:00:00.000Z','2027-01-01T00:00:00.000Z','2026-10-01']) {
+    assert.throws(()=>parseManualPrejudgeOptions(args,{...env,TEST_CHAT_ROLES_FROM:value}),/окно/);
+  }
+});
+
+test('определение ролей допускает только существующую модель и бюджет до трёх запросов', async () => {
+  const signal=new AbortController().signal, trace=[];
+  const guard={async run(amount,fn){trace.push(amount);return {settled:true,response:await fn({signal})};},
+    async runUnpricedAudio(){throw Error('audio must not be called');}};
+  const fetchImpl=async()=>new Response(JSON.stringify({usage:{cost_rub:0.01},choices:[]}),{status:200});
+  const paid=createManualPaidAdapters({key:'fixture',guard,signal,fetchImpl,sttReserveRub:1,modelReserveRub:10,maxSttParts:1});
+  const body={model:'openai/gpt-6-sol',max_tokens:5,messages:[{role:'user',content:'Тест'}]};
+  for(let n=0;n<3;n++)await paid.llm.complete(body,{role:'chat-role-inference'});
+  await assert.rejects(paid.llm.complete(body,{role:'chat-role-inference'}));
+  assert.deepEqual(trace,[10,10,10]);
+  const other=createManualPaidAdapters({key:'fixture',guard,signal,fetchImpl,sttReserveRub:1,modelReserveRub:10,maxSttParts:1});
+  await assert.rejects(other.llm.complete({...body,model:'other-model'},{role:'chat-role-inference'}));
+  await assert.rejects(other.llm.complete({...body,messages:[{role:'user',content:'a'.repeat(100001)}]},
+    {role:'chat-role-inference'}));
+  assert.deepEqual(trace,[10,10,10]);
+});
+
 test('распознавание и модель допускаются только через бюджет, без повторов', async () => {
   const trace = [];
   const signal = new AbortController().signal;

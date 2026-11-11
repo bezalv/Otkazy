@@ -1,6 +1,13 @@
 // Формат ответа соответствует ноде «final-output» от 19.10.2026.
 export function buildFinalOutput(input, analytics, screenshotStats) {
   const judge = input.judge;
+  // Сводка попадает в ai_judge_json вместе с фактами, чтобы неполное
+  // распознавание не исчезало при штатном сохранении готового разбора.
+  const coverageFields = ['calls_with_unrecognized_fragments', 'unrecognized_fragments',
+    'calls_without_selected_fragments', 'calls_with_unknown_coverage'];
+  const stats = input.transcription_stats;
+  const coverage = stats && coverageFields.every(key => Number.isSafeInteger(stats[key]) && stats[key] >= 0)
+    ? Object.fromEntries(coverageFields.map(key => [key, stats[key]])) : null;
   const probability = { высокий: 80, средний: 50, низкий: 20 }[judge.recoverable_level] || 0;
   const classification = {
     reason_class: judge.closure_reason_class || null,
@@ -48,6 +55,7 @@ export function buildFinalOutput(input, analytics, screenshotStats) {
     proof_errors_count: input.proof_errors_count,
     data_sufficiency: judge.data_sufficiency || input._data_sufficiency || null,
     facts_packet: input.facts_packet,
+    ...(coverage ? { transcription_coverage: coverage } : {}),
   };
   return {
     classification,

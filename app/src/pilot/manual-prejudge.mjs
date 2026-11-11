@@ -5,12 +5,13 @@ import { processDeal } from '../process-deal.mjs';
 import { inTransaction } from '../persistence/transaction.mjs';
 import { PrejudgeStageError, sanitizePrejudgeArtifact, prepareManualJudgeResultArtifact } from '../persistence/prejudge.mjs';
 import { exactMillisTimestamp } from '../time-precision.mjs';
+import { createRoleSessionContext } from '../worker/role-session-context.mjs';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const STAGE = /^[1-9]\d{0,29}$/;
 
 /** Только явный ручной вызов; production worker и планировщик не участвуют. */
-export async function runManualPrejudge({ pool, dealId, stageHistoryId, loseDate, options, uuid = randomUUID }) {
+export async function runManualPrejudge({ pool, dealId, stageHistoryId, loseDate, options, semanticRolesFrom, repairProofErrors = false, uuid = randomUUID }) {
   const id = Number(dealId);
   if (!pool || typeof pool.query !== 'function' || typeof pool.connect !== 'function'
       || !Number.isSafeInteger(id) || id <= 0 || id > 2147483647
@@ -18,11 +19,21 @@ export async function runManualPrejudge({ pool, dealId, stageHistoryId, loseDate
       || !options || typeof options !== 'object' || Array.isArray(options) || typeof uuid !== 'function') {
     throw new TypeError('Некорректные параметры ручного прогона');
   }
+  if (typeof repairProofErrors !== 'boolean' || (repairProofErrors && semanticRolesFrom === undefined)) {
+    throw new TypeError('Исправление ссылок доступно только при ручной проверке авторов');
+  }
   // Нельзя подменить сквозную привязку, тихий режим или сохранение снаружи.
   for (const key of ['dealId','expectedHistoryId','expectedLoseDate','silent','prejudgeCheckpoint',
     'prejudgeCheckLease','prejudgeSttHooks','semanticChatRoles','roleInferenceClient','verifyFallbackSession',
-    'verifyLatestSession','repairProofErrors']) {
+    'verifyLatestSession','repairProofErrors','roleSessionContext']) {
     if (Object.hasOwn(options, key)) throw new TypeError('Недопустимый параметр ручного прогона');
+  }
+  // Opt-in только для одного ручного запуска. Контекст верифицирует сессию
+  // по той же сделке и исходному переходу, без доступа к другим диалогам.
+  let roleSessionContext;
+  if (semanticRolesFrom !== undefined) {
+    roleSessionContext = createRoleSessionContext({ client:options.bitrix, dealId:String(id),
+      transitionId:String(stageHistoryId), cutoff:loseDate, from:semanticRolesFrom });
   }
   const runId = uuid();
   if (typeof runId !== 'string' || !UUID.test(runId)) throw new TypeError('Некорректный ID ручного прогона');
@@ -87,7 +98,9 @@ export async function runManualPrejudge({ pool, dealId, stageHistoryId, loseDate
   };
   try {
     const result=await processDeal({ ...options, dealId:id, expectedHistoryId:String(stageHistoryId),
-      expectedLoseDate:loseDate, silent:true, prejudgeCheckpoint:checkpoint, prejudgeCheckLease:check });
+      expectedLoseDate:loseDate, silent:true, prejudgeCheckpoint:checkpoint, prejudgeCheckLease:check, repairProofErrors,
+      ...(roleSessionContext ? {semanticChatRoles:true, roleSessionContext,
+        verifyFallbackSession:roleSessionContext.verify, verifyLatestSession:roleSessionContext.verify} : {}) });
     if (result?.status==='processed') {
       const artifact=prepareManualJudgeResultArtifact(result);
       await checkpoint({dealId:id,stageHistoryId:String(stageHistoryId),loseDate,artifact},{complete:true});

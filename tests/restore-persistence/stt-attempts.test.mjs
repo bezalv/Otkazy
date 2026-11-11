@@ -4,9 +4,10 @@ import {createServer} from 'node:http';
 import {existsSync,readFileSync} from 'node:fs';
 import {resolve} from 'node:path';
 import {pathToFileURL} from 'node:url';
+import {createHash} from 'node:crypto';
 import {createSttClient} from '../../app/src/stt-client.mjs';
 import {claimSttAttempt,completeSttAttempt} from '../../app/src/persistence/stt-attempts.mjs';
-import {hasUnsafePrejudgeResume,markPrejudgeNeedsReview,prepareBeginArtifact,prepareJudgeInputArtifact,prepareTranscriptArtifact,savePrejudgeArtifact} from '../../app/src/persistence/prejudge.mjs';
+import {hasUnsafePrejudgeResume,markPrejudgeNeedsReview,prepareBeginArtifact,prepareJudgeInputArtifact,prepareTranscriptArtifact,savePrejudgeArtifact,transcriptSourceKey} from '../../app/src/persistence/prejudge.mjs';
 import {transcribeCalls} from '../../app/src/calls/index.mjs';
 const pglite=resolve('tmp/pgtest/node_modules/@electric-sql/pglite/dist/index.js');
 test('скачанные байты переиспользуются в пределах перехода; новая версия и переход распознаются отдельно', {skip:!existsSync(pglite)}, async()=>{
@@ -19,8 +20,10 @@ test('скачанные байты переиспользуются в пред
     if(mode==='mismatch' && !mono) {res.writeHead(400,{'Content-Type':'application/json'});
       res.end(JSON.stringify({ok:false,error:{code:'channels_mismatch',retryable:false}}));return;}
     res.writeHead(200,{'Content-Type':'application/json'});
-    res.end(JSON.stringify({ok:true,model,channels:mono?1:2,
-      segments:mode==='silent' || (mode==='empty' && !mono) ? [] : [{channel:mono?0:1,start:1,text:'Нужна скидка'}],
+    res.end(JSON.stringify({ok:true,model,channels:mono?1:2,...(mode==='legacy_silent'?{}:{duration_sec:60}),
+      segments:mode==='silent' || mode==='legacy_silent' || (mode==='empty' && !mono) ? [] : [{channel:mono?0:1,start:1,text:'Нужна скидка'}],
+      ...(mode==='silent' || (mode==='empty' && !mono) ? {transcription_coverage:{version:1,status:'no_empty_fragments',
+        total_fragments:0,unrecognized_count:0,unrecognized_segments:[]}} : {}),
       ...(mode==='partial' ? {transcription_coverage:{version:1,status:'incomplete',total_fragments:2,
         unrecognized_count:1,unrecognized_segments:[{channel:0,start:2,end:3}]}} : {})}));
   });
@@ -69,6 +72,42 @@ test('скачанные байты переиспользуются в пред
     const quiet=()=>transcribeCalls({dealData:makeDeal(203),transcribe:req=>client(req,hooks)});
     assert.equal((await quiet()).transcription_errors.length,0);assert.equal(uploads,quietStart+2);
     assert.equal((await quiet()).transcription_errors.length,0);assert.equal(uploads,quietStart+2);
+    // Пустой подтверждённый результат сохраняется с длительностью, затем
+    // восстанавливается без второго POST и проходит ту же проверку артефакта.
+    for(const channels of [2,1]) {
+      const req={...request,file_id:String(800+channels),activity_id:String(900+channels),channel_count:channels};
+      const before=uploads,original=await client(req,hooks),again=await client(req,hooks);
+      assert.equal(uploads,before+1);assert.equal(original.formatted_dialog,'');assert.equal(again.formatted_dialog,'');
+      assert.equal(again.reserve_duration_sec,60);
+      const freshArtifact=prepareTranscriptArtifact(req,original,{allowEmpty:true});
+      const cachedArtifact=prepareTranscriptArtifact(req,again,{allowEmpty:true});
+      assert.deepEqual(cachedArtifact.payload,freshArtifact.payload);
+    }
+    // Исторический completed без длительности не считается доказанным пустым
+    // ответом: старая запись не меняется, разрешена только вторая попытка.
+    const legacyReq={...request,file_id:'850',activity_id:'950'},legacyBefore=uploads;
+    await client(legacyReq,hooks);
+    const saved=(await db.query(`SELECT attempt_id,transcript FROM public.lost_prejudge_stt_attempts
+      WHERE source_key=$1 AND status='completed'`,[transcriptSourceKey(legacyReq)])).rows[0];
+    assert.ok(saved);const legacy=structuredClone(saved.transcript);delete legacy.transcript.reserve_duration_sec;
+    const canonical=value=>Array.isArray(value)?`[${value.map(canonical).join(',')}]`:value&&typeof value==='object'
+      ?`{${Object.keys(value).sort().map(key=>`${JSON.stringify(key)}:${canonical(value[key])}`).join(',')}}`:JSON.stringify(value);
+    const checksum=createHash('sha256').update(canonical(legacy)).digest('hex');
+    await db.query('UPDATE public.lost_prejudge_stt_attempts SET transcript=$2::jsonb,transcript_sha256=$3 WHERE attempt_id=$1',
+      [saved.attempt_id,JSON.stringify(legacy),checksum]);
+    const renewed=await client(legacyReq,hooks);assert.equal(uploads,legacyBefore+2);
+    assert.equal(prepareTranscriptArtifact(legacyReq,renewed,{allowEmpty:true}).payload.status,'verified_stt_response');
+    const preserved=(await db.query('SELECT status,transcript,transcript_sha256 FROM public.lost_prejudge_stt_attempts WHERE attempt_id=$1',[saved.attempt_id])).rows[0];
+    assert.equal(preserved.status,'completed');assert.deepEqual(preserved.transcript,legacy);assert.equal(preserved.transcript_sha256,checksum);
+    const reused=await client(legacyReq,hooks);assert.equal(uploads,legacyBefore+2);
+    assert.equal(prepareTranscriptArtifact(legacyReq,reused,{allowEmpty:true}).payload.status,'verified_stt_response');
+    // Новый legacy-ответ без duration/coverage также не кешируется.
+    mode='legacy_silent';const legacyNewReq={...request,file_id:'851',activity_id:'951'};
+    const legacyResult=await client(legacyNewReq,hooks);assert.equal(legacyResult.success,true);
+    assert.equal(legacyResult.transcription_coverage.status,'unknown_legacy');
+    const legacyState=await db.query(`SELECT status,transcript FROM public.lost_prejudge_stt_attempts WHERE source_key=$1`,
+      [transcriptSourceKey(legacyNewReq)]);
+    assert.equal(legacyState.rows[0].status,'unknown');assert.equal(legacyState.rows[0].transcript,null);
     mode='normal'; model='aiesa';
     const mismatchedEngineRequest={...request,file_id:'104'};
     await assert.rejects(client(mismatchedEngineRequest,hooks));

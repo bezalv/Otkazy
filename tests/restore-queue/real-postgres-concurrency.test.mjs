@@ -21,8 +21,8 @@ test('настоящий PostgreSQL: два независимых клиент�
     await pool.query(`DO $$ BEGIN CREATE ROLE anon; EXCEPTION WHEN duplicate_object THEN NULL; END $$;
       DO $$ BEGIN CREATE ROLE authenticated; EXCEPTION WHEN duplicate_object THEN NULL; END $$;
       CREATE TABLE lost_deal_analyses (id bigint primary key)`);
-    await pool.query(await readFile('supabase/migrations/20261105052525_lost_processing_jobs.sql', 'utf8'));
-    await pool.query(await readFile('supabase/migrations/20261105065540_lost_bitrix_events.sql', 'utf8'));
+    await pool.query(await readFile('db/proposals/worker-migration-fixtures/20261105052525_lost_processing_jobs.sql', 'utf8'));
+    await pool.query(await readFile('db/proposals/worker-migration-fixtures/20261105065540_lost_bitrix_events.sql', 'utf8'));
     const precision = await pool.connect();
     try {
       await precision.query('BEGIN');

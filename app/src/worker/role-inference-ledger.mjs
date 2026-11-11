@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { exactMillisTimestamp } from '../time-precision.mjs';
+import { verifyRoleOrigin } from './role-origin.mjs';
 
 // Прототип, намеренно не подключён к очереди/Polza и не применяет миграции.
 // Требуются две отдельные приватные таблицы (RLS + revoke для anon/authenticated):
@@ -111,15 +112,16 @@ export function createRoleInferenceLedger(pool, { jobId, leaseToken, dealId, sta
   async function lockLease(connection) {
     // Включаем ожидание SELECT/COMMIT в оценку оставшегося времени аренды.
     const sampledAt = performance.now();
-    const result = await connection.query(`SELECT id,
+    const result = await connection.query(`SELECT id,trigger_type,request_key,to_jsonb(j)->>'origin_stage_history_id' AS origin_stage_history_id,
       floor(extract(epoch FROM (lease_until-clock_timestamp())) * 1000)::numeric AS remaining_ms
-      FROM public.lost_processing_jobs
+      FROM public.lost_processing_jobs j
       WHERE id=$1::uuid AND status='processing' AND lease_token=$2::uuid
-        AND deal_id=$3::bigint AND lose_date=$5::timestamptz AND lease_until>clock_timestamp()
-        AND ((trigger_type IN ('live','backfill') AND request_key='bitrix24:deal-stage-history:' || $4)
-          OR (trigger_type NOT IN ('live','backfill') AND request_key NOT LIKE 'bitrix24:deal-stage-history:%'))
+        AND deal_id=$3::bigint AND $4::text IS NOT NULL AND lose_date=$5::timestamptz AND lease_until>clock_timestamp()
       FOR UPDATE`, [jobId, leaseToken, deal, transition, exactCutoff]);
     if (result.rows.length !== 1) return null;
+    if (!await verifyRoleOrigin((text,values)=>connection.query(text,values), {
+      job:result.rows[0],dealId:deal,loseDate:exactCutoff,stageHistoryId:transition,
+    })) return null;
     const remainingMs = Number(result.rows[0].remaining_ms);
     return Number.isFinite(remainingMs) && remainingMs > 0 ? { remainingMs, sampledAt } : null;
   }

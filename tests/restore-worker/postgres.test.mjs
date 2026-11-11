@@ -13,8 +13,8 @@ test('тихий разбор проходит конвейер и сохран�
   const db = new PGlite();
   try {
     await db.exec(readFileSync('tests/restore-persistence/synthetic-schema.sql', 'utf8'));
-    await db.exec(readFileSync('supabase/migrations/20261105052525_lost_processing_jobs.sql', 'utf8'));
-    await db.exec(readFileSync('supabase/migrations/20261105065551_lost_overwrite_history.sql', 'utf8'));
+    await db.exec(readFileSync('db/proposals/worker-migration-fixtures/20261105052525_lost_processing_jobs.sql', 'utf8'));
+    await db.exec(readFileSync('db/proposals/worker-migration-fixtures/20261105065551_lost_overwrite_history.sql', 'utf8'));
     const query = (q, values) => typeof q === 'string' ? db.query(q, values) : db.query(q.text, q.values);
     const pool = { query, async connect() { return { query, release() {} }; } };
     const queue = createJobQueue(pool);

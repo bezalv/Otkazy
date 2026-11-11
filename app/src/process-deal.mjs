@@ -14,9 +14,10 @@ import { processScreenshots } from './screenshots/process.mjs';
 import { pgDecide } from './rules/pipeline-gate.mjs';
 import { dsEvaluate, dsInsufficientJudge } from './rules/data-sufficiency.mjs';
 import { runAgents } from './agents/index.mjs';
-import { PrejudgeStageError, prepareBeginArtifact, prepareRawCollectionArtifact, prepareTranscriptArtifact, prepareCommunicationsArtifact, prepareJudgeInputArtifact } from './persistence/prejudge.mjs';
+import { PrejudgeStageError, prepareBeginArtifact, prepareRawCollectionArtifact, prepareTranscriptArtifact, prepareCommunicationsArtifact, prepareJudgeInputArtifact, isLegacyEmptyTranscript } from './persistence/prejudge.mjs';
 import { ambiguousProcessingOnly } from './calls/transcript-quality.mjs';
-import { supportsSttAttempts } from './stt-client.mjs';
+import { supportsSttAttempts, verifiedAudioHash } from './stt-client.mjs';
+import { getRoleSessionContextScope } from './worker/role-session-context.mjs';
 
 function blockedTemporalScope(collection, audioWait, source, reason) {
   const sources = { ...collection._sources, [source]: { ...collection._sources[source], complete: false, error: reason } };
@@ -28,12 +29,32 @@ export async function processDeal({
   dealId, bitrix, llm, resolveFile, downloadFile, transcribe,
   judgeSystemPrompt, writerSystemPrompt, audioWaitEnabledAt, savedAudioWait = null,
   silent = false, screenshots = true, nowMs = null, clock = Date.now, expectedLoseDate = null, expectedHistoryId = null, wait,
-  semanticChatRoles = false, verifyFallbackSession, verifyLatestSession, repairProofErrors = false, roleInferenceClient,
+  semanticChatRoles = false, verifyFallbackSession, verifyLatestSession, repairProofErrors = false, roleInferenceClient, roleSessionContext,
   prejudgeCheckpoint, prejudgeCheckLease, prejudgeSttHooks,
 }) {
+  const durableScope = getRoleInferenceLedgerScope(getDurableRoleClientLedger(roleInferenceClient));
+  const sessionScope = getRoleSessionContextScope(roleSessionContext);
+  const roleCutoffMs = expectedLoseDate == null ? NaN : new Date(expectedLoseDate).getTime();
+  const roleCutoff = Number.isFinite(roleCutoffMs) ? new Date(roleCutoffMs).toISOString() : null;
+  const durableRole = semanticChatRoles === true && !!durableScope && !!sessionScope
+    && durableScope.dealId === String(dealId) && durableScope.stageHistoryId === String(expectedHistoryId)
+    && sessionScope.dealId === String(dealId) && sessionScope.stageHistoryId === String(expectedHistoryId)
+    && roleCutoff !== null && durableScope.cutoff === roleCutoff && sessionScope.cutoff === roleCutoff;
   if (prejudgeCheckpoint !== undefined && (typeof prejudgeCheckpoint !== 'function'
-      || typeof prejudgeCheckLease !== 'function' || expectedHistoryId === null || expectedLoseDate === null || semanticChatRoles === true)) {
-    throw new Error('Для сохранения материалов нужен подтверждённый переход без экспериментального определения ролей');
+      || typeof prejudgeCheckLease !== 'function' || expectedHistoryId === null || expectedLoseDate === null)) {
+    throw new Error('Для сохранения материалов нужен подтверждённый переход');
+  }
+  // При staging разрешён лишь внутренний scope-проверенный verifier;
+  // произвольный callback не доказывает принадлежность переписки сделке.
+  if (prejudgeCheckpoint !== undefined && semanticChatRoles === true) {
+    const scope = getRoleSessionContextScope(roleSessionContext);
+    if ((silent !== true && !durableRole) || !scope || scope.dealId !== String(dealId) || scope.stageHistoryId !== String(expectedHistoryId)
+        || scope.cutoff !== new Date(expectedLoseDate).toISOString()
+        || verifyFallbackSession !== roleSessionContext.verify || verifyLatestSession !== roleSessionContext.verify) {
+      throw new Error('Для сохранения ролей нужна проверенная сессия и журнал');
+    }
+  } else if (roleSessionContext !== undefined) {
+    throw new Error('Контекст ролей допустим только при сохранении материалов');
   }
   if (prejudgeCheckpoint === undefined && prejudgeCheckLease !== undefined) throw new Error('Не задано сохранение материалов');
   if (prejudgeSttHooks !== undefined && (!prejudgeCheckpoint || typeof prejudgeSttHooks !== 'object'
@@ -43,19 +64,19 @@ export async function processDeal({
     throw new Error('Исправление доказательств доступно только в тихом ручном эксперименте');
   }
   if (verifyLatestSession !== undefined && (typeof verifyLatestSession !== 'function' || semanticChatRoles !== true
-      || silent !== true || expectedHistoryId === null || expectedLoseDate === null)) {
+      || (silent !== true && !durableRole) || expectedHistoryId === null || expectedLoseDate === null)) {
     throw new Error('Подтверждение новой сессии доступно только для закреплённого тихого эксперимента');
   }
-  if (verifyFallbackSession !== undefined && (semanticChatRoles !== true || silent !== true)) {
+  if (verifyFallbackSession !== undefined && (semanticChatRoles !== true || (silent !== true && !durableRole))) {
     throw new Error('Проверка сессии доступна только в тихом ручном эксперименте');
   }
   if (verifyFallbackSession !== undefined && typeof verifyFallbackSession !== 'function') {
     throw new TypeError('Проверка сессии должна быть функцией');
   }
-  if (semanticChatRoles === true && silent !== true) {
+  if (semanticChatRoles === true && silent !== true && !durableRole) {
     throw new Error('Эксперимент определения ролей доступен только в тихом режиме');
   }
-  if (roleInferenceClient !== undefined && (semanticChatRoles !== true || silent !== true
+  if (roleInferenceClient !== undefined && (semanticChatRoles !== true || (silent !== true && !durableRole)
       || expectedHistoryId === null || expectedLoseDate === null || !getDurableRoleClientLedger(roleInferenceClient))) {
     throw new Error('Нужен подтверждённый клиент и переход для определения авторов');
   }
@@ -66,7 +87,7 @@ export async function processDeal({
   const startedAt = nowMs ?? clock();
   if (!Number.isFinite(startedAt)) throw new TypeError('Некорректное время обработки');
   const collected = await collectDeal({ client: bitrix, dealId, silent, now: startedAt, wait, expectedLoseDate, expectedHistoryId,
-    requireCurrentHistory: true, verifyLatestSession });
+    requireCurrentHistory: true, verifyLatestSession, ...(durableRole ? { roleSessionContext } : {}) });
   if (collected.deal_data && expectedLoseDate != null) {
     const expected = new Date(expectedLoseDate).getTime();
     const actual = new Date(collected.deal_data.lose_date).getTime();
@@ -138,12 +159,17 @@ export async function processDeal({
     let response;
     try { response = await transcribe(request,prejudgeSttHooks); }
     catch (error) { if (error instanceof PrejudgeStageError) throw error; if (prejudgeSttHooks) throw new PrejudgeStageError(); throw error; }
-    // Не выдаём пустой/ошибочный ответ за готовый транскрипт. Сохраняемый
-    // кандидат не используется автоматически при повторе без хеша аудиобайтов.
+    if (isLegacyEmptyTranscript(response)) {
+      if (response.audio_sha256 != null && !verifiedAudioHash(response,request)) throw new PrejudgeStageError();
+      return { ...response,transcription_coverage:{version:0,status:'unknown_legacy'} };
+    }
+    // Пустой успешный ответ сохраняем только как проверенную попытку: он не
+    // становится ни тишиной, ни доказательством отсутствия разговора. Для него
+    // подготовка требует привязку к байтам и непротиворечивое покрытие.
     if (response?.success === true && typeof response.formatted_dialog === 'string'
-        && response.formatted_dialog.trim() && !ambiguousProcessingOnly(response)) {
+        && !ambiguousProcessingOnly(response)) {
       let artifact;
-      try { artifact = prepareTranscriptArtifact(request, response); }
+      try { artifact = prepareTranscriptArtifact(request, response,{allowEmpty:!response.formatted_dialog.trim()}); }
       catch { throw new PrejudgeStageError(); }
       await checkpoint(artifact);
     }
@@ -153,6 +179,7 @@ export async function processDeal({
   try {
     normalized = await normalizeCommunications({
       collection: temporal.collection, resolveFile, transcribeVoice: transcribeAndCheckpoint, screenshots, verifyFallbackSession,
+      ...(durableRole ? { roleSessionContext } : {}),
       temporalCutoff: collected.deal_data.lose_date,
     });
   } catch (error) {
@@ -170,12 +197,16 @@ export async function processDeal({
   let chatRoleInferenceStats = null;
   let chatRoleInferenceEvidence = null;
   let chatRoleInferenceMetadata = null;
-  // Только явный ручной режим для проверки текста. Обычная обработка по умолчанию
-  // не подключает эту экспериментальную оценку и не ослабляет защиту источников.
+  // Роли оцениваются только при явном подключении и подтверждённой сессии;
+  // в рабочем обработчике отправку дополнительно защищает журнал попыток.
   if (semanticChatRoles === true) {
     const prerequisites = pgDecide({ sources: collected._sources, recognition: { voices: normalized.voice_failures } });
     if (prerequisites.block) return { status: 'blocked', collection: collected, audioWait, pipelineGate: prerequisites };
-    const roleClient = roleInferenceClient ?? llm;
+    // В ручном staging любая сессия, включая Wazzup с числовым ID,
+    // должна быть подтверждена для конкретной сделки до отправки модели.
+    const roleClient = roleInferenceClient ?? (checkpoint && checkedLlm
+      ? { requireVerifiedSession: true, complete: (...args) => checkedLlm.complete(...args) }
+      : llm);
     let inferred;
     try {
       inferred = await inferChatRoles({ communications: normalized.deal_data.communications, client: roleClient,

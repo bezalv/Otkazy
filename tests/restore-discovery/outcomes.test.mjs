@@ -7,8 +7,8 @@ import { createOutcomeComparator, scanLostTransitions } from '../../app/src/disc
 
 const pglitePath = resolve('tmp/pgtest/node_modules/@electric-sql/pglite/dist/index.js');
 const schema = readFileSync('tests/restore-persistence/synthetic-schema.sql', 'utf8');
-const queueMigration = readFileSync('supabase/migrations/20261105052525_lost_processing_jobs.sql', 'utf8');
-const liveMigration = readFileSync('supabase/migrations/20261105065540_lost_bitrix_events.sql', 'utf8');
+const queueMigration = readFileSync('db/proposals/worker-migration-fixtures/20261105052525_lost_processing_jobs.sql', 'utf8');
+const liveMigration = readFileSync('db/proposals/worker-migration-fixtures/20261105065540_lost_bitrix_events.sql', 'utf8');
 const date = '2026-11-04T00:00:00.000Z';
 const event = (history, deal, occurred = date) => ({
   event_key: `bitrix24:deal-stage-history:${history}`, deal_id: deal, occurred_at: occurred,

@@ -3,6 +3,8 @@ import assert from 'node:assert/strict';
 import { existsSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { createServer } from 'node:http';
+import { createSttClient } from '../../app/src/stt-client.mjs';
 import { PrejudgeStageError, prepareTranscriptArtifact, prepareRawCollectionArtifact, prepareCommunicationsArtifact,
   prepareJudgeInputArtifact, savePrejudgeArtifact, hasPrejudgeArtifacts, markPrejudgeNeedsReview } from '../../app/src/persistence/prejudge.mjs';
 
@@ -16,6 +18,47 @@ const response = { success:true, formatted_dialog:'Клиент: Пока не �
   manager_text:'', transcript_engine:'reserve:gigaam', total_replicas:1, channel_count:2 };
 const communication = { type:'call', activity_id:99, date:'2026-11-03T00:00:00Z', audio_url:'https://example.invalid/secret-url',
   _needs_transcription:true, transcript:response.formatted_dialog, transcript_client_text:response.client_text };
+
+test('пустой ответ сохраняется только с проверенными аудиобайтами и непротиворечивым покрытием mono/stereo', async () => {
+  let body;
+  const server=createServer(async(req,res)=>{
+    if(req.url==='/audio'){res.end(Buffer.alloc(2048,17));return;}
+    for await(const _ of req){};
+    res.writeHead(200,{'Content-Type':'application/json'});res.end(JSON.stringify(body));
+  });
+  await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+  const base=`http://127.0.0.1:${server.address().port}`;
+  try {
+    const client=createSttClient({bitrix:{request:async()=>({result:{DOWNLOAD_URL:`${base}/audio`}})},
+      sttUrl:base,sttKey:'test-only',tempRoot:resolve('tmp')});
+    for(const channels of [1,2])for(const count of [0,1]){
+      const meta={deal_id:42,file_id:'7',activity_id:'99',channel_count:channels,call_date:'2026-11-03T00:00:00Z'};
+      body={ok:true,model:'ai-sage/gigaam-v3',channels,duration_sec:12,segments:[],transcription_coverage:{version:1,
+        status:count?'incomplete':'no_empty_fragments',total_fragments:count,unrecognized_count:count,
+        unrecognized_segments:count?[{channel:channels-1,start:1,end:2}]:[]}};
+      const result=await client(meta);assert.equal(result.success,true);assert.equal(result.formatted_dialog,'');
+      assert.throws(()=>prepareTranscriptArtifact(meta,result));
+      const artifact=prepareTranscriptArtifact(meta,result,{allowEmpty:true});
+      assert.equal(artifact.payload.status,'verified_stt_response');
+      assert.equal(artifact.payload.transcript.formatted_dialog,'');
+      assert.deepEqual(artifact.payload.transcript.transcription_coverage,body.transcription_coverage);
+      assert.throws(()=>prepareTranscriptArtifact(meta,{...result,audio_sha256:'a'.repeat(64)},{allowEmpty:true}));
+    }
+    // Клиент получил пустую реплику в segments, а карта ошибочно заявляет,
+    // что она распознана: корректный хеш источника не делает ответ согласованным.
+    const meta={deal_id:42,file_id:'7',activity_id:'99',channel_count:2,call_date:'2026-11-03T00:00:00Z'};
+    body={ok:true,model:'ai-sage/gigaam-v3',channels:2,duration_sec:12,
+      segments:[{channel:0,start:1,end:2,text:''}],transcription_coverage:{version:1,status:'no_empty_fragments',
+        total_fragments:1,unrecognized_count:0,unrecognized_segments:[]}};
+    const contradiction=await client(meta);assert.equal(contradiction.success,true);assert.equal(contradiction.formatted_dialog,'');
+    assert.throws(()=>prepareTranscriptArtifact(meta,contradiction,{allowEmpty:true}),/покрытия/);
+    // Старый GigaAM может вернуть пустой ответ без карты покрытия. Даже
+    // реальный SHA источника не подтверждает в нём границы пропусков.
+    body={ok:true,model:'ai-sage/gigaam-v3',channels:2,duration_sec:12,segments:[]};
+    const legacy=await client(meta);assert.equal(legacy.success,true);assert.equal(legacy.formatted_dialog,'');
+    assert.throws(()=>prepareTranscriptArtifact(meta,legacy,{allowEmpty:true}),/покрытия/);
+  } finally {server.closeAllConnections?.();await new Promise(resolve=>server.close(resolve));}
+});
 
 test('подготовка записывает текст, но не сохраняет адрес источника как секрет', () => {
   const t = prepareTranscriptArtifact(request, response);

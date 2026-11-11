@@ -17,7 +17,8 @@ function harness({ sessionContext, reserve, preSend, finish, checkLease, respons
   const events=[];let sent=0, sealed=0, reservationDenied=false;const attempts=[];
   const pool={async connect(){return {release(){},async query(sql,params=[]){
     if(/^(BEGIN|COMMIT|ROLLBACK)/i.test(sql))return {rows:[]};
-    if(sql.includes('FROM public.lost_processing_jobs') && sql.includes('remaining_ms'))return {rows:[{id:job,remaining_ms:60000}]};
+    if(sql.includes('FROM public.lost_processing_jobs') && sql.includes('remaining_ms'))return {rows:[{id:job,remaining_ms:60000,
+      trigger_type:'live',request_key:'bitrix24:deal-stage-history:101',origin_stage_history_id:null}]};
     if(sql.includes('INSERT INTO public.lost_role_inference_scopes')){
       events.push('reserve');const outcome=reserve ? await reserve() : {status:'reserved'};
       reservationDenied=outcome?.status!=='reserved';return {rows:[]};

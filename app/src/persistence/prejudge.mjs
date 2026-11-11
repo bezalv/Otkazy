@@ -82,13 +82,60 @@ export function transcriptSourceKey(request) {
   return digest(canonical(identity));
 }
 
+// Пустой текст — только зафиксированный ответ распознавания, а не тишина.
+// Принимаем его лишь при проверенной привязке к байтам и непротиворечивой
+// карте покрытия от выбранного GigaAM; отсутствие фрагментов отдельно видно.
+function validEmptyTranscript(request,result,audioSha) {
+  const channels=Number(request?.channel_count),coverage=result?.transcription_coverage;
+  const duration=result?.reserve_duration_sec;
+  if (!audioSha || result?.transcript_engine !== 'reserve:gigaam' || ![1,2].includes(channels)
+      || Number(result?.channel_count)!==channels || typeof result?.formatted_dialog!=='string' || result.formatted_dialog.trim()
+      || typeof result?.manager_text!=='string' || result.manager_text.trim()
+      || typeof result?.client_text!=='string' || result.client_text.trim()
+      || result?.total_replicas!==0 || !Array.isArray(result?.conversation) || result.conversation.length!==0
+      || !Number.isFinite(duration) || duration<=0
+      || !coverage || coverage.version!==1 || !Number.isSafeInteger(coverage.total_fragments) || coverage.total_fragments<0
+      || !Number.isSafeInteger(coverage.unrecognized_count) || coverage.unrecognized_count!==coverage.total_fragments
+      || !Array.isArray(coverage.unrecognized_segments) || coverage.unrecognized_segments.length!==coverage.total_fragments
+      || coverage.status!==(coverage.total_fragments?'incomplete':'no_empty_fragments')) return false;
+  const seen=new Set();
+  return coverage.unrecognized_segments.every(segment=>{
+    if(!segment || !Number.isInteger(segment.channel) || segment.channel<0 || segment.channel>=channels
+        || !Number.isFinite(segment.start) || segment.start<0 || !Number.isFinite(segment.end)
+        || segment.end<=segment.start || segment.end>duration+0.02) return false;
+    const id=`${segment.channel}:${segment.start}:${segment.end}`;if(seen.has(id))return false;seen.add(id);return true;
+  });
+}
+
+// Старый успешный пустой ответ может не иметь карты покрытия/длительности.
+// Это неизвестный результат, а не подтверждённая тишина или ошибка сервиса.
+export function isLegacyEmptyTranscript(result) {
+  if (result?.success!==true || typeof result.formatted_dialog!=='string' || result.formatted_dialog.trim()
+      || (result.manager_text!=null && (typeof result.manager_text!=='string' || result.manager_text.trim()))
+      || (result.client_text!=null && (typeof result.client_text!=='string' || result.client_text.trim()))
+      || (result.total_replicas!=null && result.total_replicas!==0)
+      || (result.conversation!=null && (!Array.isArray(result.conversation) || result.conversation.length!==0))) return false;
+  const coverage=result.transcription_coverage;
+  if (coverage==null || (coverage.version===0 && coverage.status==='unknown_legacy')) return true;
+  // Карта v1 без длительности остаётся неизвестной, только если её элементы
+  // сами по себе согласованы; противоречивый v1 нельзя маскировать как legacy.
+  if (result.reserve_duration_sec!=null || coverage.version!==1 || ![1,2].includes(Number(result.channel_count))
+      || !Number.isSafeInteger(coverage.total_fragments) || coverage.total_fragments<0
+      || coverage.unrecognized_count!==coverage.total_fragments || !Array.isArray(coverage.unrecognized_segments)
+      || coverage.unrecognized_segments.length!==coverage.total_fragments
+      || coverage.status!==(coverage.total_fragments?'incomplete':'no_empty_fragments')) return false;
+  return coverage.unrecognized_segments.every(s=>s && Number.isInteger(s.channel) && s.channel>=0
+    && s.channel<Number(result.channel_count) && Number.isFinite(s.start) && s.start>=0
+    && Number.isFinite(s.end) && s.end>s.start);
+}
+
 export function prepareTranscriptArtifact(request, result, { allowEmpty = false } = {}) {
   if (!request || !result || result.success !== true || typeof result.formatted_dialog !== 'string'
       || (!allowEmpty && !result.formatted_dialog.trim()) || ![1, 2].includes(Number(request.channel_count))) throw new TypeError('Неполный транскрипт');
   // URL может содержать credential и попадает только в SHA, не в payload.
   const identityKey = transcriptSourceKey(request);
   const audioSha = verifiedAudioHash(result,request);
-  if (!result.formatted_dialog.trim() && !audioSha) throw new TypeError('Пустой ответ без подтверждения');
+  if (!result.formatted_dialog.trim() && !validEmptyTranscript(request,result,audioSha)) throw new TypeError('Пустой ответ без подтверждения покрытия');
   const payload = safeJson({ status:audioSha ? 'verified_stt_response' : 'candidate_unvalidated', source: { file_id: request.file_id, activity_id: request.activity_id,
     call_date: request.call_date ?? null, channel_count: Number(request.channel_count), speaker_role: request.speaker_role ?? null,
     source_identity_sha256: identityKey, audio_bytes_sha256: audioSha },
@@ -100,6 +147,8 @@ export function prepareTranscriptArtifact(request, result, { allowEmpty = false 
         text:typeof item?.text === 'string' ? item.text : null,
       })) : [], transcript_engine: result.transcript_engine ?? null, channel_count: result.channel_count ?? null,
       transcript_mode: result._transcript_mode ?? null,
+      ...(Number.isFinite(result.reserve_duration_sec) && result.reserve_duration_sec>0
+        ? {reserve_duration_sec:result.reserve_duration_sec} : {}),
       ...(result.transcription_coverage ? {transcription_coverage:result.transcription_coverage} : {}) } });
   // Разные версии аудио и результаты одного источника должны сосуществовать
   // в одном job; повтор идентичного ответа остаётся идемпотентным.
@@ -118,11 +167,15 @@ export function rehydrateVerifiedTranscript(payload, request, audioSha256, expec
       || t.total_replicas !== t.conversation.length || !t.conversation.every(x => Number.isSafeInteger(x.id)
         && typeof x.speaker === 'string' && typeof x.text === 'string')
       || (!t.formatted_dialog.trim() && (t.total_replicas !== 0 || t.manager_text || t.client_text))) throw new PrejudgeStageError();
+  // Старые ledger-записи не содержали длительность. Они не годятся для
+  // безопасного восстановления пустого ответа и должны быть пересчитаны.
+  if (!t.formatted_dialog.trim() && !validEmptyTranscript(request,t,audioSha256)) return null;
   return { success:true, activity_id:request.activity_id, comm_index:request.comm_index,
     date:request.call_date, direction:request.call_direction, channel_count:t.channel_count,
     speaker_role:request.speaker_role || '', total_replicas:t.total_replicas, conversation:t.conversation,
     formatted_dialog:t.formatted_dialog, manager_text:t.manager_text, client_text:t.client_text,
     transcript_engine:t.transcript_engine, audio_sha256:audioSha256,
+    ...(Number.isFinite(t.reserve_duration_sec) && t.reserve_duration_sec>0 ? {reserve_duration_sec:t.reserve_duration_sec} : {}),
     ...(t.transcription_coverage ? {transcription_coverage:t.transcription_coverage}
       : t.transcript_engine === 'reserve:gigaam' ? {transcription_coverage:{version:0,status:'unknown_legacy'}} : {}),
     ...(t.transcript_mode === 'mono' ? {_transcript_mode:'mono'} : {}) };

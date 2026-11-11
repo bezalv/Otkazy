@@ -33,7 +33,7 @@ test('план фиксируется и безопасно возобновля
   const db = new PGlite();
   try {
     await db.exec(readFileSync('tests/restore-persistence/synthetic-schema.sql', 'utf8'));
-    await db.exec(readFileSync('supabase/migrations/20261105052525_lost_processing_jobs.sql', 'utf8'));
+    await db.exec(readFileSync('db/proposals/worker-migration-fixtures/20261105052525_lost_processing_jobs.sql', 'utf8'));
     const pool = { query: (text, values) => db.query(text, values), transaction: fn => db.transaction(fn) };
     const jobs = new Map();
     const queue = { async enqueueNightlyBudgeted(action) { jobs.set(action.requestKey, action); return { created: true }; } };

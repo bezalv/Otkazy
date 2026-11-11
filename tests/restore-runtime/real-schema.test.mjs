@@ -14,7 +14,7 @@ test('настоящий PostgreSQL: active блокируется до мигр
     assert.deepEqual(identity.rows[0], { db: 'otkazy_schema_test_1', dir: `${root}/pgdata`, addr: null });
     await pool.query('CREATE TABLE public.lost_audio_wait (deal_id bigint PRIMARY KEY)');
     await assert.rejects(assertAudioOriginSchema(pool), /Схема ожидания аудио/);
-    await pool.query(await readFile('supabase/migrations/20261106031734_lost_audio_wait_origins.sql', 'utf8'));
+    await pool.query(await readFile('db/proposals/worker-migration-fixtures/20261106031734_lost_audio_wait_origins.sql', 'utf8'));
     await assert.doesNotReject(assertAudioOriginSchema(pool));
     await pool.query('ALTER TABLE public.lost_audio_wait DROP CONSTRAINT lost_audio_wait_origin_stage_history_id_check');
     await assert.rejects(assertAudioOriginSchema(pool), /Схема ожидания аудио/);

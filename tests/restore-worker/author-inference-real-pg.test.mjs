@@ -30,7 +30,10 @@ before(async () => {
   await pool.query(`CREATE TABLE public.lost_processing_jobs (
     id uuid PRIMARY KEY, deal_id bigint NOT NULL, lose_date timestamptz NOT NULL,
     request_key text NOT NULL, trigger_type text NOT NULL, status text NOT NULL,
-    lease_token uuid, lease_until timestamptz
+    lease_token uuid, lease_until timestamptz, origin_stage_history_id text DEFAULT '123', silent boolean DEFAULT true
+  );
+  CREATE TABLE public.lost_audio_wait (
+    deal_id bigint,lose_date timestamptz,origin_stage_history_id text,state text,next_check_at timestamptz
   );
   CREATE TABLE public.lost_role_inference_scopes (
     deal_id bigint NOT NULL, stage_history_id text NOT NULL CHECK(stage_history_id ~ '^[1-9][0-9]{0,29}$'),
@@ -50,8 +53,16 @@ before(async () => {
 after(async () => { if (pool) await pool.end(); });
 beforeEach(async () => {
   if (!enabled) return;
-  await pool.query('TRUNCATE public.lost_role_inference_attempts, public.lost_role_inference_scopes, public.lost_processing_jobs');
+  await pool.query('TRUNCATE public.lost_role_inference_attempts, public.lost_role_inference_scopes, public.lost_processing_jobs, public.lost_audio_wait');
   await pool.query("INSERT INTO public.lost_processing_jobs VALUES ($1,42,$3,'manual:test:1','manual','processing',$2,clock_timestamp()+interval '1 hour')", [job,lease,binding.cutoff]);
+});
+
+test('реальный PostgreSQL требует подтверждённый переход и при обычном задании',local,async()=>{
+  await pool.query("UPDATE public.lost_processing_jobs SET origin_stage_history_id='124'");
+  await pool.query("INSERT INTO public.lost_audio_wait VALUES (42,$1,'123','done',NULL)",[binding.cutoff]);
+  assert.deepEqual(await createRoleInferenceLedger(pool,binding).reserve(),{status:'lease_lost'});
+  await pool.query("UPDATE public.lost_processing_jobs SET origin_stage_history_id='123',silent=false");
+  assert.equal((await createRoleInferenceLedger(pool,binding).reserve()).status,'reserved');
 });
 
 test('две независимые сессии PostgreSQL доступны одновременно',local,async () => {
@@ -119,6 +130,7 @@ test('два экземпляра ledger с одной арендой не мо�
 
 test('разные подтверждённые переходы одного клиента не блокируют друг друга',local,async () => {
   await pool.query("INSERT INTO public.lost_processing_jobs VALUES ($1,42,$3,'manual:test:2','manual','processing',$2,clock_timestamp()+interval '1 hour')", [job2,lease,binding.cutoff]);
+  await pool.query("UPDATE public.lost_processing_jobs SET origin_stage_history_id='124' WHERE id=$1",[job2]);
   await pool.query("INSERT INTO public.lost_role_inference_scopes VALUES (42,'123')");
   const a = createRoleInferenceLedger(pool,binding), b = createRoleInferenceLedger(pool,{...binding,jobId:job2,stageHistoryId:'124'});
   const blocker = await pool.connect();

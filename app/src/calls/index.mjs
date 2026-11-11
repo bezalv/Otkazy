@@ -71,6 +71,21 @@ function mergeTranscript(call, result) {
   return out;
 }
 
+// Счётчики нельзя строить по произвольному объекту без подтверждения формы:
+// некорректная карта — неизвестное покрытие, а не полная расшифровка.
+function validCoverageForStats(coverage, result) {
+  const channels=Number(result?.channel_count);
+  if (!coverage || coverage.version !== 1 || !['incomplete','no_empty_fragments'].includes(coverage.status)
+      || !Number.isSafeInteger(coverage.total_fragments) || coverage.total_fragments < 0
+      || !Number.isSafeInteger(coverage.unrecognized_count) || coverage.unrecognized_count < 0
+      || coverage.unrecognized_count > coverage.total_fragments
+      || !Array.isArray(coverage.unrecognized_segments) || coverage.unrecognized_segments.length !== coverage.unrecognized_count
+      || (coverage.status === 'incomplete') !== (coverage.unrecognized_count > 0) || ![1,2].includes(channels)) return false;
+  return coverage.unrecognized_segments.every(segment => segment && Number.isInteger(segment.channel)
+    && segment.channel >= 0 && segment.channel < channels && Number.isFinite(segment.start) && segment.start >= 0
+    && Number.isFinite(segment.end) && segment.end >= segment.start);
+}
+
 /** Последовательный перенос стерео/моно распознавания звонков из n8n. */
 export async function transcribeCalls({ dealData, transcribe }) {
   if (!dealData || typeof dealData !== 'object' || !Array.isArray(dealData.communications)) {
@@ -200,6 +215,22 @@ export async function transcribeCalls({ dealData, transcribe }) {
   const byId = new Map(results.map(result => [String(result.activity_id), result]));
   const communications = dealData.communications.map(call => call?.type === 'call' && call.activity_id
     ? mergeTranscript(call, byId.get(String(call.activity_id))) : copyNeutralReactionTrust(call, { ...call }));
+  // Пустые ответы на выбранные фрагменты не являются доказательством тишины.
+  // Отдельно учитываем старые ответы без карты покрытия и случай, когда VAD
+  // вообще не выбрал фрагментов: это не означает полного распознавания записи.
+  const coverageStats = results.reduce((sum, result) => {
+    const coverage = result.transcription_coverage;
+    if (!validCoverageForStats(coverage,result)) {
+      sum.calls_with_unknown_coverage++;
+    } else if (coverage.status === 'incomplete') {
+      sum.calls_with_unrecognized_fragments++;
+      sum.unrecognized_fragments += coverage.unrecognized_count;
+    } else {
+      if (coverage.total_fragments === 0) sum.calls_without_selected_fragments++;
+    }
+    return sum;
+  }, { calls_with_unrecognized_fragments:0, unrecognized_fragments:0,
+    calls_without_selected_fragments:0, calls_with_unknown_coverage:0 });
   const stats = {
     calls_total: calls.length,
     calls_with_audio: candidates.length,
@@ -208,6 +239,7 @@ export async function transcribeCalls({ dealData, transcribe }) {
     calls_failed: errors.length,
     calls_by_reserve: results.filter(result => String(result.transcript_engine || '').startsWith('reserve:')).length,
     calls_by_speechkit: results.filter(result => !result.transcript_engine || result.transcript_engine === 'speechkit').length,
+    ...coverageStats,
     errors,
   };
   return {

@@ -16,10 +16,10 @@ FROM generate_series(1, 2176) n;
 CREATE TEMP TABLE baseline_analyses AS SELECT to_jsonb(t) AS row FROM public.lost_deal_analyses t;
 CREATE TEMP TABLE baseline_attention AS SELECT to_jsonb(t) AS row FROM public.lost_pipeline_attention t;
 
-\i supabase/migrations/20261105052525_lost_processing_jobs.sql
-\i supabase/migrations/20261105065540_lost_bitrix_events.sql
-\i supabase/migrations/20261105065551_lost_overwrite_history.sql
-\i supabase/migrations/20261106031734_lost_audio_wait_origins.sql
+\i db/proposals/worker-migration-fixtures/20261105052525_lost_processing_jobs.sql
+\i db/proposals/worker-migration-fixtures/20261105065540_lost_bitrix_events.sql
+\i db/proposals/worker-migration-fixtures/20261105065551_lost_overwrite_history.sql
+\i db/proposals/worker-migration-fixtures/20261106031734_lost_audio_wait_origins.sql
 
 DO $$
 DECLARE n integer; item text; permission text;

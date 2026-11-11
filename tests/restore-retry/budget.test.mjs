@@ -14,7 +14,7 @@ async function database() {
   const { PGlite } = await import(pathToFileURL(pglitePath).href);
   const db = new PGlite();
   await db.exec(readFileSync('tests/restore-persistence/synthetic-schema.sql', 'utf8'));
-  await db.exec(readFileSync('supabase/migrations/20261105052525_lost_processing_jobs.sql', 'utf8'));
+  await db.exec(readFileSync('db/proposals/worker-migration-fixtures/20261105052525_lost_processing_jobs.sql', 'utf8'));
   let clock = '2026-11-04T21:01:00Z';
   const pool = {
     query: (sql, values) => db.query(sql, values),

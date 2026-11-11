@@ -13,7 +13,7 @@ test('ночной план читает зависшие сделки и пов
   const db = new PGlite();
   try {
     await db.exec(readFileSync('tests/restore-persistence/synthetic-schema.sql', 'utf8'));
-    await db.exec(readFileSync('supabase/migrations/20261105052525_lost_processing_jobs.sql', 'utf8'));
+    await db.exec(readFileSync('db/proposals/worker-migration-fixtures/20261105052525_lost_processing_jobs.sql', 'utf8'));
     await db.exec(`CREATE TABLE test_attention (active boolean NOT NULL);
       INSERT INTO test_attention VALUES (true);
       CREATE VIEW public.lost_pipeline_attention AS

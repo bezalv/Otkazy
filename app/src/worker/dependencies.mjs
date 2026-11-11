@@ -1,5 +1,5 @@
 import { createBitrixClient } from '../bitrix-client.mjs';
-import { createPolzaClient } from '../polza-client.mjs';
+import { createPolzaClient, createPolzaRoleInferenceClient } from '../polza-client.mjs';
 import { createSttClient } from '../stt-client.mjs';
 import { createJobQueue } from '../queue/index.mjs';
 import { createDelivery } from '../delivery/index.mjs';
@@ -8,6 +8,10 @@ import { createWorkerPump } from './pump.mjs';
 import { isAbsolute } from 'node:path';
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
+import { createRoleSessionContext } from './role-session-context.mjs';
+import { createRoleInferenceLedger } from './role-inference-ledger.mjs';
+import { createDurableRoleClient } from './durable-role-client.mjs';
+import { exactMillisTimestamp } from '../time-precision.mjs';
 
 // Версия политики привязана к фактическому коду распознавания и адаптера.
 // При изменении сегментации либо модели старые результаты не переиспользуются.
@@ -32,7 +36,21 @@ export function createWorkerDependencies({ pool, bitrixBaseUrl, polzaKey, sttUrl
   const transcribe = createSttClient({ bitrix, sttUrl, sttKey, tempRoot, fetchImpl });
   const queue = createJobQueue(pool);
   const delivery = createDelivery(pool, bitrix);
+  // Фабрика не делает сетевых запросов; роль не отправляется без
+  // подтверждения исходного перехода, сессии и действующей аренды.
+  const createRoleInference = ({job,stageScope,checkLease}) => {
+    const cutoff=exactMillisTimestamp(stageScope.loseDate);
+    if (!cutoff) throw new TypeError('Не установлена точная дата отказа');
+    const from=new Date(cutoff.getTime()-365*24*60*60*1000).toISOString();
+    const sessionContext=createRoleSessionContext({client:bitrix,dealId:String(job.deal_id),
+      transitionId:stageScope.stageHistoryId,cutoff:cutoff.toISOString(),from});
+    const ledger=createRoleInferenceLedger(pool,{jobId:job.id,leaseToken:job.lease_token,
+      dealId:String(job.deal_id),stageHistoryId:stageScope.stageHistoryId,cutoff:cutoff.toISOString()});
+    const transport=createPolzaRoleInferenceClient({apiKey:polzaKey,fetchImpl});
+    return {sessionContext,roleClient:createDurableRoleClient({ledger,sessionContext,transport,checkLease})};
+  };
   const pump = makePump({ pool, queue,
+    createRoleInference,
     delivery: ({ job }) => delivery.deliver(job.id, job.lease_token),
     processOptions: {
       bitrix, llm, transcribe,

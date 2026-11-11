@@ -7,7 +7,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 const READ_METHODS = new Set([
   'crm.deal.userfield.list', 'crm.deal.get', 'crm.stagehistory.list',
   'crm.activity.list', 'crm.timeline.comment.list', 'imopenlines.crm.chat.get',
-  'imopenlines.session.history.get', 'tasks.task.list', 'disk.file.get',
+  'imopenlines.session.history.get', 'imopenlines.v2.Session.list', 'tasks.task.list', 'disk.file.get',
 ]);
 const VERDICTS = new Set(['правомерен', 'неправомерен', 'недостаточно_данных']);
 

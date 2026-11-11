@@ -1,4 +1,5 @@
 import { exactMillisTimestamp } from '../time-precision.mjs';
+import { getRoleSessionContextScope } from '../worker/role-session-context.mjs';
 import { isDeepStrictEqual } from 'node:util';
 import { createHash } from 'node:crypto';
 
@@ -236,12 +237,16 @@ function mapDeal(deal, reasons, history, now) {
 }
 
 /** Собирает первичные данные. Нормализация чатов и распознавание выполняются отдельно. */
-export async function collectDeal({ client, dealId, silent = false, now = Date.now(), wait = defaultWait, expectedHistoryId = null, expectedLoseDate = null, requireCurrentHistory = false, verifyLatestSession }) {
+export async function collectDeal({ client, dealId, silent = false, now = Date.now(), wait = defaultWait, expectedHistoryId = null, expectedLoseDate = null, requireCurrentHistory = false, verifyLatestSession, roleSessionContext }) {
   if (!client || typeof client.request !== 'function') throw new TypeError('Нужен client.request');
   const id = Number(dealId);
   if (!Number.isSafeInteger(id) || id <= 0) throw new TypeError('Некорректный ID сделки');
   if (expectedHistoryId !== null && (typeof expectedHistoryId !== 'string' || !/^[1-9]\d{0,29}$/.test(expectedHistoryId))) throw new TypeError('Некорректный ID перехода');
-  if (verifyLatestSession !== undefined && (typeof verifyLatestSession !== 'function' || silent !== true
+  const roleScope = getRoleSessionContextScope(roleSessionContext);
+  const checkedLoseDate = exactMillisTimestamp(expectedLoseDate);
+  const trustedRole = roleScope && roleScope.dealId === String(id) && roleScope.stageHistoryId === expectedHistoryId
+    && checkedLoseDate && roleScope.cutoff === checkedLoseDate.toISOString() && verifyLatestSession === roleSessionContext.verify;
+  if (verifyLatestSession !== undefined && (typeof verifyLatestSession !== 'function' || (silent !== true && !trustedRole)
       || requireCurrentHistory !== true || expectedHistoryId === null || !exactMillisTimestamp(expectedLoseDate))) {
     throw new TypeError('Подтверждение новой сессии доступно только для закреплённого тихого перехода');
   }

@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { getRoleSessionContextScope } from '../worker/role-session-context.mjs';
 import { chatMillisTimestamp } from '../time-precision.mjs';
 import { explicitNonAudio, voiceFileSnapshot } from '../voice-file-metadata.mjs';
 import { verifiedAudioOnly } from '../stt-client.mjs';
@@ -199,8 +200,8 @@ function lineId(history, chat) {
   return safeId(parts[1]);
 }
 
-async function verifyFallback({ collection, session, chatId, meta, verifyFallbackSession }) {
-  if (collection.silent !== true || typeof verifyFallbackSession !== 'function'
+async function verifyFallback({ collection, session, chatId, meta, verifyFallbackSession, trustedRole }) {
+  if ((collection.silent !== true && !trustedRole) || typeof verifyFallbackSession !== 'function'
       || (!meta.isWazzup && !meta.isWappi)) return null;
   const deal = safeId(collection.deal_id), chat = safeId(chatId), history = session.history;
   const sessionId = safeId(history?.sessionId), cutoff = strictTime(collection.deal_data?.lose_date);
@@ -224,7 +225,7 @@ async function verifyFallback({ collection, session, chatId, meta, verifyFallbac
   const chatStillMatches = () => {
     const found = collection.raw.chats.filter(item => safeId(item?.CHAT_ID) === chat);
     return found.length === 1 && found[0] === matchingChat && JSON.stringify(found[0]) === chatSnapshot
-      && collection.silent === true && safeId(collection.deal_id) === deal
+      && (collection.silent === true || trustedRole) && safeId(collection.deal_id) === deal
       && strictTime(collection.deal_data?.lose_date) === cutoff;
   };
   const request = Object.freeze({ deal_id: deal, chat_id: chat, session_id: sessionId, line_id: line,
@@ -244,7 +245,7 @@ async function verifyFallback({ collection, session, chatId, meta, verifyFallbac
       || checks.chat_bound_to_deal !== true || checks.session_matches_chat !== true
       || checks.session_matches_line !== true || checks.session_crm_matches_deal !== true
       || checks.direct_session_history_matches !== true || checks.current_chat_history_matches !== true
-      || current?.sha256 !== snapshot.sha256 || session.history !== history || collection.silent !== true
+      || current?.sha256 !== snapshot.sha256 || session.history !== history || (collection.silent !== true && !trustedRole)
       || collection.raw.chats.filter(item => safeId(item?.CHAT_ID) === chat).length !== 1
       || JSON.stringify(collection.raw.chats.find(item => safeId(item?.CHAT_ID) === chat)) !== chatSnapshot
       || safeId(collection.deal_id) !== deal
@@ -370,7 +371,12 @@ function taskEvent(task, historicalScope) {
 }
 
 /** Подготовка коммуникаций из результата collectDeal. Все внешние действия внедряются вызывающим кодом. */
-export async function normalizeCommunications({ collection, resolveFile, transcribeVoice, screenshots = true, verifyFallbackSession, temporalCutoff = null }) {
+export async function normalizeCommunications({ collection, resolveFile, transcribeVoice, screenshots = true, verifyFallbackSession, temporalCutoff = null, roleSessionContext }) {
+  const roleScope = getRoleSessionContextScope(roleSessionContext);
+  const roleCutoff = strictTime(collection?.deal_data?.lose_date);
+  const trustedRole = !!roleScope && roleScope.dealId === String(collection?.deal_id)
+    && roleCutoff !== null && roleScope.cutoff === new Date(roleCutoff).toISOString()
+    && verifyFallbackSession === roleSessionContext.verify;
   if (collection?._status !== 'pending_normalization' || !collection.raw || !collection.deal_data) {
     throw new TypeError('Нужен полный результат первичного сбора');
   }
@@ -481,7 +487,7 @@ export async function normalizeCommunications({ collection, resolveFile, transcr
       return !user || (userRole(user) === 'Менеджер' && !confirmedBitrixManager(user));
     }));
     const verified = (!meta.isWappi || hasWappiCandidate)
-      ? await verifyFallback({ collection, session, chatId, meta, verifyFallbackSession }) : null;
+      ? await verifyFallback({ collection, session, chatId, meta, verifyFallbackSession, trustedRole }) : null;
     const sessionMessageStart = messages.length;
     const sessionFileRefs = new Set();
     const byId = new Map(files.filter(file => file && file.id != null).map(file => [String(file.id), file]));

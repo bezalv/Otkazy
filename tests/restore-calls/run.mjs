@@ -38,7 +38,49 @@ test('стерео сохраняет исходные поля, роли, дв�
   assert.equal(result.full_data.title, 'Пример');
   assert.equal(result.transcription_stats.calls_by_reserve, 1);
   assert.equal(result.transcription_stats.calls_failed, 0);
+  assert.equal(result.transcription_stats.calls_with_unknown_coverage, 1);
   assert.equal(result.ready_for_analysis, false);
+});
+
+test('некорректная карта покрытия не выглядит как полная', async () => {
+  const ok={version:1,status:'incomplete',total_fragments:3,unrecognized_count:1,
+    unrecognized_segments:[{channel:0,start:0,end:1}]};
+  for (const coverage of [
+    {...ok,version:undefined}, {...ok,version:0}, {...ok,unrecognized_count:'1'},
+    {...ok,total_fragments:0}, {...ok,unrecognized_segments:[]},
+    {...ok,unrecognized_segments:[{channel:2,start:0,end:1}]},
+    {...ok,unrecognized_segments:[{channel:0,start:2,end:1}]},
+    {...ok,unrecognized_segments:[{channel:0,start:0,end:NaN}]},
+    {...ok,status:'no_empty_fragments'},
+  ]) {
+    const result=await transcribeCalls({dealData:deal,transcribe:async req=>output(req,{transcription_coverage:coverage})});
+    assert.equal(result.transcription_stats.calls_with_unknown_coverage,1);
+    assert.equal(result.transcription_stats.unrecognized_fragments,0);
+    assert.equal(result.transcription_stats.calls_with_unrecognized_fragments,0);
+  }
+});
+
+test('статистика отдельно показывает пропуски, старое покрытие и отсутствие выбранных фрагментов', async () => {
+  const multi = { deal_id:42,communications:[call,
+    {...call,activity_id:'124'}, {...call,activity_id:'125'}, {...call,activity_id:'126'}] };
+  const coverages={
+    123:{version:1,status:'incomplete',total_fragments:3,unrecognized_count:2,
+      unrecognized_segments:[{channel:0,start:0,end:1},{channel:1,start:2,end:3}]},
+    124:{version:0,status:'unknown_legacy'},
+    125:{version:1,status:'no_empty_fragments',total_fragments:0,unrecognized_count:0,unrecognized_segments:[]},
+    126:{version:1,status:'no_empty_fragments',total_fragments:1,unrecognized_count:0,unrecognized_segments:[]},
+  };
+  const result=await transcribeCalls({dealData:multi,transcribe:async req=>output(req,{
+    transcription_coverage:coverages[req.activity_id],
+    ...(req.activity_id==='125'?{formatted_dialog:'',client_text:'',conversation:[],total_replicas:0}:{}),
+  })});
+  const stats=result.transcription_stats;
+  assert.equal(stats.calls_with_unrecognized_fragments,1);
+  assert.equal(stats.unrecognized_fragments,2);
+  assert.equal(stats.calls_with_unknown_coverage,1);
+  assert.equal(stats.calls_without_selected_fragments,1);
+  assert.equal(stats.calls_transcribed,3);
+  assert.equal(result.transcription_errors.length,0);
 });
 
 test('фраза ожидания обработки как единственный результат требует перепроверки', async () => {
