@@ -40,3 +40,16 @@ test('ожидающие записи ставятся в очередь оди�
     assert.equal((await enqueueDueAudioChecks(db)).length, 0);
   } finally { await db.close(); }
 });
+
+test('пилот не запускает ожидания аудио до границы пилота', {skip:!existsSync(pglitePath)},async()=>{
+ const {PGlite}=await import(pathToFileURL(pglitePath).href);const db=new PGlite();
+ try{
+  await db.exec(readFileSync('tests/restore-persistence/synthetic-schema.sql','utf8'));
+  await db.exec(readFileSync('db/proposals/worker-migration-fixtures/20261105052525_lost_processing_jobs.sql','utf8'));
+  for(const [id,date] of [[42,'2026-10-01'],[43,'2026-11-12']])await db.query(`INSERT INTO public.lost_audio_wait
+   (deal_id,lose_date,state,first_seen_at,deadline_at,next_check_at,silent,screenshots)
+   VALUES ($1,$2::date,'waiting',$2::date,$2::date+interval '1 day',$2::date,false,true)`,[id,date]);
+  const due=await enqueueDueAudioChecks(db,{pilotEnabledAt:'2026-11-01T00:00:00.000Z'});
+  assert.deepEqual(due.map(x=>Number(x.deal_id)),[43]);
+ }finally{await db.close();}
+});

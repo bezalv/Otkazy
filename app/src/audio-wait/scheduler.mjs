@@ -1,8 +1,9 @@
 // Постановка очередной проверки аудио. Новая таблица ожиданий не создаётся.
 // Старая n8n и этот планировщик не должны работать одновременно.
-export async function enqueueDueAudioChecks(pool, { limit = 20 } = {}) {
+export async function enqueueDueAudioChecks(pool, { limit = 20, pilotEnabledAt = null } = {}) {
   if (!pool || typeof pool.query !== 'function') throw new TypeError('Нужен пул PostgreSQL');
   if (!Number.isInteger(limit) || limit < 1 || limit > 100) throw new TypeError('Некорректный размер пакета');
+  if (pilotEnabledAt !== null && (!Number.isFinite(Date.parse(pilotEnabledAt)) || new Date(pilotEnabledAt).toISOString() !== pilotEnabledAt)) throw new TypeError('Некорректная граница пилота');
   const result = await pool.query(`
     WITH due AS (
       SELECT w.deal_id, w.lose_date, w.next_check_at, w.silent, w.screenshots,
@@ -11,6 +12,7 @@ export async function enqueueDueAudioChecks(pool, { limit = 20 } = {}) {
         (extract(epoch from w.next_check_at) * 1000000)::bigint::text AS request_key
       FROM public.lost_audio_wait w
       WHERE w.state='waiting' AND w.next_check_at <= now()
+        ${pilotEnabledAt ? 'AND w.lose_date >= $2::timestamptz' : ''}
         AND (w.lease_until IS NULL OR w.lease_until <= now())
         AND NOT EXISTS (
           SELECT 1 FROM public.lost_processing_jobs j
@@ -25,7 +27,7 @@ export async function enqueueDueAudioChecks(pool, { limit = 20 } = {}) {
       (id, request_key, deal_id, lose_date, trigger_type, silent, screenshots)
     SELECT gen_random_uuid(), request_key, deal_id, lose_date, 'audio_wait', silent, screenshots FROM due
     ON CONFLICT (request_key) DO NOTHING
-    RETURNING id, deal_id, request_key`, [limit]);
+    RETURNING id, deal_id, request_key`, pilotEnabledAt ? [limit, pilotEnabledAt] : [limit]);
   return result.rows;
 }
 

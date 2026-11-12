@@ -42,3 +42,14 @@ test('миграция и очередь на локальном движке Po
   await db.query("insert into public.lost_deal_analyses (id, pipeline_operation_id) values (1, $1)", [claimed.id]);
   await assert.rejects(db.query("insert into public.lost_deal_analyses (id, pipeline_operation_id) values (2, $1)", [claimed.id]), { code: '23505' });
 });
+
+test('пилот не захватывает старые и ручные задания', {skip:!existsSync(packagePath)}, async t=>{
+  const {PGlite}=await import(pathToFileURL(packagePath).href);const db=new PGlite();t.after(()=>db.close());
+  await db.exec('create role anon; create role authenticated; create table public.lost_deal_analyses (id bigint primary key);');
+  await db.exec(readFileSync(migrationPath,'utf8'));const ordinary=createJobQueue(db);
+  await ordinary.enqueue({requestKey:'bitrix24:deal-stage-history:101',dealId:101,loseDate:'2026-11-10T00:00:00.000Z',triggerType:'live'});
+  await ordinary.enqueue({requestKey:'manual:102',dealId:102,loseDate:'2026-11-12T01:00:00.000Z',triggerType:'manual'});
+  await ordinary.enqueue({requestKey:'bitrix24:deal-stage-history:103',dealId:103,loseDate:'2026-11-12T01:00:00.000Z',triggerType:'live'});
+  const pilot=createJobQueue(db,{pilotEnabledAt:'2026-11-12T00:00:00.000Z'});
+  assert.equal(Number((await pilot.claim()).deal_id),103);assert.equal(await pilot.claim(),null);
+});

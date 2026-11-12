@@ -18,7 +18,7 @@ function required(env, name) {
 /** Проверяет настройки до создания сервера, пула или фоновых задач. */
 export function readMainConfig(env) {
   const mode = env.OTKAZY_MODE || 'setup';
-  if (!['setup', 'active'].includes(mode)) throw new Error('Некорректный OTKAZY_MODE');
+  if (!['setup', 'active', 'pilot'].includes(mode)) throw new Error('Некорректный OTKAZY_MODE');
   const port = Number(env.PORT || 3000);
   if (!Number.isSafeInteger(port) || port < 1 || port > 65535) throw new Error('Некорректный PORT');
   const host = env.HOST || '0.0.0.0';
@@ -58,8 +58,8 @@ export function readMainConfig(env) {
   if (!exactMillisTimestamp(liveEnabledAt)) throw new Error('Некорректный LIVE_ENABLED_AT');
   return {
     mode, port, host, databaseUrl: database.toString(), bitrixBaseUrl,
-    polzaKey: required(env, 'POLZA_API_KEY'), applicationToken: required(env, 'BITRIX_EVENT_TOKEN'),
-    domain, memberId: required(env, 'BITRIX_MEMBER_ID'), liveEnabledAt,
+    polzaKey: required(env, 'POLZA_API_KEY'), ...(mode === 'active' ? {applicationToken: required(env, 'BITRIX_EVENT_TOKEN'),
+    memberId: required(env, 'BITRIX_MEMBER_ID')} : {}), domain, liveEnabledAt,
   };
 }
 
@@ -76,12 +76,12 @@ export function createMainHandler({ mode, application = null, isStopping = () =>
     res.setHeader('Content-Type', 'application/json; charset=utf-8');
     if ((req.method === 'GET' || req.method === 'HEAD') && (pathname === '/health' || pathname === '/ready')) {
       let info = { ready: false, status: 'not_running' };
-      try { if (pathname === '/ready' && mode === 'active' && application && !isStopping()) info = application.getReadiness(); } catch { /* не выдаём внутреннюю ошибку */ }
+      try { if (pathname === '/ready' && mode !== 'setup' && application && !isStopping()) info = application.getReadiness(); } catch { /* не выдаём внутреннюю ошибку */ }
       const alive = mode === 'setup' || (isStarted() && !isStopping());
-      const ready = mode === 'active' && alive && info?.ready === true;
+      const ready = mode !== 'setup' && alive && info?.ready === true;
       const code = pathname === '/health' ? (alive ? 200 : 503) : ready ? 200 : 503;
       const checks = {};
-      if (mode === 'active' && info?.checks && typeof info.checks === 'object') {
+      if (mode !== 'setup' && info?.checks && typeof info.checks === 'object') {
         for (const name of ['inbox', 'worker', 'nightly', 'stt', 'delivery_review', 'database', 'database_retry', 'database_delivery']) {
           const value = info.checks[name];
           if (['checking', 'ok', 'error', 'unavailable', 'needs_review'].includes(value)) checks[name] = value;
@@ -159,7 +159,7 @@ export async function startMain({ env = process.env, processRef = process, makeP
     } finally { timer.abort(); }
   }
   try {
-    if (config.mode === 'active') {
+    if (config.mode !== 'setup') {
       const ca = trustedRoots(readCertificate);
       pool = await makePool({ connectionString: config.databaseUrl, ssl: { rejectUnauthorized: true, ca }, max: 2,
         connectionTimeoutMillis: 10000, idleTimeoutMillis: 30000,
@@ -179,7 +179,7 @@ export async function startMain({ env = process.env, processRef = process, makeP
       });
       application = makeApplication({ pool: createDeadlinePool(pool, { initializationSignal: startupAbort.signal }), bitrixBaseUrl: config.bitrixBaseUrl, polzaKey: config.polzaKey,
         applicationToken: config.applicationToken, domain: config.domain, memberId: config.memberId,
-        liveEnabledAt: config.liveEnabledAt, onEvent: name => {
+        liveEnabledAt: config.liveEnabledAt, ...(config.mode === 'pilot' ? {pilotMode:true} : {}), onEvent: name => {
           if (name === 'processing_degraded') log('Обработка временно недоступна');
           if (name === 'processing_recovered') log('Обработка восстановлена');
         } });

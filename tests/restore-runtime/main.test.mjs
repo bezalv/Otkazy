@@ -69,6 +69,14 @@ test('ошибочная конфигурация не создаёт пул, с
   assert.doesNotThrow(() => readMainConfig({ ...valid, DATABASE_URL: 'postgresql://user:password@aws-0-us.pooler.supabase.com:5432/db' }));
 });
 
+test('режим пилота не требует событийного токена и не открывает webhook', () => {
+  const config=readMainConfig({...valid,OTKAZY_MODE:'pilot',BITRIX_EVENT_TOKEN:'',BITRIX_MEMBER_ID:''});
+  assert.equal(config.mode,'pilot');assert.equal(config.applicationToken,undefined);
+  const handler=createMainHandler({mode:'pilot',application:{getReadiness:()=>({ready:true})},isStarted:()=>true});
+  assert.equal(request(handler,'/ready').statusCode,200);
+  assert.equal(request(handler,'/webhooks/bitrix','POST').statusCode,404);
+});
+
 test('подменённый сертификат не позволяет создать пул и не раскрывает ошибку чтения', async () => {
   let created = 0;
   for (const readCertificate of [() => rootCertificates[0], () => { throw new Error('fixture-secret'); }]) {

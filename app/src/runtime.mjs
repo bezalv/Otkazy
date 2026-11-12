@@ -4,9 +4,11 @@ import { startSttService } from './stt/child.mjs';
 import { createWorkerDependencies } from './worker/dependencies.mjs';
 import { runNightlyCycle } from './retry/coordinator.mjs';
 import { checkRuntime } from './server.mjs';
+import { pollPilotRefusals } from './pilot/live-poll.mjs';
+import { validateLiveConfig } from './live/index.mjs';
 
 /** Явная подготовка runtime. Не подключается к БД и не запускает расписания. */
-export async function prepareRuntime({ pool, bitrixBaseUrl, polzaKey, bitrixLimiter, deliveryMode = 'production', fetchImpl = globalThis.fetch,
+export async function prepareRuntime({ pool, bitrixBaseUrl, polzaKey, bitrixLimiter, deliveryMode = 'production', pilotEnabledAt = null, fetchImpl = globalThis.fetch,
   startStt = startSttService, checkTools = checkRuntime, makeDependencies = createWorkerDependencies,
   loadText = path => readFile(path, 'utf8') }) {
   const [judgePrompt, writerPrompt] = await Promise.all([
@@ -19,7 +21,7 @@ export async function prepareRuntime({ pool, bitrixBaseUrl, polzaKey, bitrixLimi
   try {
     if (typeof stt.healthy !== 'function' || typeof stt.close !== 'function') throw new Error('Не задан контроль сервиса распознавания');
     const dependencies = makeDependencies({ pool, bitrixBaseUrl, polzaKey,
-      sttUrl: stt.address, sttKey: stt.key, tempRoot: stt.tempRoot, judgePrompt, writerPrompt, fetchImpl, bitrixLimiter, deliveryMode });
+      sttUrl: stt.address, sttKey: stt.key, tempRoot: stt.tempRoot, judgePrompt, writerPrompt, fetchImpl, bitrixLimiter, deliveryMode, pilotEnabledAt });
     const active = new Set();
     let closing = false;
     let drainPromise;
@@ -34,7 +36,15 @@ export async function prepareRuntime({ pool, bitrixBaseUrl, polzaKey, bitrixLimi
       return promise;
     }
     return {
-      tick: () => run(() => dependencies.pump.tick()),
+      tick: () => run(async () => {
+        if (pilotEnabledAt) await validateLiveConfig(pool,pilotEnabledAt);
+        return dependencies.pump.tick();
+      }),
+      pollPilot: () => {
+        if (deliveryMode !== 'pilot65' || !pilotEnabledAt) throw new Error('Пилот не включён');
+        return run(async () => { await validateLiveConfig(pool,pilotEnabledAt);
+          return pollPilotRefusals({bitrix:dependencies.bitrix,queue:dependencies.queue,enabledAt:pilotEnabledAt}); });
+      },
       nightly: nowMs => run(() => runNightlyCycle({ pool, queue: dependencies.queue, bitrix: dependencies.bitrix, nowMs })),
       async close({ graceMs = 25000 } = {}) {
         if (!Number.isSafeInteger(graceMs) || graceMs < 1 || graceMs > 300000) throw new TypeError('Некорректный срок завершения');

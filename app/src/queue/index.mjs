@@ -16,8 +16,9 @@ function leaseSeconds(value) {
 }
 
 /** Очередь хранит только параметры запуска; все запросы выполняются через подключённый pg. */
-export function createJobQueue(pool, { uuid = randomUUID, lease = DEFAULT_LEASE_SECONDS } = {}) {
+export function createJobQueue(pool, { uuid = randomUUID, lease = DEFAULT_LEASE_SECONDS, pilotEnabledAt = null } = {}) {
   if (!pool || typeof pool.query !== 'function') throw new TypeError('Нужен пул PostgreSQL');
+  if (pilotEnabledAt !== null && !exactMillisTimestamp(pilotEnabledAt)) throw new TypeError('Некорректная граница пилота');
   const duration = leaseSeconds(lease);
 
   async function enqueueOn(connection, { requestKey, dealId, loseDate, triggerType, silent = false, screenshots = true }, createdAt = null) {
@@ -127,7 +128,8 @@ export function createJobQueue(pool, { uuid = randomUUID, lease = DEFAULT_LEASE_
         update public.lost_processing_jobs
         set status = 'pending', lease_token = null, lease_until = null, updated_at = now()
         where status = 'processing' and lease_until <= now()
-        returning id`);
+          ${pilotEnabledAt ? "and lose_date >= $1::timestamptz and trigger_type in ('live','audio_wait')" : ''}
+        returning id`, pilotEnabledAt ? [pilotEnabledAt] : []);
       return result.rows.length;
     },
 
@@ -139,6 +141,7 @@ export function createJobQueue(pool, { uuid = randomUUID, lease = DEFAULT_LEASE_
           with candidate as (
             select job.id from public.lost_processing_jobs job
             where job.status = 'pending' and job.available_at <= now()
+              ${pilotEnabledAt ? "and job.lose_date >= $3::timestamptz and job.trigger_type in ('live','audio_wait')" : ''}
               and not exists (
                 select 1 from public.lost_processing_jobs active
                 where active.deal_id = job.deal_id and active.status in ('processing', 'needs_review')
@@ -151,7 +154,7 @@ export function createJobQueue(pool, { uuid = randomUUID, lease = DEFAULT_LEASE_
               lease_until = now() + make_interval(secs => $2::double precision),
               attempts = attempts + 1, updated_at = now()
           from candidate where job.id = candidate.id
-          returning job.*, to_char(job.lose_date AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS lose_date`, [token, duration]);
+          returning job.*, to_char(job.lose_date AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS lose_date`, pilotEnabledAt ? [token, duration, pilotEnabledAt] : [token, duration]);
         return result.rows[0] || null;
       } catch (error) {
         // Два процесса могли одновременно выбрать разные задания одной сделки.

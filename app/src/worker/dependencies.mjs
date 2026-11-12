@@ -12,6 +12,7 @@ import { createRoleSessionContext } from './role-session-context.mjs';
 import { createRoleInferenceLedger } from './role-inference-ledger.mjs';
 import { createDurableRoleClient } from './durable-role-client.mjs';
 import { exactMillisTimestamp } from '../time-precision.mjs';
+import { enqueueDueAudioChecks } from '../audio-wait/scheduler.mjs';
 
 // Версия политики привязана к фактическому коду распознавания и адаптера.
 // При изменении сегментации либо модели старые результаты не переиспользуются.
@@ -25,7 +26,7 @@ function sttAttemptPolicy() {
 }
 
 // Только сборка зависимостей: не открывает соединение и не запускает обработку.
-export function createWorkerDependencies({ pool, bitrixBaseUrl, polzaKey, sttUrl, sttKey, tempRoot, judgePrompt, writerPrompt, bitrixLimiter, deliveryMode = 'production', fetchImpl = globalThis.fetch, makePump = createWorkerPump }) {
+export function createWorkerDependencies({ pool, bitrixBaseUrl, polzaKey, sttUrl, sttKey, tempRoot, judgePrompt, writerPrompt, bitrixLimiter, deliveryMode = 'production', pilotEnabledAt = null, fetchImpl = globalThis.fetch, makePump = createWorkerPump }) {
   if (!pool || typeof pool.query !== 'function' || typeof pool.connect !== 'function') throw new TypeError('Не задан пул базы');
   if (typeof judgePrompt !== 'string' || !judgePrompt.trim() || typeof writerPrompt !== 'string' || !writerPrompt.trim()) {
     throw new TypeError('Не заданы промпты анализа');
@@ -34,7 +35,8 @@ export function createWorkerDependencies({ pool, bitrixBaseUrl, polzaKey, sttUrl
   const bitrix = createBitrixClient({ baseUrl: bitrixBaseUrl, fetchImpl, limiter: bitrixLimiter });
   const llm = createPolzaClient({ apiKey: polzaKey, fetchImpl });
   const transcribe = createSttClient({ bitrix, sttUrl, sttKey, tempRoot, fetchImpl });
-  const queue = createJobQueue(pool);
+  if ((deliveryMode === 'pilot65') !== (pilotEnabledAt !== null)) throw new TypeError('Не задана граница пилота');
+  const queue = createJobQueue(pool, { pilotEnabledAt });
   const delivery = createDelivery(pool, bitrix, { mode: deliveryMode });
   // Фабрика не делает сетевых запросов; роль не отправляется без
   // подтверждения исходного перехода, сессии и действующей аренды.
@@ -50,6 +52,7 @@ export function createWorkerDependencies({ pool, bitrixBaseUrl, polzaKey, sttUrl
     return {sessionContext,roleClient:createDurableRoleClient({ledger,sessionContext,transport,checkLease})};
   };
   const pump = makePump({ pool, queue,
+    ...(pilotEnabledAt ? { operations:{schedule:() => enqueueDueAudioChecks(pool,{pilotEnabledAt})} } : {}),
     createRoleInference,
     delivery: ({ job }) => delivery.deliver(job.id, job.lease_token),
     processOptions: {

@@ -2,7 +2,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { prepareRuntime } from './runtime.mjs';
 import { createBitrixClient } from './bitrix-client.mjs';
 import { createBitrixLimiter } from './bitrix-limiter.mjs';
-import { createLiveInbox, processLiveEvent } from './live/index.mjs';
+import { createLiveInbox, processLiveEvent, validateLiveConfig } from './live/index.mjs';
 import { createLiveHttpHandler } from './live/http.mjs';
 
 const DEFAULT_INTERVALS = { inbox: 3000, worker: 5000, nightly: 60000, database: 30000 };
@@ -42,8 +42,9 @@ export async function assertAudioOriginSchema(pool) {
  * Сырой текст ошибок, тело webhook и секреты нигде не журналируются.
  */
 export function createApplication({ pool, bitrixBaseUrl, polzaKey, applicationToken, domain, memberId,
-  liveEnabledAt, fetchImpl = globalThis.fetch, intervals = {}, databaseDeadlineMs = 5000, onEvent = () => {} }, dependencies = {}) {
-  const configured = { ...DEFAULT_INTERVALS, ...intervals };
+  liveEnabledAt, pilotMode = false, fetchImpl = globalThis.fetch, intervals = {}, databaseDeadlineMs = 5000, onEvent = () => {} }, dependencies = {}) {
+  if (typeof pilotMode !== 'boolean') throw new TypeError('Некорректный режим пилота');
+  const configured = { ...DEFAULT_INTERVALS, ...(pilotMode ? {inbox:60000} : {}), ...intervals };
   for (const interval of Object.values(configured)) {
     if (!Number.isSafeInteger(interval) || interval < 1 || interval > 86400000) throw new TypeError('Некорректный интервал');
   }
@@ -231,9 +232,14 @@ export function createApplication({ pool, bitrixBaseUrl, polzaKey, applicationTo
     scheduled.set('database', timer);
   }
   function beginSchedules() {
-    schedule('inbox', inboxTick, 0);
+    schedule('inbox', pilotMode ? async () => {
+      const result=await runtime.pollPilot();
+      if (result?.status === 'stt_unavailable') throw new Error('Распознавание недоступно');
+      return result;
+    } : inboxTick, 0);
     schedule('worker', workerTick, 0);
-    schedule('nightly', () => runtime.nightly(), 0);
+    if (pilotMode) checks.nightly='ok';
+    else schedule('nightly', () => runtime.nightly(), 0);
     scheduleDatabase(0);
   }
 
@@ -246,14 +252,15 @@ export function createApplication({ pool, bitrixBaseUrl, polzaKey, applicationTo
       try {
         await inspectAudioOriginSchema(pool);
         if (state !== 'starting') return { status: 'stopping' };
-        inbox = makeInbox(pool, { applicationToken, domain, memberId, liveEnabledAt });
-        await inbox.assertConfig();
+        if (pilotMode) await validateLiveConfig(pool,liveEnabledAt);
+        else { inbox = makeInbox(pool, { applicationToken, domain, memberId, liveEnabledAt }); await inbox.assertConfig(); }
         if (state !== 'starting') return { status: 'stopping' };
         bitrix = makeBitrix({ baseUrl: bitrixBaseUrl, fetchImpl, limiter: bitrixLimiter });
-        runtime = await prepare({ pool, bitrixBaseUrl, polzaKey, fetchImpl, bitrixLimiter });
+        runtime = await prepare({ pool, bitrixBaseUrl, polzaKey, fetchImpl, bitrixLimiter,
+          ...(pilotMode ? {deliveryMode:'pilot65',pilotEnabledAt:liveEnabledAt} : {}) });
         if (state !== 'starting') return { status: 'stopping' };
         // HTTP-прослойка отслеживает запись даже если клиент оборвал соединение.
-        liveHandler = makeHttp({ inbox: { acceptForm: body => track(inbox.acceptForm(body)) } });
+        if (!pilotMode) liveHandler = makeHttp({ inbox: { acceptForm: body => track(inbox.acceptForm(body)) } });
         state = 'running';
         beginSchedules();
         return { status: 'running' };

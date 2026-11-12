@@ -12,6 +12,22 @@ function deferred() {
   const promise = new Promise((yes, no) => { resolve = yes; reject = no; });
   return { promise, resolve, reject };
 }
+
+test('пилот запускает опрос и worker без webhook и ночного повтора',async()=>{
+  const calls=[];const timers=fakeTimers();const at='2026-11-05T00:00:00.000Z';let settings;
+  const app=createApplication({pool:{async query(){return {rows:[{matches:true}]};}},pilotMode:true,liveEnabledAt:at,
+    bitrixBaseUrl:'fixture',polzaKey:'fixture',intervals:{inbox:1000,worker:1000,nightly:1000}}, {
+    timers,inspectAudioOriginSchema:async()=>{},createBitrixClient:()=>({}),
+    createLiveInbox:()=>{throw Error('webhook forbidden');},createLiveHttpHandler:()=>{throw Error('webhook forbidden');},
+    inspectInbox:async()=>false,inspectDelivery:async()=>false,
+    prepareRuntime:async x=>{settings=x;return {pollPilot:async()=>{calls.push('poll');return {queued:0};},
+      tick:async()=>{calls.push('worker');},nightly:async()=>{calls.push('nightly');},close:async()=>({status:'drained'})};},
+  });
+  await app.start();assert.equal(settings.deliveryMode,'pilot65');assert.equal(settings.pilotEnabledAt,at);
+  for(const [id,timer] of [...timers.pending])if(timer.ms===0)timers.fire(id);
+  await flush();await flush();assert.ok(calls.includes('poll'));assert.ok(calls.includes('worker'));assert.ok(!calls.includes('nightly'));
+  await app.stop();
+});
 function fakeTimers() {
   let next = 0;
   const pending = new Map();
