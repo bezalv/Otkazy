@@ -42,8 +42,11 @@ function expectedChat(result, chat, purpose, entity) {
   if (purpose === 'role_inference') return wazzup;
   // Identity отдельно от авторства: название Wappi и код в полном entityId
   // подтверждают тип текущего чата, но не направление сообщений или историю.
-  const wappi = /wappi/i.test(title) && !/^wz_/i.test(connector) && !/wazzup/i.test(connector);
-  return wazzup || wappi;
+  const wappi = /wappi/i.test(title) && connector !== 'telegrambot' && !/^wz_/i.test(connector) && !/wazzup/i.test(connector);
+  // Встроенный Telegram-коннектор подтверждает только идентичность сессии,
+  // но не авторство сообщений.
+  const telegram = connector === 'telegrambot' && !/wappi|wazzup/i.test(title);
+  return wazzup || wappi || telegram;
 }
 function stageMatches(deal, rows, dealId, stageId, transitionId, cutoff) {
   if (numeric(deal?.result?.ID) !== dealId || deal?.result?.STAGE_ID !== stageId) return false;

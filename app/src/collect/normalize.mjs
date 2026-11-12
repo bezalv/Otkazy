@@ -84,7 +84,7 @@ function confirmedBitrixManager(user) {
     && user.externalAuthId.trim().toLowerCase() !== 'imconnector';
 }
 
-function roleForMessage(message, text, users, isWazzup, connectorUnknown, connectorConflict, isWappi = false) {
+function roleForMessage(message, text, users, isWazzup, connectorUnknown, connectorConflict, isWappi = false, isTelegram = false) {
   const senderId = String(message.senderid || message.SENDER_ID || message.author_id || message.AUTHOR_ID || '0');
   const user = senderId !== '0' ? users?.[senderId] : null;
   if (connectorConflict) return { role: 'unknown', author: 'Участник чата' };
@@ -110,13 +110,13 @@ function roleForMessage(message, text, users, isWazzup, connectorUnknown, connec
     return { role: 'unknown', author: 'Участник чата' };
   }
   // Формат заголовка Wazzup не является подтверждением направления Wappi.
-  const author = !isWappi && text.match(/===\s*(?:Исходящее|Входящее)\s+сообщение,\s*автор:\s*[^(]*\(([^)]+)\)/);
+  const author = !isWappi && !isTelegram && text.match(/===\s*(?:Исходящее|Входящее)\s+сообщение,\s*автор:\s*[^(]*\(([^)]+)\)/);
   if (author) return { role: 'Менеджер', author: author[1].trim() };
   if (user) {
     const role = userRole(user);
     // У Wappi отсутствие признаков внешнего пользователя ещё не делает его
     // сотрудником. Сохраняем неопределённость, пока сотрудник не подтверждён.
-    if (isWappi && role === 'Менеджер' && !confirmedBitrixManager(user)) {
+    if ((isWappi || isTelegram) && role === 'Менеджер' && !confirmedBitrixManager(user)) {
       return { role: 'unknown', author: 'Участник чата' };
     }
     return { role, author: role === 'Клиент' ? 'Клиент' : (user.name || user.firstName || 'Менеджер') };
@@ -415,11 +415,12 @@ export async function normalizeCommunications({ collection, resolveFile, transcr
     const idIsWazzup = connector.toLowerCase().includes('wazzup') || connector.toLowerCase().startsWith('wz_');
     const titleIsWazzup = title.toLowerCase().includes('wazzup');
     const titleIsWappi = title.toLowerCase().includes('wappi');
-    const conflict = (titleIsWazzup && !idIsWazzup) || (titleIsWappi && idIsWazzup);
+    const conflict = (titleIsWazzup && !idIsWazzup) || (titleIsWappi && (idIsWazzup || connector === 'telegrambot'));
     return [String(chat.CHAT_ID), {
       connector, title, connectorUnknown: connector.toLowerCase() === 'unknown' || conflict, connectorConflict: conflict,
       isWazzup: idIsWazzup && !conflict,
       isWappi: !conflict && (connector.toLowerCase().includes('wappi') || titleIsWappi),
+      isTelegram: !conflict && connector === 'telegrambot',
     }];
   }));
   const messages = [];
@@ -524,7 +525,7 @@ export async function normalizeCommunications({ collection, resolveFile, transcr
       const link = ids.length ? null : audioLink(text);
       const count = ids.length + (link ? 1 : 0);
       if (systemMessage(message, text, count)) { systemDropped++; continue; }
-      const { role, author } = roleForMessage(message, text, users, meta.isWazzup, meta.connectorUnknown, meta.connectorConflict, meta.isWappi);
+      const { role, author } = roleForMessage(message, text, users, meta.isWazzup, meta.connectorUnknown, meta.connectorConflict, meta.isWappi, meta.isTelegram);
       const cleaned = link ? '' : cleanChatText(text, meta.isWazzup);
       if (!cleaned && !count) continue;
       // Ссылки на файлы регистрируются выше, даже когда сообщение позднее
@@ -605,8 +606,8 @@ export async function normalizeCommunications({ collection, resolveFile, transcr
     const user = authorId !== '0' ? orphan.users[authorId] : null;
     const role = orphan.meta.connectorConflict ? 'unknown' : orphan.meta.isWazzup || orphan.meta.connectorUnknown
       ? (confirmedBitrixManager(user) ? 'Менеджер' : 'unknown')
-      : (user ? (orphan.meta.isWappi && userRole(user) === 'Менеджер' && !confirmedBitrixManager(user) ? 'unknown' : userRole(user))
-        : (orphan.meta.isWappi ? 'unknown' : 'Клиент'));
+      : (user ? ((orphan.meta.isWappi || orphan.meta.isTelegram) && userRole(user) === 'Менеджер' && !confirmedBitrixManager(user) ? 'unknown' : userRole(user))
+        : ((orphan.meta.isWappi || orphan.meta.isTelegram) ? 'unknown' : 'Клиент'));
     const author = role === 'Менеджер' ? (user.name || user.firstName || 'Менеджер') : role === 'Клиент' ? 'Клиент' : 'Участник чата';
     const event = {
       type: 'chat', channel: orphan.meta.title, connector_id: orphan.meta.connector,

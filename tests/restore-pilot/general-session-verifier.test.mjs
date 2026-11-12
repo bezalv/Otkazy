@@ -72,6 +72,17 @@ test('identity проверка Wazzup требует точного совпа�
  assert.equal((await identity(f.input))?.kind,'verified_fallback_session_v1');
  f.state.connector='wz_other';assert.equal(await identity(f.input),null);
 });
+test('Telegram identity не подтверждает авторство и требует точного кода и привязки к сделке',async()=>{
+ const f=fixture();f.state.connector='telegrambot';f.state.title='Telegram';
+ f.input.history.chat[12].entityId='telegrambot|9|client|user';
+ f.input.history_sha256=createHash('sha256').update(JSON.stringify(f.input.history)).digest('hex');
+ const identity=createGeneralSessionVerifier({client:f.client,lookupSession:f.lookup,dealId:'127114',transitionId:'321',purpose:'session_identity'});
+ assert.equal((await identity(f.input))?.kind,'verified_fallback_session_v1');
+ assert.equal(await f.verifier(f.input),null);
+ f.state.record.crmEntityId='1';assert.equal(await identity(f.input),null);f.state.record.crmEntityId='127114';
+ f.state.connector='telegrambot_fake';assert.equal(await identity(f.input),null);f.state.connector='telegrambot';
+ f.state.title='Wappi Telegram';assert.equal(await identity(f.input),null);
+});
 test('role_inference требует точный код коннектора исходного снимка и проверяет его повторно',async()=>{
   for(const change of [f=>{f.state.connector='wz_other';}, f=>{f.state.connector='';},
     f=>{f.state.connector='unknown';},f=>{f.state.title='Wappi';}]) {

@@ -507,6 +507,17 @@ test('Wappi не приписывает отдельное вложение кл
   assert.equal(result.deal_data.communications[0].role,'unknown');
 });
 
+test('Telegram сохраняет неизвестное авторство и подтверждает только признаки пользователя', async () => {
+  const users={1:{name:'Неполный'},2:{name:'Сотрудник',active:true,connector:false,extranet:false,externalAuthId:'default'},3:{connector:true}};
+  const collection=collected({chats:[{CHAT_ID:2,CONNECTOR_ID:'telegrambot',CONNECTOR_TITLE:'Telegram'}],
+    sessions:[{session_id:1,history:{chatId:2,chat:{2:{}},users,files:{},message:{
+      1:{id:1,senderid:1,text:'Неизвестный автор'},2:{id:2,senderid:2,text:'Сообщение сотрудника'},
+      3:{id:3,senderid:3,text:'Сообщение клиента'}}}}]});
+  const events=(await normalizeCommunications({collection})).deal_data.communications;
+  assert.deepEqual(events.map(x=>x.role),['unknown','Менеджер','Клиент']);
+  assert.deepEqual(events.map(x=>x.direction),['unknown','outgoing','incoming']);
+});
+
 test('заголовок входящего Wappi не переопределяет признаки автора и не назначает менеджера', async () => {
   const collection=collected({chats:[{CHAT_ID:2,CONNECTOR_ID:'opaque',CONNECTOR_TITLE:'Wappi'}],
     sessions:[{session_id:1,history:{chatId:2,chat:{2:{}},users:{3:{connector:true}},files:{},message:{
