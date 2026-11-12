@@ -25,7 +25,7 @@ function sttAttemptPolicy() {
 }
 
 // Только сборка зависимостей: не открывает соединение и не запускает обработку.
-export function createWorkerDependencies({ pool, bitrixBaseUrl, polzaKey, sttUrl, sttKey, tempRoot, judgePrompt, writerPrompt, bitrixLimiter, fetchImpl = globalThis.fetch, makePump = createWorkerPump }) {
+export function createWorkerDependencies({ pool, bitrixBaseUrl, polzaKey, sttUrl, sttKey, tempRoot, judgePrompt, writerPrompt, bitrixLimiter, deliveryMode = 'production', fetchImpl = globalThis.fetch, makePump = createWorkerPump }) {
   if (!pool || typeof pool.query !== 'function' || typeof pool.connect !== 'function') throw new TypeError('Не задан пул базы');
   if (typeof judgePrompt !== 'string' || !judgePrompt.trim() || typeof writerPrompt !== 'string' || !writerPrompt.trim()) {
     throw new TypeError('Не заданы промпты анализа');
@@ -35,7 +35,7 @@ export function createWorkerDependencies({ pool, bitrixBaseUrl, polzaKey, sttUrl
   const llm = createPolzaClient({ apiKey: polzaKey, fetchImpl });
   const transcribe = createSttClient({ bitrix, sttUrl, sttKey, tempRoot, fetchImpl });
   const queue = createJobQueue(pool);
-  const delivery = createDelivery(pool, bitrix);
+  const delivery = createDelivery(pool, bitrix, { mode: deliveryMode });
   // Фабрика не делает сетевых запросов; роль не отправляется без
   // подтверждения исходного перехода, сессии и действующей аренды.
   const createRoleInference = ({job,stageScope,checkLease}) => {

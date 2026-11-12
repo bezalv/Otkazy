@@ -309,4 +309,22 @@ test('состояния доставки после транзакции рез
     assert.deepEqual(notification.recipient_states, { 65: 'ok', 26175: 'sending', 19601: 'pending' });
     limiter.close();
   });
+  await t.test('пилот доставляет все вердикты только 65 и не пишет комментарий', async () => {
+    const sent=[];
+    const pilot=createDelivery(pool,{async request(method, body, options){
+      assert.equal(method,'im.notify.system.add');
+      assert.equal(body.USER_ID,65);assert.equal(await options.beforeSend(),true);
+      sent.push(body);return {result:42};
+    }},{mode:'pilot65'});
+    for (const [n,verdict] of [[21,'правомерен'],[22,'неправомерен'],[23,'недостаточно_данных']]) {
+      await add(n,{verdict,closure:'other'});
+      assert.deepEqual(await pilot.deliver(jobId(n),lease),{state:'done'});
+      assert.equal((await row(n)).comment_state,'skipped');
+      const q=await db.query("SELECT ai_judge_json->'pilot_notification' AS pilot,ai_judge_json->'notification' AS production FROM lost_deal_analyses WHERE id=$1",[n]);
+      assert.deepEqual(q.rows[0].pilot.delivered,[65]);assert.equal(q.rows[0].production,null);
+    }
+    assert.equal(sent.length,3);
+    assert.match(sent[0].MESSAGE,/правомерен/);assert.match(sent[2].MESSAGE,/недостаточно_данных/);
+    await add(24,{silent:true});assert.deepEqual(await pilot.deliver(jobId(24),lease),{state:'done'});assert.equal(sent.length,3);
+  });
 });

@@ -6,7 +6,7 @@ import { runNightlyCycle } from './retry/coordinator.mjs';
 import { checkRuntime } from './server.mjs';
 
 /** Явная подготовка runtime. Не подключается к БД и не запускает расписания. */
-export async function prepareRuntime({ pool, bitrixBaseUrl, polzaKey, bitrixLimiter, fetchImpl = globalThis.fetch,
+export async function prepareRuntime({ pool, bitrixBaseUrl, polzaKey, bitrixLimiter, deliveryMode = 'production', fetchImpl = globalThis.fetch,
   startStt = startSttService, checkTools = checkRuntime, makeDependencies = createWorkerDependencies,
   loadText = path => readFile(path, 'utf8') }) {
   const [judgePrompt, writerPrompt] = await Promise.all([
@@ -19,7 +19,7 @@ export async function prepareRuntime({ pool, bitrixBaseUrl, polzaKey, bitrixLimi
   try {
     if (typeof stt.healthy !== 'function' || typeof stt.close !== 'function') throw new Error('Не задан контроль сервиса распознавания');
     const dependencies = makeDependencies({ pool, bitrixBaseUrl, polzaKey,
-      sttUrl: stt.address, sttKey: stt.key, tempRoot: stt.tempRoot, judgePrompt, writerPrompt, fetchImpl, bitrixLimiter });
+      sttUrl: stt.address, sttKey: stt.key, tempRoot: stt.tempRoot, judgePrompt, writerPrompt, fetchImpl, bitrixLimiter, deliveryMode });
     const active = new Set();
     let closing = false;
     let drainPromise;
