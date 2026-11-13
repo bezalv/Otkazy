@@ -72,6 +72,7 @@ export function toPersistenceResult(job, outcome, audioOriginHistoryId = null, v
  * delivery вызывается лишь после сохранения результата либо его восстановления.
  */
 export async function runJob({ job, queue, store, loadAudioWait, delivery, createRoleInference, process = processDeal, processOptions = {}, heartbeatMs = 60000, resolveRetryTransition = resolveCurrentTransition }) {
+  const processingStarted = Date.now();
   if (processOptions.semanticChatRoles === true) {
     throw new Error('Эксперимент определения ролей доступен только без записи и доставки');
   }
@@ -260,6 +261,7 @@ export async function runJob({ job, queue, store, loadAudioWait, delivery, creat
         chatRoleInferenceUnaccounted:true};
       result=toPersistenceResult(job,outcome,audioHistoryId,stageScope?.stageHistoryId ?? null);
     }
+    result.processing_time_sec=Math.max(0,Math.round((Date.now()-processingStarted)/1000));
     const stored = await store.persistResult(result);
     if (!stored.needsExternalActions) return { status: stored.status, analysisId: stored.analysisId || null,
       ...(outcome?.audioWait?.reason === 'audio_wait_terminal_recordings_missing'

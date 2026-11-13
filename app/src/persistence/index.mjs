@@ -117,7 +117,8 @@ export async function lookupOperation(pool, id) {
  * сохранённый разбор. Вызывающий может продолжить внешние действия без LLM.
  * Успешное чтение не занимает право на отправку комментария или уведомления.
  */
-export async function loadResumableResult(pool, { operation_id, lease_token }) {
+export async function loadResumableResult(pool, { operation_id, lease_token, allowPilotError = false }) {
+  if (typeof allowPilotError !== 'boolean') throw new TypeError('Некорректный режим уведомления');
   const operation = operationId(operation_id);
   const lease = operationId(lease_token);
   if (!pool || typeof pool.connect !== 'function') throw new TypeError('Нужен пул PostgreSQL');
@@ -136,6 +137,10 @@ export async function loadResumableResult(pool, { operation_id, lease_token }) {
     if (response.rowCount !== 1 || !response.rows?.[0]) throw new Error('Задача не принадлежит этому обработчику или аренда истекла');
     const row = response.rows[0];
     if (!row.analysis_id) return null;
+    if (row.pipeline_error && allowPilotError && row.silent !== true) return {
+      analysisId: row.analysis_id, silent:false, screenshots:row.screenshots === true,
+      result:{deal_id:Number(row.deal_id),pipeline_error:row.pipeline_error},
+    };
     if (row.pipeline_error || !row.ai_judge_json || typeof row.ai_judge_json !== 'object'
       || !['правомерен', 'неправомерен', 'недостаточно_данных'].includes(row.ai_judge_json.verdict)) {
       throw new Error('Сохранённый результат не пригоден для внешних действий');
@@ -316,7 +321,8 @@ async function archiveExpiredCard(connection, operation, id) {
  * Никаких уведомлений и комментариев в Битрикс функция не отправляет.
  * Для записи обязательны id задачи и актуальный lease_token из очереди.
  */
-export async function persistResult(pool, result) {
+export async function persistResult(pool, result, { allowPilotError = false } = {}) {
+  if (typeof allowPilotError !== 'boolean') throw new TypeError('Некорректный режим уведомления');
   if (!result || typeof result !== 'object') throw new TypeError('Не получен результат сделки');
   // Изолируем поле до получения и блокировки настоящего задания. Входу не
   // доверяем: сопоставление делается только с данными заблокированной строки.
@@ -416,7 +422,7 @@ export async function persistResult(pool, result) {
         ...(roleUnaccounted ? {role_inference_unaccounted:true} : {}) };
       const inserted = await connection.query(insertStatement('lost_deal_analyses', {
         deal_id: id, pipeline_error: message, prompt_version: result.prompt_version || 'v2.8-sol',
-        trigger_type: 'batch', processing_time_sec: Number(result.processing_time_sec) || 0,
+        trigger_type: ['live','audio_wait','manual','nightly','backfill'].includes(job.trigger_type) ? job.trigger_type : 'batch', processing_time_sec: Number(result.processing_time_sec) || 0,
         pipeline_operation_id: operation,
         ...(meta ? { llm_prompt_tokens: meta.prompt_tokens, llm_completion_tokens: meta.completion_tokens,
           llm_total_tokens: meta.total_tokens, judge_prompt_tokens: meta.judge_usage?.prompt_tokens ?? null,
@@ -455,6 +461,7 @@ export async function persistResult(pool, result) {
       return { status, dealId: id };
     }
     const rows = processedRows(result, deal, comms);
+    rows.analysis.trigger_type=['live','audio_wait','manual','nightly','backfill'].includes(job.trigger_type) ? job.trigger_type : 'batch';
     rows.analysis.pipeline_operation_id = operation;
     if (result.audio_wait_expired === true) await archiveExpiredCard(connection, operation, id);
     await connection.query(insertStatement('lost_deals', rows.deal, {
@@ -471,7 +478,7 @@ export async function persistResult(pool, result) {
     return { status, dealId: id, analysisId: inserted.rows[0].id };
     };
     const saved = await save();
-    const needsExternalActions = status === 'processed' && job.silent !== true;
+    const needsExternalActions = (status === 'processed' || (allowPilotError && status === 'error')) && job.silent !== true;
     const finishQuery = needsExternalActions
       ? `SELECT id FROM public.lost_processing_jobs
           WHERE id=$1 AND status='processing' AND lease_token=$2 AND lease_until>clock_timestamp()`

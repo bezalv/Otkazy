@@ -5,6 +5,7 @@ import { pathToFileURL } from 'node:url';
 import test from 'node:test';
 import { persistResult, lookupOperation, loadResumableResult } from '../../app/src/persistence/index.mjs';
 import { enqueueDueAudioChecks } from '../../app/src/audio-wait/scheduler.mjs';
+import { createDelivery } from '../../app/src/delivery/index.mjs';
 
 const pglitePath = resolve('tmp/pgtest/node_modules/@electric-sql/pglite/dist/index.js');
 const schema = readFileSync('tests/restore-persistence/synthetic-schema.sql', 'utf8');
@@ -45,8 +46,8 @@ test('реальный SQL в изолированной БД PGlite', { skip: !
       query(text, values) { return db.query(text, values); },
       async connect() {
         return {
-          query(query) {
-            return typeof query === 'string' ? db.query(query) : db.query(query.text, query.values);
+          query(query, values) {
+            return typeof query === 'string' ? db.query(query, values) : db.query(query.text, query.values);
           },
           release() {},
         };
@@ -138,6 +139,33 @@ test('реальный SQL в изолированной БД PGlite', { skip: !
       assert.equal(row.pipeline_error.includes('secretvalue'), false);
       assert.equal(row.ai_verdict, null);
       assert.equal((await db.query('SELECT status FROM lost_processing_jobs WHERE id=$1', [operation(8)])).rows[0].status, 'done');
+    });
+
+    await t.test('ошибка пилота сохраняется до уведомления и восстанавливается без повтора LLM', async () => {
+      const id=operation(80);await job(id,{dealId:80,silent:false});
+      await db.query("update lost_processing_jobs set trigger_type='live' where id=$1",[id]);
+      const saved=await persistResult(pool,{operation_id:id,lease_token:leaseToken,deal_id:80,_status:'error',_error:'технический сбой распознавания',processing_time_sec:9}, {allowPilotError:true});
+      assert.equal(saved.needsExternalActions,true);
+      assert.equal((await db.query('select status from lost_processing_jobs where id=$1',[id])).rows[0].status,'processing');
+      await assert.rejects(loadResumableResult(pool,{operation_id:id,lease_token:leaseToken}));
+      const resumed=await loadResumableResult(pool,{operation_id:id,lease_token:leaseToken,allowPilotError:true});
+      assert.equal(resumed.result.pipeline_error,'технический сбой распознавания');assert.equal(resumed.result.deal_id,80);
+      const sent=[];const delivery=createDelivery(pool,{async request(method,body,options){
+        assert.equal(method,'im.notify.system.add');assert.equal(await options.beforeSend(),true);sent.push(body);return {result:42};
+      }},{mode:'pilot65'});
+      assert.deepEqual(await delivery.deliver(id,leaseToken),{state:'done'});
+      assert.equal(sent.length,1);assert.equal(sent[0].USER_ID,65);assert.match(sent[0].MESSAGE,/Вердикт не вынесен/);
+      const finished=(await db.query('select status,comment_state,notify_state from lost_processing_jobs where id=$1',[id])).rows[0];
+      assert.deepEqual(finished,{status:'done',comment_state:'skipped',notify_state:'ok'});
+      const stats=(await db.query('select trigger_type,processing_time_sec from lost_deal_analyses where pipeline_operation_id=$1',[id])).rows[0];
+      assert.deepEqual(stats,{trigger_type:'live',processing_time_sec:9});
+    });
+
+    await t.test('живой разбор сохраняет собственный тип и длительность',async()=>{
+      const id=operation(81);await job(id,{dealId:81});await db.query("update lost_processing_jobs set trigger_type='live' where id=$1",[id]);
+      await persistResult(pool,{...result,operation_id:id,deal_id:81,deal_data:{...deal,deal_id:81},processing_time_sec:42});
+      const stats=(await db.query('select trigger_type,processing_time_sec from lost_deal_analyses where pipeline_operation_id=$1',[id])).rows[0];
+      assert.deepEqual(stats,{trigger_type:'live',processing_time_sec:42});
     });
 
     await t.test('сбой проверки аудио переназначает время по дедлайну и не меняет чужое ожидание', async () => {

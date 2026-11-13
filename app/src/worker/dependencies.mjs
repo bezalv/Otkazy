@@ -52,6 +52,7 @@ export function createWorkerDependencies({ pool, bitrixBaseUrl, polzaKey, sttUrl
     return {sessionContext,roleClient:createDurableRoleClient({ledger,sessionContext,transport,checkLease})};
   };
   const pump = makePump({ pool, queue,
+    ...(deliveryMode === 'pilot65' ? {allowPilotError:true} : {}),
     ...(pilotEnabledAt ? { operations:{schedule:() => enqueueDueAudioChecks(pool,{pilotEnabledAt})} } : {}),
     createRoleInference,
     delivery: ({ job }) => delivery.deliver(job.id, job.lease_token),

@@ -318,13 +318,30 @@ test('состояния доставки после транзакции рез
     }},{mode:'pilot65'});
     for (const [n,verdict] of [[21,'правомерен'],[22,'неправомерен'],[23,'недостаточно_данных']]) {
       await add(n,{verdict,closure:'other'});
+      if(n===21)await db.query("UPDATE lost_deal_analyses SET ai_judge_json=jsonb_set(ai_judge_json,'{transcription_coverage}',$1::jsonb) WHERE id=21",[JSON.stringify({unrecognized_fragments:2,calls_with_unknown_coverage:0})]);
       assert.deepEqual(await pilot.deliver(jobId(n),lease),{state:'done'});
       assert.equal((await row(n)).comment_state,'skipped');
       const q=await db.query("SELECT ai_judge_json->'pilot_notification' AS pilot,ai_judge_json->'notification' AS production FROM lost_deal_analyses WHERE id=$1",[n]);
       assert.deepEqual(q.rows[0].pilot.delivered,[65]);assert.equal(q.rows[0].production,null);
     }
     assert.equal(sent.length,3);
-    assert.match(sent[0].MESSAGE,/правомерен/);assert.match(sent[2].MESSAGE,/недостаточно_данных/);
+    assert.match(sent[0].MESSAGE,/правомерен/);assert.match(sent[0].MESSAGE,/не распознано фрагментов — 2/);assert.match(sent[2].MESSAGE,/недостаточно_данных/);
     await add(24,{silent:true});assert.deepEqual(await pilot.deliver(jobId(24),lease),{state:'done'});assert.equal(sent.length,3);
+  });
+  await t.test('ошибка пилота отправляется только 65 без вердикта или комментария', async () => {
+    await add(25);await db.query("UPDATE lost_deal_analyses SET pipeline_error=$1,ai_judge_json=NULL,ai_verdict=NULL WHERE id=25",['технический сбой распознавания']);
+    const sent=[];const pilot=createDelivery(pool,{async request(method,body,options){
+      assert.equal(method,'im.notify.system.add');assert.equal(body.USER_ID,65);assert.equal(await options.beforeSend(),true);
+      sent.push(body);return {result:42};
+    }},{mode:'pilot65'});
+    assert.deepEqual(await pilot.deliver(jobId(25),lease),{state:'done'});
+    assert.equal(sent.length,1);assert.match(sent[0].MESSAGE,/разбор не завершён/);assert.match(sent[0].MESSAGE,/Вердикт не вынесен/);
+    assert.deepEqual(await row(25),{status:'done',comment_state:'skipped',comment_id:null,notify_state:'ok'});
+    const a=(await db.query("select pipeline_error,ai_judge_json->'pilot_notification' as notification from lost_deal_analyses where id=25")).rows[0];
+    assert.equal(a.pipeline_error,'технический сбой распознавания');assert.deepEqual(a.notification.delivered,[65]);
+    await add(26,{deal:25});await db.query("UPDATE lost_processing_jobs SET lose_date=(SELECT lose_date FROM lost_processing_jobs WHERE id=$1) WHERE id=$2",[jobId(25),jobId(26)]);
+    await db.query("UPDATE lost_deal_analyses SET pipeline_error='повторная ошибка',ai_judge_json=NULL,ai_verdict=NULL WHERE id=26");
+    assert.deepEqual(await pilot.deliver(jobId(26),lease),{state:'done'});assert.equal(sent.length,1);
+    assert.equal((await row(26)).notify_state,'skipped');
   });
 });

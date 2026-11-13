@@ -29,7 +29,7 @@ async function transaction(pool, action) {
   } finally { connection.release(discard ? new Error('Состояние сессии неизвестно') : undefined); }
 }
 
-async function lockJob(connection, jobId, lease) {
+async function lockJob(connection, jobId, lease, allowPilotError = false) {
   const res = await connection.query(`SELECT j.*, a.id AS analysis_id, a.ai_judge_json, a.pipeline_error,
       a.prompt_version, d.title FROM public.lost_processing_jobs j
       JOIN public.lost_deal_analyses a ON a.pipeline_operation_id=j.id
@@ -38,6 +38,10 @@ async function lockJob(connection, jobId, lease) {
         AND j.lease_until>clock_timestamp() FOR UPDATE OF j`, [jobId, lease]);
   if (res.rows.length !== 1) throw new Error('Результат или действующая аренда не найдены');
   const row = res.rows[0];
+  if (row.pipeline_error && allowPilotError && row.silent !== true) {
+    row.ai_judge_json = row.ai_judge_json && typeof row.ai_judge_json === 'object' ? row.ai_judge_json : {};
+    return row;
+  }
   if (row.pipeline_error || !row.ai_judge_json || !['правомерен', 'неправомерен', 'недостаточно_данных'].includes(row.ai_judge_json.verdict)) {
     throw new Error('Результат непригоден для отправки');
   }
@@ -59,18 +63,26 @@ export function createDelivery(pool, client, { now = () => Date.now(), mode = 'p
   const notificationPath = pilot ? '{pilot_notification}' : '{notification}';
 
   function notificationMessage(row) {
+    if (pilot && row.pipeline_error) {
+      const category = /распознав|транскриб/i.test(row.pipeline_error) ? 'ошибка распознавания записи' : 'ошибка обработки данных';
+      return `⚠️ Отказы: разбор не завершён\nСделка #${row.deal_id}\nПричина: ${category}. Вердикт не вынесен; требуется проверка.\nhttps://dinalnsk.bitrix24.ru/crm/deal/details/${row.deal_id}/`;
+    }
     const judge = row.ai_judge_json;
     const header = pilot ? `🧪 Отказы: ${judge.verdict}` : judge.verdict === 'неправомерен' ? '🔴 Неправомерный отказ' : '💰 Отказ по цене — возможен возврат спецпредложением';
     if (pilot) {
       const reason = typeof judge.exact_reason === 'string' ? judge.exact_reason.trim().slice(0, 2000) : '';
-      return `${header}\nСделка #${row.deal_id}\n${judge.verdict_reason_short || ''}${reason ? `\n${reason}` : ''}\nhttps://dinalnsk.bitrix24.ru/crm/deal/details/${row.deal_id}/`;
+      const coverage=judge.transcription_coverage;
+      const missing=Number.isSafeInteger(coverage?.unrecognized_fragments) && coverage.unrecognized_fragments>0 ? coverage.unrecognized_fragments : 0;
+      const unknown=Number.isSafeInteger(coverage?.calls_with_unknown_coverage) && coverage.calls_with_unknown_coverage>0 ? coverage.calls_with_unknown_coverage : 0;
+      const warning=missing || unknown ? `\n⚠️ Расшифровка неполная: не распознано фрагментов — ${missing}, звонков с неизвестной полнотой — ${unknown}.` : '';
+      return `${header}\nСделка #${row.deal_id}\n${judge.verdict_reason_short || ''}${reason ? `\n${reason}` : ''}${warning}\nhttps://dinalnsk.bitrix24.ru/crm/deal/details/${row.deal_id}/`;
     }
     return `${header}\nСделка: ${row.title || ''} (#${row.deal_id})\n${judge.verdict_reason_short || ''}\nhttps://dinalnsk.bitrix24.ru/crm/deal/details/${row.deal_id}/`;
   }
 
   async function claimComment(jobId, lease) {
     return transaction(pool, async db => {
-      const row = await lockJob(db, jobId, lease);
+      const row = await lockJob(db, jobId, lease, pilot);
       if (row.silent) {
         await fencedUpdate(db, jobId, lease, "comment_state='skipped', notify_state='skipped'");
         return { state: 'skipped' };
@@ -95,7 +107,7 @@ export function createDelivery(pool, client, { now = () => Date.now(), mode = 'p
 
   async function markComment(jobId, lease, commentId) {
     return transaction(pool, async db => {
-      const row = await lockJob(db, jobId, lease);
+      const row = await lockJob(db, jobId, lease, pilot);
       if (row.comment_state !== 'sending') throw new Error('Комментарий не ожидает подтверждения');
       if (commentId == null) await fencedUpdate(db, jobId, lease, "comment_state='unknown', status='needs_review', lease_token=NULL, lease_until=NULL");
       else await fencedUpdate(db, jobId, lease, "comment_state='ok', comment_id=$3", [String(commentId)]);
@@ -104,7 +116,7 @@ export function createDelivery(pool, client, { now = () => Date.now(), mode = 'p
 
   async function claimNotification(jobId, lease) {
     return transaction(pool, async db => {
-      const row = await lockJob(db, jobId, lease);
+      const row = await lockJob(db, jobId, lease, pilot);
       if (row.silent) {
         await fencedUpdate(db, jobId, lease, "notify_state='skipped'");
         return { state: 'skipped' };
@@ -137,7 +149,11 @@ export function createDelivery(pool, client, { now = () => Date.now(), mode = 'p
       }
       // Сериализация разных задач одной сделки и вердикта, включая предыдущие обработки.
       await db.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [`lost-notify:${row.deal_id}:${verdict}`]);
-      const previous = pilot ? { rows: [] } : await db.query(`SELECT ai_judge_json->'${notificationKey}'->>'status' AS state
+      const previous = pilot && row.pipeline_error ? await db.query(`SELECT a.ai_judge_json->'pilot_notification'->>'status' AS state
+        FROM public.lost_deal_analyses a JOIN public.lost_processing_jobs j ON j.id=a.pipeline_operation_id
+        WHERE a.deal_id=$1 AND j.lose_date=$2 AND a.id<>$3 AND a.pipeline_error IS NOT NULL
+          AND a.ai_judge_json->'pilot_notification'->>'status' IN ('ok','sending','unknown')`, [row.deal_id,row.lose_date,row.analysis_id])
+        : pilot ? { rows: [] } : await db.query(`SELECT ai_judge_json->'${notificationKey}'->>'status' AS state
         FROM public.lost_deal_analyses WHERE deal_id=$1
           AND (ai_judge_json->>'verdict'=$2 OR ai_verdict=$2)
           AND ai_judge_json->'${notificationKey}'->>'status' IN ('ok','sending','unknown')`, [row.deal_id, verdict]);
@@ -158,7 +174,7 @@ export function createDelivery(pool, client, { now = () => Date.now(), mode = 'p
 
   async function claimRecipient(jobId, lease, userId) {
     return transaction(pool, async db => {
-      const row = await lockJob(db, jobId, lease);
+      const row = await lockJob(db, jobId, lease, pilot);
       const mark = row.ai_judge_json[notificationKey];
       if (row.notify_state !== 'sending' || !mark?.recipient_states) throw new Error('Некорректное состояние уведомления');
       if (mark.recipient_states[userId] !== 'pending') return false;
@@ -171,7 +187,7 @@ export function createDelivery(pool, client, { now = () => Date.now(), mode = 'p
 
   async function recordNotificationAttempt(jobId, lease, userId, delivered) {
     return transaction(pool, async db => {
-      const row = await lockJob(db, jobId, lease);
+      const row = await lockJob(db, jobId, lease, pilot);
       if (row.notify_state !== 'sending') throw new Error('Уведомление не ожидает подтверждения');
       const mark = row.ai_judge_json[notificationKey];
       if (!mark || !Array.isArray(mark.delivered) || !Array.isArray(mark.failed) || mark.recipient_states?.[userId] !== 'sending') throw new Error('Некорректное состояние уведомления');
@@ -185,7 +201,7 @@ export function createDelivery(pool, client, { now = () => Date.now(), mode = 'p
 
   async function markNotificationNotStarted(jobId, lease, userId) {
     return transaction(pool, async db => {
-      const row = await lockJob(db, jobId, lease);
+      const row = await lockJob(db, jobId, lease, pilot);
       const mark = row.ai_judge_json[notificationKey];
       if (row.notify_state !== 'sending' || mark?.recipient_states?.[userId] !== 'sending'
           || !Array.isArray(mark.failed)) throw new Error('Некорректное состояние уведомления');
@@ -200,7 +216,7 @@ export function createDelivery(pool, client, { now = () => Date.now(), mode = 'p
 
   async function markNotification(jobId, lease) {
     return transaction(pool, async db => {
-      const row = await lockJob(db, jobId, lease);
+      const row = await lockJob(db, jobId, lease, pilot);
       if (row.notify_state !== 'sending') throw new Error('Уведомление не ожидает подтверждения');
       const mark = row.ai_judge_json[notificationKey];
       if (!mark || !Array.isArray(mark.delivered) || !Array.isArray(mark.failed) || !mark.recipient_states
@@ -218,7 +234,7 @@ export function createDelivery(pool, client, { now = () => Date.now(), mode = 'p
 
   async function finish(jobId, lease) {
     return transaction(pool, async db => {
-      const row = await lockJob(db, jobId, lease);
+      const row = await lockJob(db, jobId, lease, pilot);
       if (!['ok', 'skipped'].includes(row.comment_state) || !['ok', 'skipped'].includes(row.notify_state)) return false;
       await fencedUpdate(db, jobId, lease, "status='done', lease_token=NULL, lease_until=NULL");
       return true;
