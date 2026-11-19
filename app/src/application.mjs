@@ -42,13 +42,14 @@ export async function assertAudioOriginSchema(pool) {
  * Сырой текст ошибок, тело webhook и секреты нигде не журналируются.
  */
 export function createApplication({ pool, bitrixBaseUrl, polzaKey, applicationToken, domain, memberId,
-  liveEnabledAt, pilotMode = false, fetchImpl = globalThis.fetch, intervals = {}, databaseDeadlineMs = 5000, onEvent = () => {} }, dependencies = {}) {
+  liveEnabledAt, pilotMode = false, fetchImpl = globalThis.fetch, intervals = {}, databaseDeadlineMs = 5000, onEvent = () => {}, onDiagnostic = () => {} }, dependencies = {}) {
   if (typeof pilotMode !== 'boolean') throw new TypeError('Некорректный режим пилота');
   const configured = { ...DEFAULT_INTERVALS, ...(pilotMode ? {inbox:60000} : {}), ...intervals };
   for (const interval of Object.values(configured)) {
     if (!Number.isSafeInteger(interval) || interval < 1 || interval > 86400000) throw new TypeError('Некорректный интервал');
   }
   if (typeof onEvent !== 'function') throw new TypeError('Некорректный обработчик состояния');
+  if (typeof onDiagnostic !== 'function') throw new TypeError('Некорректный обработчик диагностики');
   if (!Number.isSafeInteger(databaseDeadlineMs) || databaseDeadlineMs < 1 || databaseDeadlineMs > 300000) throw new TypeError('Некорректный срок проверки базы');
   const prepare = dependencies.prepareRuntime || prepareRuntime;
   const makeInbox = dependencies.createLiveInbox || createLiveInbox;
@@ -89,6 +90,27 @@ export function createApplication({ pool, bitrixBaseUrl, polzaKey, applicationTo
   let state = 'idle';
   let startPromise, drainPromise, runtime, inbox, liveHandler, bitrix;
   let databaseProbe;
+  let lastFailedChecks = '';
+  const lastFailureKinds = new Map();
+
+  // Не сохраняем ни сообщение исключения, ни произвольные свойства: они могут
+  // содержать текст клиента, URL вебхука, SQL или другие секреты.
+  function diagnostic(details) {
+    try { onDiagnostic(details); } catch { /* диагностика не влияет на обработку */ }
+  }
+  function failureKind(error) {
+    const code = error?.code || error?.cause?.code;
+    if (['ETIMEDOUT','UND_ERR_CONNECT_TIMEOUT','UND_ERR_HEADERS_TIMEOUT','57014'].includes(code) || error?.name === 'TimeoutError') return 'timeout';
+    if (['ECONNRESET','ECONNREFUSED','ENOTFOUND','EAI_AGAIN','UND_ERR_CONNECT'].includes(code)) return 'connection';
+    if (['28P01','28000'].includes(code)) return 'database_auth';
+    if (error?.name === 'AbortError') return 'aborted';
+    return 'unknown';
+  }
+  function reportFailure(component, kind) {
+    if (lastFailureKinds.get(component) === kind) return;
+    lastFailureKinds.set(component, kind);
+    diagnostic({ event: 'component_failure', component, kind });
+  }
 
   function report(name) {
     try { onEvent(name); } catch { /* ошибки наблюдателя не управляют обработкой */ }
@@ -97,6 +119,11 @@ export function createApplication({ pool, bitrixBaseUrl, polzaKey, applicationTo
     if (state !== 'running') return;
     const failed = Object.values(checks).some(value => value === 'error' || value === 'unavailable' || value === 'needs_review');
     readiness = failed ? 'degraded' : Object.values(checks).every(value => value === 'ok') ? 'ready' : 'checking';
+    const failedChecks = Object.fromEntries(Object.entries(checks).filter(([, value]) => ['error','unavailable','needs_review'].includes(value)));
+    const fingerprint = JSON.stringify(failedChecks);
+    if (failed && fingerprint !== lastFailedChecks) diagnostic({ event: 'readiness_degraded', checks: failedChecks });
+    if (!failed && lastFailedChecks && readiness === 'ready') diagnostic({ event: 'readiness_recovered' });
+    lastFailedChecks = failed ? fingerprint : (readiness === 'ready' ? '' : lastFailedChecks);
     if (readiness === 'degraded' && !degradationReported) {
       degradationReported = true;
       report('processing_degraded');
@@ -138,10 +165,12 @@ export function createApplication({ pool, bitrixBaseUrl, polzaKey, applicationTo
           }
           if (name === 'worker') checks.delivery_review = result?.reviewStatus || 'error';
           if (!sttUnavailable) checks[name] = result?.status === 'retry_pending' ? 'error' : 'ok';
+          lastFailureKinds.delete(name);
           updateReadiness();
-        } catch {
+        } catch (error) {
           if (state !== 'running') return;
           checks[name] = 'error';
+          reportFailure(name, failureKind(error));
           updateReadiness();
         }
       }));
@@ -188,6 +217,7 @@ export function createApplication({ pool, bitrixBaseUrl, polzaKey, applicationTo
       if (state !== 'running') return;
       if (databaseProbe) {
         checks.database = 'error';
+        reportFailure('database', 'previous_probe_pending');
         updateReadiness();
         scheduleDatabase(configured.database);
         return;
@@ -199,6 +229,7 @@ export function createApplication({ pool, bitrixBaseUrl, polzaKey, applicationTo
         probe.expired = true;
         if (state === 'running') {
           checks.database = 'error';
+          reportFailure('database', 'timeout');
           updateReadiness();
           scheduleDatabase(configured.database);
         }
@@ -211,12 +242,14 @@ export function createApplication({ pool, bitrixBaseUrl, polzaKey, applicationTo
         const reviewPending = await inspectDelivery(pool);
         if (probe.expired || state !== 'running') return;
         checks.database = 'ok';
+        lastFailureKinds.delete('database');
         checks.database_retry = retryPending ? 'error' : 'ok';
         checks.database_delivery = reviewPending ? 'needs_review' : 'ok';
         updateReadiness();
-      }).catch(() => {
+      }).catch(error => {
         if (!probe.expired && state === 'running') {
           checks.database = 'error';
+          reportFailure('database', failureKind(error));
           updateReadiness();
         }
       }).finally(() => {

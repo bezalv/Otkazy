@@ -187,6 +187,28 @@ test('ошибки цикла не раскрывают секреты в соо
   await application.stop();
 });
 
+test('диагностика называет компонент и категорию без секретов, повтор не засоряет журнал', async () => {
+  const diagnostics = [];
+  let healthy = false;
+  const { application, timers } = fixture({
+    options: { onDiagnostic: value => diagnostics.push(value), intervals: { inbox: 11, worker: 12, nightly: 13, database: 14 } },
+    runtime: { async tick() { if (!healthy) { const error = new Error('secret-event https://secret.invalid'); error.code = 'ECONNRESET'; throw error; } } },
+  });
+  await application.start();
+  for (const id of [...timers.pending.keys()]) timers.fire(id);
+  await flush(); await flush();
+  assert.ok(diagnostics.some(x => x.event === 'component_failure' && x.component === 'worker' && x.kind === 'connection'));
+  assert.ok(diagnostics.some(x => x.event === 'readiness_degraded' && x.checks.worker === 'error'));
+  const timerFor = ms => [...timers.pending].find(([, item]) => item.ms === ms)?.[0];
+  timers.fire(timerFor(12)); await flush(); await flush();
+  assert.equal(diagnostics.filter(x => x.event === 'component_failure' && x.component === 'worker').length, 1);
+  healthy = true;
+  timers.fire(timerFor(12)); await flush(); await flush();
+  assert.ok(diagnostics.some(x => x.event === 'readiness_recovered'));
+  assert.doesNotMatch(JSON.stringify(diagnostics), /secret-event|secret\.invalid/);
+  await application.stop();
+});
+
 test('STT деградация сигнализируется один раз, а webhook продолжает сохраняться', async () => {
   const events = [];
   let available = false;

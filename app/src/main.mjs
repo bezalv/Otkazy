@@ -182,7 +182,7 @@ export async function startMain({ env = process.env, processRef = process, makeP
         liveEnabledAt: config.liveEnabledAt, ...(config.mode === 'pilot' ? {pilotMode:true} : {}), onEvent: name => {
           if (name === 'processing_degraded') log('Обработка временно недоступна');
           if (name === 'processing_recovered') log('Обработка восстановлена');
-        } });
+        }, onDiagnostic: details => log(JSON.stringify({ time: new Date().toISOString(), ...details })) });
       if (stopping) throw new Error('Приложение остановлено при запуске');
     }
     server = makeServer(createMainHandler({ mode: config.mode, application, isStopping: () => stopping, isStarted: () => started }));
