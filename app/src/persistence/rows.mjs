@@ -166,7 +166,8 @@ export function communicationRow(dealId, comm, index) {
   // Модельная роль хранится в facts_packet как гипотеза; в плоской таблице
   // нет колонки её происхождения, поэтому не выдаём её за известного автора.
   const semanticTextRole = eventType === 'chat' && comm._role_source === 'semantic_inference'
-    && comm._has_audio !== true && comm._has_files !== true && comm._has_audio_transcript !== true && !transcript;
+    && comm._has_audio !== true && (comm._has_files !== true || comm.non_audio_attachments > 0)
+    && comm._has_audio_transcript !== true && !transcript;
   let transcriptStatus = transcript.length ? 'transcribed' : comm._transcription_empty ? 'empty_transcript' : comm._needs_transcription ? 'pending' : 'skipped';
   if (transcriptStatus === 'transcribed' && eventType === 'call' && isVoicemail(transcript)) transcriptStatus = 'voicemail';
   return {

@@ -48,7 +48,7 @@ function fixture(explicit=true){
  const client={async request(method){
   if(method==='crm.deal.get')return {result:{ID:'127114',STAGE_ID:'C23:LOSE'}};
   if(method==='crm.stagehistory.list')return {result:{items:[{ID:'321',STAGE_ID:'C23:LOSE',CREATED_TIME:cutoff}]}};
-  if(method==='imopenlines.crm.chat.get')return {result:[{CHAT_ID:12,CONNECTOR_ID:state.connector,CONNECTOR_TITLE:'Wappi WhatsApp'}]};
+  if(method==='imopenlines.crm.chat.get')return {result:[{CHAT_ID:12,CONNECTOR_ID:state.connector,CONNECTOR_TITLE:state.title || 'Wappi WhatsApp'}]};
   if(method==='imopenlines.session.history.get')return {result:structuredClone(state.history)};
   throw Error('Неожиданный вызов');
  }};
@@ -89,9 +89,8 @@ test('изменение доказанного события или истор
   (f,m)=>{m.push({...m[0],message_id:'подмена'});},
  ]){const f=fixture(),m=await normalized(f);mutate(f,m);const out=await inference(m);assert.equal(out.calls,0);}
 });
-test('файлы и неизвестные даты блокируют сессию, поздние сообщения не попадают в запрос',async()=>{
- for(const mutate of [f=>{f.collection.raw.sessions[0].history.message[51].params={FILE_ID:[77]};f.collection.raw.sessions[0].history.files={77:{id:77,type:'image'}};f.state.history=structuredClone(f.collection.raw.sessions[0].history);},
-  f=>{f.collection.raw.sessions[0].history.message[51].date=null;f.state.history=structuredClone(f.collection.raw.sessions[0].history);}]){
+test('неизвестные даты блокируют сессию, поздние сообщения не попадают в запрос',async()=>{
+ for(const mutate of [f=>{f.collection.raw.sessions[0].history.message[51].date=null;f.state.history=structuredClone(f.collection.raw.sessions[0].history);}]){
   const f=fixture();mutate(f);assert.equal((await inference(await normalized(f))).calls,0);
  }
  const f=fixture();f.collection.raw.sessions[0].history.message[55]={id:55,senderid:3,text:'ПОЗДНЕЕ СООБЩЕНИЕ',date:'2026-10-29T00:00:00Z'};f.state.history=structuredClone(f.collection.raw.sessions[0].history);
@@ -136,22 +135,22 @@ test('поддельная или сериализованная нейтрал�
  assert.equal(check(callOutput.communications).block,false);
  callOutput.communications[1].text='Изменено';assert.equal(check(callOutput.communications).kind,'author_ambiguous');
 });
-test('отдельное изображение без FILE_ID блокирует оценку, файл не скачивается',async()=>{
+test('отдельное изображение без FILE_ID не блокирует текст и не скачивается',async()=>{
  for(const type of ['image']){const f=fixture();f.collection.raw.sessions[0].history.files={77:{id:77,type,name:`asset.${type==='image'?'jpg':'mp4'}`}};
   f.state.history=structuredClone(f.collection.raw.sessions[0].history);let downloads=0;
   const messages=(await normalizeCommunications({collection:f.collection,verifyFallbackSession:f.verifier,resolveFile:async()=>{downloads++;throw Error('лишний вызов');}})).deal_data.communications;
-  assert.equal((await inference(messages)).calls,0);assert.equal(downloads,0);
+  assert.equal((await inference(messages)).calls,1);assert.equal(downloads,0);
  }
 });
 
 
-test('неидентифицируемые изображения и файлы неизвестного типа закрывают семантику',async()=>{
+test('известное изображение пропускается, файл неизвестного типа закрывает семантику',async()=>{
  for(const file of [{type:'image'},{type:'application/octet-stream'},{}]){
   const f=fixture();f.collection.raw.sessions[0].history.files=[file];
   f.state.history=structuredClone(f.collection.raw.sessions[0].history);let downloads=0;
   const messages=(await normalizeCommunications({collection:f.collection,verifyFallbackSession:f.verifier,
     resolveFile:async()=>{downloads++;throw Error('лишний вызов');}})).deal_data.communications;
-  assert.equal((await inference(messages)).calls,0,JSON.stringify(file));assert.equal(downloads,0);
+  assert.equal((await inference(messages)).calls,file.type==='image'?1:0,JSON.stringify(file));assert.equal(downloads,0);
  }
  // Аудиофайл без ID отклоняется уже нормализатором, не только классификатором.
  const f=fixture();f.collection.raw.sessions[0].history.files=[{type:'audio'}];
@@ -195,6 +194,49 @@ function voiceFixture({sender=3, additionalFile=null}={}) {
  h.files={77:{id:77,type:'audio',name:'voice.ogg'},...(additionalFile?{78:{id:78,...additionalFile}}:{})};
  f.state.history=structuredClone(h);return f;
 }
+
+for (const connector of ['Wappi', 'Wazzup']) test(`${connector}: PDF и изображения сохраняют контекст и допускают текстовый отказ`, async () => {
+ const f=fixture(), h=f.collection.raw.sessions[0].history;
+ if (connector==='Wazzup') {
+  f.state.connector='wz_max_test'; f.state.title='Wazzup MAX';
+  h.chat[12].entityId='wz_max_test|9|client|user';
+  f.collection.raw.chats[0]={CHAT_ID:12,CONNECTOR_ID:f.state.connector,CONNECTOR_TITLE:f.state.title};
+ }
+ h.message[51]={id:51,senderid:3,text:'',date:'2026-10-27T00:00:02Z',params:{FILE_ID:[77]}};
+ h.message[52].text='Отправляю расчёт и фотографии.';
+ h.message[52].params={FILE_ID:[78]};
+ h.message[53].senderid=3;
+ h.files={77:{id:77,type:'file',name:'estimate.pdf'},78:{id:78,type:'image',name:'sample.jpg'},
+  79:{id:79,type:'image',name:'unreferenced.jpg',date:'2026-10-27T00:00:00Z'}};
+ f.state.history=structuredClone(h);
+ const messages=await normalized(f);
+ assert.equal(messages.length,5);
+ assert.equal(messages[1]._has_audio,false);
+ assert.equal(messages[1].non_audio_attachment_only,true);
+ assert.equal(messages[1]._wazzup_author_ambiguous,undefined);
+ assert.equal(messages[1]._wappi_author_ambiguous,undefined);
+ assert.match(messages[1].text,/Содержимое не анализируется/);
+ const out=await inference(messages,['client','unknown','manager','client','manager']);
+ assert.equal(out.calls,1); assert.equal(out.result.stats.unresolved,0);
+ assert.equal(out.result.communications[3].role,'Клиент');
+ assert.equal(out.result.communications[3]._role_source,'semantic_inference');
+ assert.equal(pgDecide({sources,communications:out.result.communications,allowNonmaterialUnknown:true}).block,false);
+ const facts=assembleFacts({lose_date:cutoff,communications:out.result.communications},'prompt').facts_packet.facts;
+ assert.equal(facts.find(x=>x.content.includes('Содержимое не анализируется')).actor,'system');
+ assert.equal(facts.find(x=>x.content.includes('уже приобрёл')).actor,'client');
+ assert.doesNotMatch(JSON.stringify(out.request),/estimate\.pdf|sample\.jpg|unreferenced\.jpg/);
+ assert.equal((await inference(structuredClone(messages))).calls,0);
+});
+
+test('полностью распознанное голосовое с PDF допускает роли и сохраняет расшифровку',async()=>{
+ const f=voiceFixture({additionalFile:{type:'file',name:'estimate.pdf'}});
+ const {messages,requested}=await normalizeVoice(f);
+ assert.equal(requested.length,1);
+ const out=await inference(messages,['client','client','manager','client','manager']);
+ assert.equal(out.calls,1);
+ assert.match(out.result.communications[1].text,/Голосовой отказ/);
+ assert.equal(out.result.communications[1]._has_audio_transcript,true);
+});
 async function normalizeVoice(f,{fail=false,empty=false}={}) {
  const requested=[];
  const output=await normalizeCommunications({collection:f.collection,verifyFallbackSession:f.verifier,

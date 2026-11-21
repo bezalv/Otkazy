@@ -1,4 +1,4 @@
-import { verifiedInferenceSession, verifiedInferenceGroup, verifiedInferenceVoice } from '../collect/normalize.mjs';
+import { verifiedInferenceSession, verifiedInferenceGroup, verifiedInferenceContent } from '../collect/normalize.mjs';
 import { trustNeutralReaction } from './chat-role-trust.mjs';
 import { chatMillisTimestamp } from '../time-precision.mjs';
 
@@ -13,6 +13,7 @@ const MAX_RESPONSE_CHARS = 50_000;
 // собственные сетевые повторы, их бюджет должен задаваться отдельно у клиента.
 const MAX_MODEL_CALLS = 3;
 const SYSTEM = [
+  'Отметка «Вложение без текстового сообщения. Содержимое не анализируется.» обозначает только наличие файла. Не придумывай его содержание или автора по этой отметке. Для остальных сообщений учитывай текст и последовательность диалога.',
   'Определи вероятного автора каждого сообщения одной переписки: client (клиент), manager (менеджер) или unknown (неизвестно). Учитывай смысл и порядок, не додумывай отсутствующие данные.',
   'Для известной роли верни impact=not_applicable. Если роль unknown, оцени её значение для итогового вердикта и анализа с учётом всей последующей переписки до отказа. Верни impact=not_material, когда по остальным явным репликам обеих сторон причина отказа и ключевые действия понятны, а краткая реакция не выражает согласие, отказ, обязательство, цену, срок или существенное условие. Это оценка по доступному контексту, а не требование математически доказать отсутствие любого возможного влияния. При недостатке контекста либо если реакция может относиться к существенному условию верни impact=material_or_unclear.',
   'Положительный вымышленный пример: клиент спрашивает, делают ли установку дверей; затем сообщение 👍 без ясного автора; менеджер описывает возможные варианты, стороны продолжают содержательный диалог, клиент отдельно пишет, что отказывается, а менеджер подтверждает закрытие. При такой последовательности именно неизвестный 👍 может получить impact=not_material: итоговый отказ выражен словами и не зависит от определения автора реакции.',
@@ -247,7 +248,7 @@ export async function inferChatRoles({ communications, client, cutoff, dealId } 
       const known = observedRole(item);
       if (!message || seen.has(message) || !Number.isFinite(timestamp) || known === 'conflict'
           || item._chat_connector_unknown === true || item._session_unreferenced_files === true || item._session_context_ambiguous === true
-          || (hasAttachment(item) && !verifiedInferenceVoice(item, { dealId, cutoff, cache: verifiedHistoryCache }))
+          || (hasAttachment(item) && !verifiedInferenceContent(item, { dealId, cutoff, cache: verifiedHistoryCache }))
           || typeof item.text !== 'string' || !item.text.trim() || item.text.length > MAX_MESSAGE_CHARS
           || (ambiguous(item) && known)) invalid = true;
       seen.add(message); chars += typeof item.text === 'string' ? item.text.length : MAX_CHARS + 1;

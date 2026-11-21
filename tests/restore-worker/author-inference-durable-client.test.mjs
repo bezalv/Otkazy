@@ -51,10 +51,11 @@ function harness({ sessionContext, reserve, preSend, finish, checkLease, respons
 }
 const cutoff='2026-01-01T00:01:00.000Z';
 const infer = (client,communications) => inferChatRoles({communications,client,cutoff,dealId:'42'});
-async function verifiedRows(family='Wazzup') {
+async function verifiedRows(family='Wazzup', attachment=false) {
   const code=family==='Wappi'?'opaque':'wz_test';
   const history={chatId:1,sessionId:2,chat:{1:{entityId:`${code}|9|client|user`}},
     users:{55:family==='Wappi'?{}:{connector:true}},files:{},message:{50:{id:50,senderid:55,date:'2026-01-01T00:00:01Z',text:'Сообщение'}}};
+  if(attachment){history.files={77:{id:77,type:'image',name:'sample.jpg'}};history.message[50].params={FILE_ID:[77]};}
   const bitrix={async request(method){
     if(method==='crm.deal.get')return {result:{ID:'42',STAGE_ID:'C23:LOSE'}};
     if(method==='crm.stagehistory.list')return {result:{items:[{ID:'101',STAGE_ID:'C23:LOSE',CREATED_TIME:cutoff}]}};
@@ -83,6 +84,15 @@ test('резерв фиксируется до POST, подтверждение 
     assert.deepEqual(h.events,['reserve','presend','lease','POST','finish:1:settled'],family);
     assert.equal(output.communications[0]._role_source,'semantic_inference',family);
     assert.equal(output.stats.resolved,1);assert.equal(h.client.snapshot().pending_confirmation,false);
+  }
+});
+
+test('рабочий адаптер принимает подтверждённый текст рядом с изображением',async()=>{
+  for(const family of ['Wazzup','Wappi']) {
+    const input=await verifiedRows(family,true),h=harness({sessionContext:contexts.get(input)});
+    const output=await infer(h.client,input);
+    assert.equal(h.sent,1);assert.equal(output.stats.resolved,1);
+    assert.equal(output.communications[0]._role_source,'semantic_inference');
   }
 });
 test('неподтверждённый резерв, неизвестный COMMIT и чужая роль не отправляют запрос',async()=>{

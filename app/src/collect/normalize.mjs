@@ -17,6 +17,7 @@ const verifiedFallbackEvents = new WeakMap();
 // Статус полного распознавания выдаётся только самим нормализатором для
 // подтверждённой сессии. Флаги в JSON или копии сообщения не являются proof.
 const verifiedVoiceEvents = new WeakSet();
+const verifiedContentEvents = new WeakSet();
 const AUDIO_EXTENSIONS = ['mp3', 'mpga', 'ogg', 'opus', 'wav', 'm4a', 'oga'];
 const VOICE_SUPPORTED = ['ogg', 'oga', 'opus', 'mp3', 'mpga'];
 const SYSTEM_PATTERNS = [
@@ -307,6 +308,12 @@ export function verifiedInferenceVoice(event, { dealId, cutoff, cache } = {}) {
     && verifiedInferenceSession(event, { dealId, cutoff, cache }) !== null;
 }
 
+// Подтверждён текст сообщения и всех его голосовых. Содержимое PDF и
+// изображений не читается, их присутствие не отменяет текстовый контекст.
+export function verifiedInferenceContent(event, scope = {}) {
+  return verifiedContentEvents.has(event) && verifiedInferenceSession(event, scope) !== null;
+}
+
 function callEvent(call) {
   if (call._historical_plan_only === true) return {
     type: 'task', date: call.CREATED,
@@ -564,11 +571,11 @@ export async function normalizeCommunications({ collection, resolveFile, transcr
       }
       if (link) audioItems.push({ event, fileId: null, link });
     }
-    // Непривязанное изображение остаётся частью истории, даже если отдельного
-    // сообщения у него нет. Без его содержания текстовый контекст неполон.
+    // PDF и изображения остаются в исходной истории. Для текстового разбора
+    // отсутствие привязки такого файла к реплике не блокирует весь диалог.
     const scopedFiles = files.filter(file => !ignoredVideo(file) && (file?.id != null && sessionFileRefs.has(String(file.id))
       || withinCutoff(file?.date || file?.DATE || null)));
-    if (scopedFiles.some(file => file?.id == null || (!sessionFileRefs.has(String(file.id)) && knownNonAudio(file)))) {
+    if (scopedFiles.some(file => file?.id == null && !knownNonAudio(file))) {
       if (cutoff !== null && messages.length === sessionMessageStart) {
         throw new TemporalScopeError('openlines', 'Вложение истории не связано с сообщением до отказа');
       }
@@ -632,8 +639,8 @@ export async function normalizeCommunications({ collection, resolveFile, transcr
 
   const transcripts = new Map();
   const unrecognized = new Map();
-  // Для допуска в контекст требуется успех КАЖДОГО вложения сообщения,
-  // а не только одного файла при наличии других, в том числе изображений.
+  // Каждое вложение классифицируется. Все голосовые требуют подтверждённой
+  // расшифровки, неаудиофайлы учитываются отдельно.
   const attachmentCoverage = new Map();
   let audioFound = 0;
   function markUnrecognized(event, failure) {
@@ -641,10 +648,13 @@ export async function normalizeCommunications({ collection, resolveFile, transcr
     if (failure) voiceFailures.push(failure);
   }
   for (const item of audioItems) {
-    const coverage = attachmentCoverage.get(item.event) || { total: 0, success: 0, audioOnly: 0 };
+    const coverage = attachmentCoverage.get(item.event) || { total: 0, success: 0, audioOnly: 0, nonAudio: 0 };
     coverage.total++;
     attachmentCoverage.set(item.event, coverage);
-    if (knownNonAudio(item.fileMeta)) continue;
+    if (knownNonAudio(item.fileMeta)) {
+      if (!audioMetadata(item.fileMeta)) coverage.nonAudio++;
+      continue;
+    }
     let file, voiceSnapshot;
     if (item.link) {
       file = { id: `link${audioFound}`, name: `voice_link.${item.link.ext}`, url: item.link.url };
@@ -661,13 +671,16 @@ export async function normalizeCommunications({ collection, resolveFile, transcr
           if (audioMetadata(item.fileMeta)) {
             markUnrecognized(item.event, { file_id: item.fileId, retryable: true, step: 'disk_file_get',
               error: 'Тип файла в истории и Битрикс Диске расходится' });
-          }
+          } else coverage.nonAudio++;
           continue;
         }
         const name = data.NAME || data.name || item.fileMeta?.name || '';
         if (audioMetadata(item.fileMeta) && !extension(name)) throw new Error('Не удалось определить формат аудиофайла');
         if (!audioMetadata(item.fileMeta) && !extension(name)) throw new Error('Не удалось определить тип файла');
-        if (!audioMetadata(item.fileMeta) && !AUDIO_EXTENSIONS.includes(extension(name))) continue;
+        if (!audioMetadata(item.fileMeta) && !AUDIO_EXTENSIONS.includes(extension(name))) {
+          coverage.nonAudio++;
+          continue;
+        }
         file = { id: item.fileId, name, url: data.DOWNLOAD_URL || data.urlDownload || data.url || null };
         if (verifiedFallbackEvents.has(item.event)) {
           voiceSnapshot = voiceFileSnapshot(data, item.fileId, name);
@@ -739,12 +752,24 @@ export async function normalizeCommunications({ collection, resolveFile, transcr
       unrecognizedCount += count;
     }
     if (ambiguousMessageSessions.has(eventScopes.get(message))) message._session_context_ambiguous = true;
-    // Закрепляем окончательный объект после обработки вложений, чтобы
-    // аудиореплика не выпала из группы. Прочие и нераспознанные вложения
-    // не получают подтверждения и закрывают семантическую оценку сессии.
+    const coverage = attachmentCoverage.get(message);
+    if (coverage?.nonAudio > 0) {
+      message._has_audio = coverage.nonAudio < coverage.total;
+      message.non_audio_attachments = coverage.nonAudio;
+      if (coverage.nonAudio === coverage.total && !message.text.trim()) {
+        message.text = '[Вложение без текстового сообщения. Содержимое не анализируется.]';
+        message.non_audio_attachment_only = true;
+        // У пустого файлового события нет реплики, для которой требуется автор.
+        delete message._wazzup_author_ambiguous;
+        delete message._wappi_author_ambiguous;
+      }
+    }
+    // Закрепляем текст после расшифровки голосовых и классификации файлов.
     const binding = verifiedFallbackEvents.get(message);
     if (binding) binding.eventSnapshot = JSON.stringify(message);
-    const coverage = attachmentCoverage.get(message);
+    if (binding && coverage?.total > 0 && coverage.success + coverage.nonAudio === coverage.total
+        && coverage.audioOnly === coverage.success && count === 0 && !message.transcription_coverage?.length
+        && message._session_unreferenced_files !== true) verifiedContentEvents.add(message);
     if (binding && coverage?.total > 0 && coverage.success === coverage.total && coverage.audioOnly === coverage.total
         && count === 0 && !message.transcription_coverage?.length && message._has_audio_transcript === true && message._session_unreferenced_files !== true) {
       verifiedVoiceEvents.add(message);

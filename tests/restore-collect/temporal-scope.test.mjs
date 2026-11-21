@@ -101,11 +101,14 @@ test('позднее или недатированное вложение ста
   }
 });
 
-test('отдельная картинка без сообщения не исчезает из истории как будто её не было', async () => {
+test('отдельная картинка сохраняется в исходной истории и не блокирует текстовый сбор', async () => {
   const c=collection();c.raw.chats=[{CHAT_ID:'5',CONNECTOR_ID:'wazzup'}];
   c.raw.sessions=[{session_id:'6',history:{chatId:'5',sessionId:'6',chat:{'5':{}},users:{},message:{},
     files:{'8':{id:8,name:'photo.jpg',type:'image',date:'2026-11-04T09:00:00Z'}}}}];
-  await assert.rejects(normalizeCommunications({collection:c,temporalCutoff:cutoff}),TemporalScopeError);
+  const before=structuredClone(c.raw);
+  const result=await normalizeCommunications({collection:c,temporalCutoff:cutoff});
+  assert.deepEqual(c.raw,before);
+  assert.equal(result.deal_data.communications.filter(x=>x.type==='chat').length,0);
 });
 
 test('аналитика проверенного входа не сдвигает cutoff за границу отказа', () => {

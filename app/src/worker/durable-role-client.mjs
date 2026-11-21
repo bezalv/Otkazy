@@ -1,6 +1,6 @@
 // Отдельный opt-in протокол. Не создаёт ledger, не открывает соединение и не
 // подключён к рабочей очереди. Очередь должна передать проверенный scope.
-import { verifiedInferenceGroupForVerifier, verifiedInferenceVoice } from '../collect/normalize.mjs';
+import { verifiedInferenceGroupForVerifier, verifiedInferenceContent } from '../collect/normalize.mjs';
 import { chatMillisTimestamp } from '../time-precision.mjs';
 import { isCanonicalRoleInferenceRequest, isValidRoleInferenceResponse } from '../analysis/chat-role-inference.mjs';
 import { getRoleSessionContextScope } from './role-session-context.mjs';
@@ -37,7 +37,7 @@ export function createDurableRoleClient({ ledger, sessionContext, transport, che
     if (dated.some(({item,time}) => time === null || typeof item?.text !== 'string' || !item.text.trim()
         || item._chat_connector_unknown === true || item._session_unreferenced_files === true
         || item._session_context_ambiguous === true
-        || (hasAttachment(item) && !verifiedInferenceVoice(item, scope)))) return null;
+        || (hasAttachment(item) && !verifiedInferenceContent(item, scope)))) return null;
     const eligible = dated.filter(({time}) => time <= cutoffMs).sort((a,b) => a.time - b.time || a.index - b.index);
     if (!eligible.length || eligible.length > 100 || eligible.some((x,i) => i && x.time === eligible[i-1].time)) return null;
     const ids = new Set(), entries=[];let chars=0;

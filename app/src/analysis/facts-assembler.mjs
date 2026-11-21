@@ -325,6 +325,7 @@ for (var i = 0; i < comms.length; i++) {
     }
     var chatHasVoice = (c._has_audio_transcript === true)
       || !!(c.transcript && String(c.transcript).trim().length > 0);
+    if (c.non_audio_attachment_only === true) actor = 'system';
     facts.push({
       fact_id: nextId(),
       source: chatHasVoice ? 'chat_voice_transcript' : 'chat',
