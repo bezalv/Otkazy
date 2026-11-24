@@ -50,6 +50,7 @@ const CALL_FIELDS = [
   'ID', 'SUBJECT', 'CREATED', 'START_TIME', 'END_TIME', 'DIRECTION',
   'RESPONSIBLE_ID', 'DESCRIPTION', 'SETTINGS', 'PROVIDER_ID',
   'PROVIDER_TYPE_ID', 'COMPLETED', 'FILES', 'COMMUNICATIONS',
+  'OWNER_TYPE_ID', 'OWNER_ID', 'TYPE_ID', 'STORAGE_ELEMENT_IDS',
 ];
 
 const TASK_FIELDS = [
@@ -382,6 +383,36 @@ export async function collectDeal({ client, dealId, silent = false, now = Date.n
       filter: { OWNER_TYPE_ID: 2, OWNER_ID: id, TYPE_ID: 2 },
       select: CALL_FIELDS, order: { CREATED: 'ASC' },
     }, page => page, wait, onAttempts);
+    sources.calls.collection_scope = 'deal_owner_and_bound_origin_lead';
+    sources.calls.lead_calls_added = 0;
+    sources.calls.lead_calls_unbound = 0;
+    if (deal.LEAD_ID && String(deal.LEAD_ID) !== '0') {
+      const leadId = openlineId(deal.LEAD_ID);
+      if (!leadId) throw new Error('Некорректный ID исходного лида');
+      const leadCalls = await list(client, 'crm.activity.list', {
+        filter: { OWNER_TYPE_ID: 1, OWNER_ID: Number(leadId), TYPE_ID: 2 },
+        select: CALL_FIELDS, order: { CREATED: 'ASC' },
+      }, page => page, wait, onAttempts);
+      const seen = new Set(raw.calls.map(c => String(c.ID)));
+      for (const call of leadCalls) {
+        const activityId = openlineId(call?.ID);
+        if (!activityId || String(call.OWNER_TYPE_ID) !== '1' || String(call.OWNER_ID) !== leadId
+            || String(call.TYPE_ID) !== '2') throw new Error('Не подтверждена принадлежность звонка исходному лиду');
+        if (seen.has(activityId)) continue;
+        const bindings = await list(client, 'crm.activity.binding.list', { activityId: Number(activityId) },
+          page => page, wait, onAttempts);
+        if (bindings.some(b => !openlineId(b?.entityId) || !openlineId(b?.entityTypeId))) {
+          throw new Error('Некорректные привязки звонка исходного лида');
+        }
+        if (!bindings.some(b => String(b.entityTypeId) === '2' && String(b.entityId) === String(id))) {
+          sources.calls.lead_calls_unbound++;
+          continue;
+        }
+        raw.calls.push({ ...call, _source_lead_id: leadId, _verified_deal_binding: String(id) });
+        seen.add(activityId);
+        sources.calls.lead_calls_added++;
+      }
+    }
   });
   await source('comments', async onAttempts => {
     raw.comments = await list(client, 'crm.timeline.comment.list', {

@@ -287,7 +287,9 @@ for (var i = 0; i < comms.length; i++) {
         || !!(c.audio_files && c.audio_files.length) || c._transcription_attempted === true;
       var noTextContent = hadRecording
         ? ('Звонок ' + (c.direction || '?') + ', ' + dur + ' сек: запись есть, но не распознана — содержание неизвестно')
-        : ('Звонок ' + (c.direction || '?') + ', ' + dur + ' сек, записи нет');
+        : c._recording_wait_exempt_reason
+          ? ('Звонок ' + (c.direction || '?') + ', ' + dur + ' сек: запись недоступна, содержание неизвестно; факт разговора не подтверждён')
+          : ('Звонок ' + (c.direction || '?') + ', ' + dur + ' сек, записи нет');
       facts.push({
         fact_id: nextId(), source: 'call_event', actor: 'system',
         ts: ts, direction: c.direction || null,

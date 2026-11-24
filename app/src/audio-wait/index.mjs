@@ -2,6 +2,10 @@
 // Окно кандидатов относительно перехода в отказ: сутки, поскольку более старые
 // отсутствующие файлы уже не объясняются обнаруженной задержкой в несколько часов.
 export const AW_DAY_MS = 86400000;
+// Это порог только блокирующего ожидания, не доказательство недозвона.
+// Короткое событие остаётся в фактах с неизвестным содержанием. Любая
+// имеющаяся запись распознаётся независимо от длительности.
+export const AW_SHORT_UNRECORDED_MS = 5000;
 export const AW_CHECK_MINUTES = [5, 15, 30, 60, 120, 180, 240, 300, 360, 420, 480, 1440];
 export function awTime(value) {
   // Драйвер PostgreSQL возвращает timestamptz как Date; строковое преобразование
@@ -14,6 +18,18 @@ export function awHasAudio(call) {
   return Object.values(call.FILES || {}).some(function (f) {
     return !!(f && (f.urlDownload || f.URL_DOWNLOAD || f.url));
   });
+}
+export function awNonBlockingReason(call, tracked) {
+  if (awHasAudio(call) || tracked?.first_audio_seen_at) return null;
+  // Известный файл без ссылки всё ещё требуется получить; исчезнувшую
+  // ранее доступную запись нельзя принять за короткий звонок без записи.
+  if (Object.keys(call.FILES || {}).length || Object.values(call.STORAGE_ELEMENT_IDS || {}).length) return null;
+  const missed = call.SETTINGS?.MISSED_CALL;
+  if (missed === true || missed === 'Y' || missed === 1 || missed === '1') return 'missed_call';
+  const start = awTime(call.START_TIME), end = awTime(call.END_TIME), created = awTime(call.CREATED);
+  if (String(call.PROVIDER_ID) !== 'VOXIMPLANT_CALL' || String(call.COMPLETED) !== 'Y'
+      || start === null || end === null || created === null || Math.abs(start - created) > 600000) return null;
+  return end > start && end - start <= AW_SHORT_UNRECORDED_MS ? 'short_unrecorded_content_unknown' : null;
 }
 export function awCandidate(call, loseMs, nowMs) {
   if (String(call.PROVIDER_ID) !== 'VOXIMPLANT_CALL' || String(call.COMPLETED) !== 'Y') return false;
@@ -38,9 +54,19 @@ export function awAssess(calls, loseDate, enabledAt, saved, nowMs) {
     var tracked = observations[id];
     if (!tracked && !awCandidate(c, loseMs, nowMs)) continue;
     var available = awHasAudio(c);
+    var nonBlocking = awNonBlockingReason(c, tracked);
+    if (nonBlocking) {
+      if (tracked) { tracked.non_blocking_reason = nonBlocking; tracked.last_checked_at = new Date(nowMs).toISOString(); }
+      continue;
+    }
+    if (tracked) delete tracked.non_blocking_reason;
     if (!available) {
       pending.push(id);
       if (!tracked) observations[id] = { activity_id: id, provider: c.PROVIDER_ID, ended_at: c.END_TIME, first_missing_at: new Date(nowMs).toISOString(), first_audio_seen_at: null };
+      Object.assign(observations[id], { started_at: c.START_TIME,
+        duration_seconds: (awTime(c.END_TIME) - awTime(c.START_TIME)) / 1000,
+        checked_via: 'crm_activity_settings_and_files', last_checked_at: new Date(nowMs).toISOString(),
+        file_ids: Object.values(c.FILES || {}).map(f => f?.id ?? f?.ID).filter(id => /^[1-9]\d*$/.test(String(id))).map(String) });
     } else if (tracked && !tracked.first_audio_seen_at) {
       tracked.first_audio_seen_at = new Date(nowMs).toISOString();
     }
@@ -102,9 +128,9 @@ export function planAudioWait({ stageId, callsComplete, calls, loseDate, enabled
   if (recheckTerminal && assessment.state !== 'disabled') {
     // Ранее замеченная запись не гарантирует, что она доступна сейчас:
     // для нового анализа каждый отслеженный звонок должен присутствовать
-    // в свежем ответе и содержать актуальную ссылку на файл.
+    // в свежем ответе и иметь запись либо явное неблокирующее основание.
     const trackedAvailable = Object.keys(saved.observations || {}).every(id =>
-      calls.some(call => String(call.ID) === id && awHasAudio(call)));
+      calls.some(call => String(call.ID) === id && (awHasAudio(call) || awNonBlockingReason(call, saved.observations[id]))));
     if (assessment.state === 'ready' && trackedAvailable) return { action: 'analyze', queue: null };
     // Повтор без новых записей не должен создавать ещё один pipeline_error
     // или заменять прежний вердикт: прежний цикл уже дал конечный результат.
@@ -122,7 +148,13 @@ export function planAudioWait({ stageId, callsComplete, calls, loseDate, enabled
     };
   }
   if (assessment.state === 'expired') {
-    const reason = 'Запись звонка не появилась в течение 24 часов ожидания. Содержание разговора неизвестно; оценка действий менеджера не выносилась.';
+    const pending = assessment.queue.pending_calls.map(id => {
+      const seconds = assessment.queue.observations[id]?.duration_seconds;
+      return '#' + id + (Number.isFinite(seconds) ? ' (' + seconds + ' сек)' : '');
+    }).join(', ');
+    const reason = 'За 24 часа повторных проверок не удалось получить запись: CRM-дела ' + pending
+      + '. Проверены ссылки и вложения CRM-дел. Это срок ожидания приложения, а не измеренная задержка загрузки файла.'
+      + ' Содержание разговоров неизвестно; оценка действий менеджера не выносилась.';
     return {
       action: 'expired',
       queue: assessment.queue,

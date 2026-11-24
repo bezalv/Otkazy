@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { awNonBlockingReason } from '../audio-wait/index.mjs';
 import { getRoleSessionContextScope } from '../worker/role-session-context.mjs';
 import { chatMillisTimestamp } from '../time-precision.mjs';
 import { explicitNonAudio, voiceFileSnapshot } from '../voice-file-metadata.mjs';
@@ -337,6 +338,7 @@ function callEvent(call) {
     responsible_id: call.RESPONSIBLE_ID, description: call.DESCRIPTION || '',
     provider: call.PROVIDER_ID || '', provider_type_id: call.PROVIDER_TYPE_ID || '',
     completed: call.COMPLETED || '', audio_url: audioUrl, audio_files: files,
+    _recording_wait_exempt_reason: awNonBlockingReason(call),
     activity_id: call.ID, _needs_transcription: audioUrl || files.length > 0,
   };
 }
