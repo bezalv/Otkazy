@@ -97,7 +97,21 @@ export async function processDeal({
     if (actual > expected) return { status: 'obsolete_transition', collection: collected };
     if (actual < expected) return { status: 'error', collection: { ...collected, _error: 'История стадий ещё не подтверждает дату отказа' } };
   }
-  if (collected._status !== 'pending_normalization') return { status: collected._status, collection: collected };
+  const checkpoint = prejudgeCheckpoint === undefined ? null : async artifact => {
+    try {
+      const saved = await prejudgeCheckpoint({ dealId:Number(dealId), stageHistoryId:expectedHistoryId,
+        loseDate:collected.deal_data.lose_date, artifact });
+      if (saved?.saved !== true) throw new Error('Не подтверждено сохранение');
+    } catch { throw new PrejudgeStageError(); }
+  };
+  if (collected._status !== 'pending_normalization') {
+    // Недоступная статистика не должна оставлять только общую ошибку сбора:
+    // сохраняем исходные даты и ID файлов до любого платного вызова.
+    if (checkpoint && collected._sources?.calls?.timing_errors?.length) {
+      await checkpoint(prepareRawCollectionArtifact(collected, { timingFailure:true }));
+    }
+    return { status: collected._status, collection: collected };
+  }
 
   // Сбор и ожидание готовности записи могут занять минуты. Сравнивать время
   // завершения звонка с моментом начала сбора означало бы терять новые звонки.
@@ -129,13 +143,6 @@ export async function processDeal({
   // сохранённые ожидания. Судье и распознаванию — только события до отказа.
   temporal ||= scopeCollectionAtLose(collected, { screenshots });
   if (temporal.error) return blockedTemporalScope(collected, audioWait, temporal.error.source, temporal.error.reason);
-  const checkpoint = prejudgeCheckpoint === undefined ? null : async artifact => {
-    try {
-      const saved = await prejudgeCheckpoint({ dealId:Number(dealId), stageHistoryId:expectedHistoryId,
-        loseDate:collected.deal_data.lose_date, artifact });
-      if (saved?.saved !== true) throw new Error('Не подтверждено сохранение');
-    } catch { throw new PrejudgeStageError(); }
-  };
   let stageLeaseLost = false;
   const checkStageLease = async () => {
     if (stageLeaseLost) throw new PrejudgeStageError();
@@ -150,7 +157,7 @@ export async function processDeal({
   if (checkpoint) {
     await checkpoint(prepareBeginArtifact({sttAttempts:prejudgeSttHooks !== undefined}));
     let rawArtifact;
-    try { rawArtifact = prepareRawCollectionArtifact(temporal.collection); }
+    try { rawArtifact = prepareRawCollectionArtifact(temporal.collection, { unscopedCalls:collected.raw.calls }); }
     catch { throw new PrejudgeStageError(); }
     await checkpoint(rawArtifact);
   }

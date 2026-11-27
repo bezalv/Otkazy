@@ -7,6 +7,7 @@ import { verifiedAudioOnly } from '../stt-client.mjs';
 import { ambiguousProcessingOnly } from '../calls/transcript-quality.mjs';
 import { PrejudgeStageError } from '../persistence/prejudge.mjs';
 import { isMissedCallSystemMessage } from '../system-chat.mjs';
+import { needsVerifiedCallTiming, verifiedCallTiming } from './call-timing.mjs';
 
 export class TemporalScopeError extends Error {
   constructor(source, reason) { super(reason); this.source = source; }
@@ -316,6 +317,8 @@ export function verifiedInferenceContent(event, scope = {}) {
 }
 
 function callEvent(call) {
+  const timing = verifiedCallTiming(call);
+  if (needsVerifiedCallTiming(call) && !timing) throw new TemporalScopeError('calls', `Не подтверждено фактическое время записи звонка ${call.ID}`);
   if (call._historical_plan_only === true) return {
     type: 'task', date: call.CREATED,
     title: 'Запланированный звонок: ' + (call.SUBJECT || 'без темы') + ' (текущий срок: ' + call.START_TIME + ')',
@@ -332,9 +335,9 @@ function callEvent(call) {
   const scheduled = created && call.START_TIME
     && Math.abs(new Date(call.START_TIME).getTime() - new Date(created).getTime()) > 600000;
   return {
-    type: 'call', date: call._historical_event_time || created, direction: call.DIRECTION === '2' ? 'outgoing' : 'incoming',
-    subject: call.SUBJECT || '', duration_start: call.START_TIME,
-    duration_end: scheduled ? call.START_TIME : call.END_TIME,
+    type: 'call', date: timing?.start || call._historical_event_time || created, direction: call.DIRECTION === '2' ? 'outgoing' : 'incoming',
+    subject: call.SUBJECT || '', duration_start: timing?.start ?? call.START_TIME,
+    duration_end: timing?.end ?? (scheduled ? call.START_TIME : call.END_TIME),
     responsible_id: call.RESPONSIBLE_ID, description: call.DESCRIPTION || '',
     provider: call.PROVIDER_ID || '', provider_type_id: call.PROVIDER_TYPE_ID || '',
     completed: call.COMPLETED || '', audio_url: audioUrl, audio_files: files,

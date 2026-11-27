@@ -2,6 +2,7 @@ import { exactMillisTimestamp } from '../time-precision.mjs';
 import { getRoleSessionContextScope } from '../worker/role-session-context.mjs';
 import { isDeepStrictEqual } from 'node:util';
 import { createHash } from 'node:crypto';
+import { needsVerifiedCallTiming, attachVerifiedCallTiming } from './call-timing.mjs';
 
 const SOURCE_LABELS = {
   calls: 'звонки',
@@ -50,7 +51,7 @@ const CALL_FIELDS = [
   'ID', 'SUBJECT', 'CREATED', 'START_TIME', 'END_TIME', 'DIRECTION',
   'RESPONSIBLE_ID', 'DESCRIPTION', 'SETTINGS', 'PROVIDER_ID',
   'PROVIDER_TYPE_ID', 'COMPLETED', 'FILES', 'COMMUNICATIONS',
-  'OWNER_TYPE_ID', 'OWNER_ID', 'TYPE_ID', 'STORAGE_ELEMENT_IDS',
+  'OWNER_TYPE_ID', 'OWNER_ID', 'TYPE_ID', 'STORAGE_ELEMENT_IDS', 'ORIGIN_ID', 'LAST_UPDATED',
 ];
 
 const TASK_FIELDS = [
@@ -413,6 +414,25 @@ export async function collectDeal({ client, dealId, silent = false, now = Date.n
         sources.calls.lead_calls_added++;
       }
     }
+    sources.calls.timing_verified = 0;
+    sources.calls.timing_errors = [];
+    for (let index = 0; index < raw.calls.length; index++) {
+      const call = raw.calls[index];
+      if (!needsVerifiedCallTiming(call)) continue;
+      const activityId = openlineId(call.ID);
+      try {
+        if (!activityId) throw new Error('Некорректный ID звонка');
+        const statistics = await list(client, 'voximplant.statistic.get', {
+          FILTER: { CRM_ACTIVITY_ID: Number(activityId) }, SORT: 'ID', ORDER: 'ASC',
+        }, page => page, wait, onAttempts);
+        raw.calls[index] = attachVerifiedCallTiming(call, statistics);
+        sources.calls.timing_verified++;
+      } catch (error) {
+        sources.calls.timing_errors.push({ activity_id: activityId, reason: 'actual_call_time_unverified',
+          error: safeError(error) });
+      }
+    }
+    if (sources.calls.timing_errors.length) throw new Error('Не подтверждено фактическое время записей');
   });
   await source('comments', async onAttempts => {
     raw.comments = await list(client, 'crm.timeline.comment.list', {
@@ -569,6 +589,8 @@ export async function collectDeal({ client, dealId, silent = false, now = Date.n
     result._status = 'error';
     result._step = 'collect_incomplete';
     result._error = `сбор неполный: ${incomplete.map(item => item.label).join(', ')}`;
+    if (sources.calls.timing_errors?.length) result._error += '; не подтверждено фактическое время записей звонков: '
+      + sources.calls.timing_errors.map(item => item.activity_id).join(', ');
   } else {
     result._status = 'pending_normalization';
   }

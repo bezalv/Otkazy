@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { communicationRow } from './rows.mjs';
 import { inTransaction } from './transaction.mjs';
 import { verifiedAudioHash } from '../stt-client.mjs';
+import { verifiedCallTiming } from '../collect/call-timing.mjs';
 
 // Этот слой сохраняет только готовые результаты и не считает ID файла хешем
 // аудио. Автоматическое повторное использование по одному ID запрещено.
@@ -195,15 +196,20 @@ function fileIds(message) {
 }
 
 /** Ограниченная проекция входов ДО распознавания голосовых, без адресов файлов. */
-export function prepareRawCollectionArtifact(collection) {
+export function prepareRawCollectionArtifact(collection, { unscopedCalls, timingFailure = false } = {}) {
   const raw = collection?.raw;
   if (!raw || !['calls','comments','tasks','chats','sessions'].every(name => Array.isArray(raw[name]))) {
     throw new TypeError('Неполная коллекция');
   }
-  const payload = safeJson({ projection:'safe_fields_only', url_policy:'credential_fields_redacted',
-    calls:raw.calls.map(call => ({id:scalar(call.ID),created:scalar(call.CREATED),start:scalar(call.START_TIME),
+  const callMetadata = call => ({id:scalar(call.ID),created:scalar(call.CREATED),start:scalar(call.START_TIME),
       end:scalar(call.END_TIME),provider:scalar(call.PROVIDER_ID),direction:scalar(call.DIRECTION),
-      has_recording:!!call.SETTINGS?.RECORD_URL || items(call.FILES).length>0})),
+      last_updated:scalar(call.LAST_UPDATED),file_ids:items(call.FILES).map(([key,file]) => scalar(file?.id ?? file?.ID ?? key)),
+      actual_timing:verifiedCallTiming(call), historical_plan_only:call._historical_plan_only === true,
+      has_recording:!!call.SETTINGS?.RECORD_URL || items(call.FILES).length>0});
+  const payload = safeJson({ projection:'safe_fields_only', url_policy:'credential_fields_redacted',
+    ...(timingFailure ? { stage:'call_timing_blocked', timing_errors:collection._sources?.calls?.timing_errors || [] } : {}),
+    ...(unscopedCalls ? { calls_before_temporal_scope:unscopedCalls.map(callMetadata) } : {}),
+    calls:raw.calls.map(callMetadata),
     comments:raw.comments.map(comment => ({id:scalar(comment.ID),created:scalar(comment.CREATED),
       author_id:scalar(comment.AUTHOR_ID),text:scalar(comment.COMMENT)})),
     tasks:raw.tasks.map(task => ({id:scalar(task.id ?? task.ID),created:scalar(task.createdDate ?? task.CREATED_DATE),
@@ -216,7 +222,7 @@ export function prepareRawCollectionArtifact(collection) {
         text:scalar(message?.text || message?.TEXT || ''),file_ids:fileIds(message)})),
       files:items(session.history?.files).map(([key,file]) => ({id:scalar(file?.id ?? file?.ID ?? key),
         date:scalar(file?.date || file?.DATE || null),type:scalar(file?.type || file?.TYPE || null),name:scalar(file?.name || file?.NAME || null)})) })) });
-  return {type:'raw_collection',key:digest('raw-collection-v1'),payload};
+  return {type:'raw_collection',key:timingFailure ? digest('call-timing-blocked-v1:' + canonical(payload)) : digest('raw-collection-v1'),payload};
 }
 
 function communicationRows(dealId, communications) {

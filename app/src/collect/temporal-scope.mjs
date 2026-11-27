@@ -1,4 +1,5 @@
 import { chatMillisTimestamp } from '../time-precision.mjs';
+import { hasCallRecording, needsVerifiedCallTiming, verifiedCallTiming } from './call-timing.mjs';
 
 const time = value => chatMillisTimestamp(value)?.getTime() ?? null;
 
@@ -18,9 +19,13 @@ export function scopeCollectionAtLose(collection, { screenshots = true } = {}) {
   const counts = { calls: 0, comments: 0, tasks: 0 };
   for (const call of raw.calls) {
     const created = time(call?.CREATED);
-    const start = time(call?.START_TIME);
-    const end = time(call?.END_TIME);
-    const hasAudio = Boolean(call?.SETTINGS?.RECORD_URL) || (call?.FILES && typeof call.FILES === 'object' && Object.keys(call.FILES).length > 0);
+    const timing = verifiedCallTiming(call);
+    if (needsVerifiedCallTiming(call) && !timing) {
+      return { error: { source: 'calls', reason: `Не подтверждено фактическое время записи звонка ${call.ID}` } };
+    }
+    const start = time(timing?.start ?? call?.START_TIME);
+    const end = time(timing?.end ?? call?.END_TIME);
+    const hasAudio = hasCallRecording(call);
     const actual = start !== null;
     if ((hasAudio || call?.PROVIDER_ID === 'VOXIMPLANT_CALL') && start === null) {
       return { error: { source: 'calls', reason: 'Неизвестно время начала звонка' } };
@@ -35,7 +40,7 @@ export function scopeCollectionAtLose(collection, { screenshots = true } = {}) {
       counts.calls++;
       // CRM-дело, созданное до отказа существенно раньше планового старта,
       // сохраняется как план без аудио и без утверждения, что звонок был.
-      if (created !== null && created < cutoff && start !== null && start - created > 600000) {
+      if (!hasAudio && created !== null && created < cutoff && start !== null && start - created > 600000) {
         scoped.calls.push({ ID: call.ID, CREATED: call.CREATED, START_TIME: call.START_TIME,
           SUBJECT: call.SUBJECT, RESPONSIBLE_ID: call.RESPONSIBLE_ID, _historical_plan_only: true });
       }
@@ -49,7 +54,7 @@ export function scopeCollectionAtLose(collection, { screenshots = true } = {}) {
     }
     // CREATED сохраняется для распознавания планируемой CRM-активности;
     // дата события передаётся отдельно, не меняя исходную активность.
-    scoped.calls.push(actual ? { ...call, _historical_event_time: call.START_TIME } : call);
+    scoped.calls.push(actual ? { ...call, _historical_event_time: timing?.start ?? call.START_TIME } : call);
   }
   for (const [key, field, source] of [['comments', 'CREATED', 'comments'], ['tasks', null, 'tasks']]) {
     for (const item of raw[key]) {

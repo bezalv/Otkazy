@@ -30,14 +30,12 @@ test('пересечение границы, равное время и неиз
   }
 });
 
-test('другой провайдер сохраняет ранний план без будущей записи', async () => {
+test('запись с плановыми датами другого провайдера тоже не исчезает как план', async () => {
   const c=collection();c.raw.calls=[{...call('2026-11-04T09:00:00Z','2026-11-04T11:00:00Z','2026-11-04T11:01:00Z'),
     PROVIDER_ID:'OTHER',SETTINGS:{RECORD_URL:'https://example.test/record'}}];
-  const r=scopeCollectionAtLose(c);assert.equal(r.collection.raw.calls.length,1);assert.equal(r.excluded.calls,1);
-  const n=await normalizeCommunications({collection:r.collection,temporalCutoff:cutoff});
-  assert.equal(n.deal_data.communications[0].type,'task');assert.equal(n.deal_data.communications[0]._needs_transcription,undefined);
-  const row=communicationRow(42,n.deal_data.communications[0],0);
-  assert.equal(row.event_type,'task');assert.equal(row.event_id,'activity:1');
+  const r=scopeCollectionAtLose(c);assert.equal(r.error.source,'calls');
+  assert.match(r.error.reason,/фактическое время/);
+  assert.equal(c.raw.calls[0].SETTINGS.RECORD_URL,'https://example.test/record');
 });
 
 test('планируемая активность не превращается в состоявшийся разговор', async () => {
